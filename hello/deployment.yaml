@@ -45,13 +45,13 @@ metadata:
   name: hello
   namespace: default
   annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-staging
+    cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
   ingressClassName: nginx
   tls:
   - hosts:
     - hello.ekstest.com
-    secretName: hello-tls
+    secretName: hello-tls-prod
   rules:
   - host: hello.ekstest.com
     http:
