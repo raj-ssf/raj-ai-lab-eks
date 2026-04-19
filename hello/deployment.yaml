@@ -51,6 +51,7 @@ spec:
   tls:
   - hosts:
     - hello.ekstest.com
+    - hello2.ekstest.com
     secretName: hello-tls-prod
   rules:
   - host: hello.ekstest.com
