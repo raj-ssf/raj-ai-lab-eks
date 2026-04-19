@@ -38,3 +38,28 @@ spec:
   - port: 80
     targetPort: 80
   type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hello
+  namespace: default
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-staging
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - hello.ekstest.com
+    secretName: hello-tls
+  rules:
+  - host: hello.ekstest.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: hello
+            port:
+              number: 80
