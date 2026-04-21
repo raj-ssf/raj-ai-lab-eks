@@ -169,8 +169,15 @@ def ingest(req: IngestRequest):
         log.error("embed failed: %s", e)
         raise HTTPException(status_code=502, detail=f"embed failed: {e}")
 
-    point_id = req.id or str(uuid.uuid4())
+    # Qdrant point IDs must be unsigned int or UUID. Map arbitrary user-provided
+    # IDs to a deterministic UUID5 so callers can still use memorable strings.
+    # Original string is preserved in the payload for filtering/lookup.
     payload = {"text": req.text}
+    if req.id:
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, req.id))
+        payload["original_id"] = req.id
+    else:
+        point_id = str(uuid.uuid4())
     if req.metadata:
         payload.update(req.metadata)
 
