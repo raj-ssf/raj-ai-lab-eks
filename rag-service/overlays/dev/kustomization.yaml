@@ -1,17 +1,13 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-
 # IRSA role ARN and ingress hostname are injected by the ArgoCD Application spec
 # (Terraform-managed in raj-ai-lab-eks-infra/argocd-apps.tf) via `kustomize.patches`.
 # The full image reference (newName + newTag) lives here so GHA can bump the tag
 # without a Terraform apply. Account ID in newName is not a secret.
-
 namespace: rag
-
 resources:
   - ../../base
-
 images:
   - name: rag-service
     newName: 050693401425.dkr.ecr.us-west-2.amazonaws.com/rag-service
-    newTag: sha-358a398   # updated by .github/workflows/build-push-rag-service.yml on every build
+    newTag: sha-beabf81 # updated by .github/workflows/build-push-rag-service.yml on every build
