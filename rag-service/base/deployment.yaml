@@ -18,7 +18,7 @@ spec:
       containers:
         - name: rag-service
           image: rag-service:dev   # rewritten by overlay's `images:` field
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always 
           ports:
             - name: http
               containerPort: 8000
