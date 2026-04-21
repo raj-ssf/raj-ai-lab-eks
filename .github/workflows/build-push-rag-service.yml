@@ -1,0 +1,62 @@
+name: Build and push rag-service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rag-service/app/**"
+      - ".github/workflows/build-push-rag-service.yml"
+  workflow_dispatch:   # manual trigger from GitHub UI
+
+permissions:
+  id-token: write      # required for AWS OIDC federation
+  contents: read
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: rag-service/app
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ vars.ECR_REPOSITORY_URL }}:latest
+            ${{ vars.ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### rag-service image built and pushed"
+            echo ""
+            echo "**Tags:**"
+            echo "- \`${{ vars.ECR_REPOSITORY_URL }}:latest\`"
+            echo "- \`${{ vars.ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}\`"
+            echo ""
+            echo "**To roll out:**"
+            echo '```'
+            echo "kubectl -n rag rollout restart deployment/rag-service"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
