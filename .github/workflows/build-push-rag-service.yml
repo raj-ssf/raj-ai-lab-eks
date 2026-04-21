@@ -10,7 +10,7 @@ on:
 
 permissions:
   id-token: write      # required for AWS OIDC federation
-  contents: read
+  contents: write      # required to commit rag-service/image.tag back
 
 jobs:
   build-push:
@@ -46,6 +46,25 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Update image.tag and commit
+        env:
+          TAG: sha-${{ steps.sha.outputs.short }}
+        run: |
+          # Write the new tag only if it changed (prevents empty commits on no-op reruns)
+          current=$(cat rag-service/image.tag 2>/dev/null || echo "")
+          if [ "$current" = "$TAG" ]; then
+            echo "image.tag already $TAG; skipping commit"
+            exit 0
+          fi
+
+          echo "$TAG" > rag-service/image.tag
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rag-service/image.tag
+          git commit -m "rag-service: bump image tag to $TAG"
+          git push
+
       - name: Summary
         run: |
           {
@@ -55,8 +74,5 @@ jobs:
             echo "- \`${{ vars.ECR_REPOSITORY_URL }}:latest\`"
             echo "- \`${{ vars.ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}\`"
             echo ""
-            echo "**To roll out:**"
-            echo '```'
-            echo "kubectl -n rag rollout restart deployment/rag-service"
-            echo '```'
+            echo "**Deploy:** \`cd raj-ai-lab-eks-infra && terraform apply\`"
           } >> "$GITHUB_STEP_SUMMARY"
