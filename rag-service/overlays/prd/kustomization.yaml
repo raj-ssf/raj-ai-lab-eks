@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: rag
+
+resources:
+  - ../../base
+
+# When you have a real prod account, copy the dev overlay's patches block
+# here and swap in the prod account ID.
+# patches:
+#   - target:
+#       kind: ServiceAccount
+#       name: rag-service
+#     patch: |-
+#       apiVersion: v1
+#       kind: ServiceAccount
+#       metadata:
+#         name: rag-service
+#         annotations:
+#           eks.amazonaws.com/role-arn: arn:aws:iam::<prod-account-id>:role/raj-ai-lab-eks-rag-service
