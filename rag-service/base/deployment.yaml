@@ -31,6 +31,16 @@ spec:
               value: us.amazon.nova-pro-v1:0
             - name: AUTO_THRESHOLD_CHARS
               value: "500"
+            - name: EMBED_MODEL_ID
+              value: amazon.titan-embed-text-v2:0
+            - name: QDRANT_URL
+              value: http://qdrant.qdrant.svc.cluster.local:6333
+            - name: QDRANT_COLLECTION
+              value: rag-docs
+            - name: EMBED_DIM
+              value: "1024"
+            - name: RAG_DEFAULT_TOP_K
+              value: "3"
           resources:
             requests:
               cpu: 100m
