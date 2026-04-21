@@ -25,8 +25,12 @@ spec:
           env:
             - name: AWS_REGION
               value: us-west-2     # IRSA doesn't inject this; boto3 needs it
-            - name: BEDROCK_MODEL_ID
+            - name: BEDROCK_FAST_MODEL_ID
               value: us.anthropic.claude-haiku-4-5-20251001-v1:0
+            - name: BEDROCK_SMART_MODEL_ID
+              value: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+            - name: AUTO_THRESHOLD_CHARS
+              value: "500"
           resources:
             requests:
               cpu: 100m
