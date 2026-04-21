@@ -8,4 +8,4 @@ resources:
   - ../../base
 images:
   - name: rag-service
-    newTag: sha-0250df2 # updated by .github/workflows/build-push-rag-service.yml on every build
+    newTag: sha-358a398 # updated by .github/workflows/build-push-rag-service.yml on every build
