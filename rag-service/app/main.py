@@ -26,7 +26,7 @@ AUTO_THRESHOLD = int(os.environ.get("AUTO_THRESHOLD_CHARS", "500"))
 
 bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 
-app = FastAPI(title="rag-service", version="0.3.1")
+app = FastAPI(title="rag-service", version="0.3.0")
 
 
 class InvokeRequest(BaseModel):
