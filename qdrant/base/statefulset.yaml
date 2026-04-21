@@ -34,6 +34,11 @@ spec:
               value: "6334"
             - name: QDRANT__TELEMETRY_DISABLED
               value: "true"
+            # Default snapshots path is /qdrant/snapshots (outside the PVC) and
+            # not writable by UID 1000. Redirect into the PVC so it's writable
+            # AND survives pod restart.
+            - name: QDRANT__STORAGE__SNAPSHOTS_PATH
+              value: ./storage/snapshots
           resources:
             requests:
               cpu: 250m
