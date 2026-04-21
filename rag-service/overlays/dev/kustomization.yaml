@@ -1,11 +1,15 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# Env-specific values (IRSA role ARN, ECR image URL, hostname) are injected by the
-# ArgoCD Application spec in raj-ai-lab-eks-infra/argocd-apps.tf — not here — so
-# this file stays committable without leaking account IDs or domains.
+# Account-specific bits (IRSA role ARN, ECR registry URL, hostname) are injected
+# by the ArgoCD Application spec in raj-ai-lab-eks-infra/argocd-apps.tf.
+# The image TAG lives here so GHA can bump it without touching Terraform.
 
 namespace: rag
 
 resources:
   - ../../base
+
+images:
+  - name: rag-service
+    newTag: latest   # updated by .github/workflows/build-push-rag-service.yml on every build
