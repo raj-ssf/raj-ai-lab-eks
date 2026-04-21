@@ -70,3 +70,12 @@ spec:
             capabilities:
               drop:
                 - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Writable scratch dir — Python libs (portalocker via qdrant-client, tempfile
+        # callers, etc.) need a writable /tmp even though the rootfs is read-only.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
