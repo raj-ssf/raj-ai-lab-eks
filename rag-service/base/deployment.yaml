@@ -26,9 +26,9 @@ spec:
             - name: AWS_REGION
               value: us-west-2     # IRSA doesn't inject this; boto3 needs it
             - name: BEDROCK_FAST_MODEL_ID
-              value: amazon.nova-micro-v1:0
+              value: us.amazon.nova-micro-v1:0
             - name: BEDROCK_SMART_MODEL_ID
-              value: amazon.nova-pro-v1:0
+              value: us.amazon.nova-pro-v1:0
             - name: AUTO_THRESHOLD_CHARS
               value: "500"
           resources:
