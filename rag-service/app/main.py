@@ -8,13 +8,26 @@ from typing import Literal, Optional
 import boto3
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
+# OpenTelemetry: set up tracer provider + OTLP gRPC exporter BEFORE instrumenting
+# boto3/httpx, otherwise the clients are constructed without spans.
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.botocore import BotocoreInstrumentor
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.logging import LoggingInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    format="%(asctime)s %(levelname)s [trace_id=%(otelTraceID)s span_id=%(otelSpanID)s] %(name)s - %(message)s",
 )
 log = logging.getLogger("rag-service")
 
@@ -29,7 +42,22 @@ COLLECTION = os.environ.get("QDRANT_COLLECTION", "rag-docs")
 EMBED_DIM = int(os.environ.get("EMBED_DIM", "1024"))
 DEFAULT_TOP_K = int(os.environ.get("RAG_DEFAULT_TOP_K", "3"))
 
-# --- Clients (module-level singletons) ---
+# --- OpenTelemetry tracer setup ---
+# OTEL_EXPORTER_OTLP_ENDPOINT is read by OTLPSpanExporter automatically, but we
+# name the service via Resource so Tempo groups spans correctly in Grafana.
+SERVICE_NAME = os.environ.get("OTEL_SERVICE_NAME", "rag-service")
+_resource = Resource.create({"service.name": SERVICE_NAME})
+_provider = TracerProvider(resource=_resource)
+_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+trace.set_tracer_provider(_provider)
+
+# Auto-instrument: boto3 (Bedrock calls), httpx (qdrant-client HTTP), stdlib
+# logging (injects trace_id/span_id into log records).
+BotocoreInstrumentor().instrument()
+HTTPXClientInstrumentor().instrument()
+LoggingInstrumentor().instrument(set_logging_format=False)
+
+# --- Clients (module-level singletons; constructed AFTER instrumenting) ---
 bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 qdrant = QdrantClient(url=QDRANT_URL)
 
@@ -69,7 +97,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="rag-service", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="rag-service", version="0.5.0", lifespan=lifespan)
+
+# FastAPI trace spans + Prometheus /metrics endpoint.
+FastAPIInstrumentor.instrument_app(app)
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 
 # --- Request / response models ---

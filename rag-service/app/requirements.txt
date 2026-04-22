@@ -3,3 +3,10 @@ uvicorn[standard]==0.30.6
 boto3==1.35.30
 pydantic==2.9.2
 qdrant-client==1.12.1
+prometheus-fastapi-instrumentator==7.0.0
+opentelemetry-sdk==1.27.0
+opentelemetry-exporter-otlp-proto-grpc==1.27.0
+opentelemetry-instrumentation-fastapi==0.48b0
+opentelemetry-instrumentation-botocore==0.48b0
+opentelemetry-instrumentation-httpx==0.48b0
+opentelemetry-instrumentation-logging==0.48b0
