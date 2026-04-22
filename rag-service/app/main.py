@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
@@ -11,7 +12,14 @@ from fastapi import FastAPI, HTTPException
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 
 # OpenTelemetry: set up tracer provider + OTLP gRPC exporter BEFORE instrumenting
 # boto3/httpx, otherwise the clients are constructed without spans.
@@ -41,6 +49,13 @@ QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant.qdrant.svc.cluster.loca
 COLLECTION = os.environ.get("QDRANT_COLLECTION", "rag-docs")
 EMBED_DIM = int(os.environ.get("EMBED_DIM", "1024"))
 DEFAULT_TOP_K = int(os.environ.get("RAG_DEFAULT_TOP_K", "3"))
+CHUNK_SIZE_DEFAULT = int(os.environ.get("RAG_CHUNK_SIZE", "500"))
+CHUNK_OVERLAP_DEFAULT = int(os.environ.get("RAG_CHUNK_OVERLAP", "50"))
+EMBED_CONCURRENCY = int(os.environ.get("RAG_EMBED_CONCURRENCY", "8"))
+
+# Payload keys the service manages itself. Excluded from the `metadata` field
+# in search results so callers only see what they put there at ingest time.
+RESERVED_PAYLOAD_KEYS = {"text", "parent_id", "chunk_index", "original_id"}
 
 # --- OpenTelemetry tracer setup ---
 # OTEL_EXPORTER_OTLP_ENDPOINT is read by OTLPSpanExporter automatically, but we
@@ -86,6 +101,56 @@ def embed(text: str) -> list[float]:
     return json.loads(response["body"].read())["embedding"]
 
 
+def embed_batch(texts: list[str]) -> list[list[float]]:
+    """Embed a list of texts. Titan embed-v2 has no batch API, so fan out via
+    a thread pool. Botocore is thread-safe; OTel botocore instrumentation
+    creates one span per call."""
+    if not texts:
+        return []
+    if len(texts) == 1:
+        return [embed(texts[0])]
+    with ThreadPoolExecutor(max_workers=EMBED_CONCURRENCY) as pool:
+        return list(pool.map(embed, texts))
+
+
+def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
+    """Split text into chunks of ~chunk_size chars with `overlap` chars of
+    carry-over between neighbours. Prefers paragraph/sentence/word boundaries
+    within the last 20% of each chunk so splits don't land mid-word."""
+    if chunk_size <= 0 or len(text) <= chunk_size:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + chunk_size, n)
+        if end < n:
+            search_from = start + int(chunk_size * 0.8)
+            for boundary in ("\n\n", "\n", ". ", " "):
+                idx = text.rfind(boundary, search_from, end)
+                if idx > start:
+                    end = idx + len(boundary)
+                    break
+        chunks.append(text[start:end].strip())
+        if end >= n:
+            break
+        start = max(end - overlap, start + 1)
+    return [c for c in chunks if c]
+
+
+def build_filter(filter_dict: Optional[dict]) -> Optional[Filter]:
+    """Translate a flat dict into a Qdrant Filter with AND semantics. Only
+    scalar equality is supported here; range/OR needs a richer surface."""
+    if not filter_dict:
+        return None
+    return Filter(
+        must=[
+            FieldCondition(key=k, match=MatchValue(value=v))
+            for k, v in filter_dict.items()
+        ]
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Best-effort collection init. If Qdrant is unreachable at startup, log and
@@ -97,7 +162,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="rag-service", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="rag-service", version="0.6.0", lifespan=lifespan)
 
 # FastAPI trace spans + Prometheus /metrics endpoint.
 FastAPIInstrumentor.instrument_app(app)
@@ -111,12 +176,16 @@ class InvokeRequest(BaseModel):
     model: Literal["auto", "fast", "smart"] = "auto"
     retrieve: bool = False
     top_k: int = Field(default=DEFAULT_TOP_K, ge=1, le=20)
+    filter: Optional[dict] = None
 
 
 class RetrievedHit(BaseModel):
     id: str
     score: float
     text: str
+    metadata: dict = {}
+    parent_id: Optional[str] = None
+    chunk_index: Optional[int] = None
 
 
 class InvokeResponse(BaseModel):
@@ -132,16 +201,21 @@ class IngestRequest(BaseModel):
     id: Optional[str] = None
     text: str = Field(..., min_length=1)
     metadata: Optional[dict] = None
+    chunk_size: int = Field(default=CHUNK_SIZE_DEFAULT, ge=0, le=10_000)
+    chunk_overlap: int = Field(default=CHUNK_OVERLAP_DEFAULT, ge=0, le=2_000)
 
 
 class IngestResponse(BaseModel):
-    id: str
+    ids: list[str]
+    chunks: int
     chars: int
+    parent_id: str
 
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(default=DEFAULT_TOP_K, ge=1, le=20)
+    filter: Optional[dict] = None
 
 
 # --- Helpers ---
@@ -156,21 +230,32 @@ def pick_model(req: InvokeRequest) -> tuple[str, str]:
     return MODEL_SMART, "auto"
 
 
-def search_qdrant(query: str, top_k: int) -> list[RetrievedHit]:
+def search_qdrant(
+    query: str,
+    top_k: int,
+    filter_dict: Optional[dict] = None,
+) -> list[RetrievedHit]:
     vec = embed(query)
     hits = qdrant.query_points(
         collection_name=COLLECTION,
         query=vec,
         limit=top_k,
+        query_filter=build_filter(filter_dict),
     ).points
-    return [
-        RetrievedHit(
-            id=str(h.id),
-            score=float(h.score),
-            text=h.payload.get("text", "") if h.payload else "",
+    results: list[RetrievedHit] = []
+    for h in hits:
+        payload = h.payload or {}
+        results.append(
+            RetrievedHit(
+                id=str(h.id),
+                score=float(h.score),
+                text=payload.get("text", ""),
+                metadata={k: v for k, v in payload.items() if k not in RESERVED_PAYLOAD_KEYS},
+                parent_id=payload.get("parent_id"),
+                chunk_index=payload.get("chunk_index"),
+            )
         )
-        for h in hits
-    ]
+    return results
 
 
 # --- Endpoints ---
@@ -196,35 +281,47 @@ def models():
 def ingest(req: IngestRequest):
     try:
         ensure_collection()
-        vec = embed(req.text)
+    except Exception as e:
+        log.error("ensure_collection failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"ensure_collection failed: {e}")
+
+    chunks = chunk_text(req.text, req.chunk_size, req.chunk_overlap)
+
+    try:
+        vectors = embed_batch(chunks)
     except ClientError as e:
         log.error("embed failed: %s", e)
         raise HTTPException(status_code=502, detail=f"embed failed: {e}")
 
-    # Qdrant point IDs must be unsigned int or UUID. Map arbitrary user-provided
-    # IDs to a deterministic UUID5 so callers can still use memorable strings.
-    # Original string is preserved in the payload for filtering/lookup.
-    payload = {"text": req.text}
-    if req.id:
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, req.id))
-        payload["original_id"] = req.id
-    else:
-        point_id = str(uuid.uuid4())
-    if req.metadata:
-        payload.update(req.metadata)
+    # parent_id is what the caller passed (human-readable). Chunk IDs are
+    # uuid5(parent_id:i) so re-ingesting the same input upserts (idempotent)
+    # instead of creating duplicates.
+    parent_id = req.id or str(uuid.uuid4())
 
-    qdrant.upsert(
-        collection_name=COLLECTION,
-        points=[PointStruct(id=point_id, vector=vec, payload=payload)],
+    points: list[PointStruct] = []
+    chunk_ids: list[str] = []
+    for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
+        chunk_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{parent_id}:{i}"))
+        payload = {"text": chunk, "parent_id": parent_id, "chunk_index": i}
+        if req.metadata:
+            payload.update(req.metadata)
+        points.append(PointStruct(id=chunk_id, vector=vec, payload=payload))
+        chunk_ids.append(chunk_id)
+
+    qdrant.upsert(collection_name=COLLECTION, points=points)
+    log.info("ingested parent=%s chunks=%d chars=%d", parent_id, len(chunks), len(req.text))
+    return IngestResponse(
+        ids=chunk_ids,
+        chunks=len(chunks),
+        chars=len(req.text),
+        parent_id=parent_id,
     )
-    log.info("ingested id=%s chars=%d", point_id, len(req.text))
-    return IngestResponse(id=point_id, chars=len(req.text))
 
 
 @app.post("/search", response_model=list[RetrievedHit])
 def search(req: SearchRequest):
     try:
-        return search_qdrant(req.query, req.top_k)
+        return search_qdrant(req.query, req.top_k, req.filter)
     except ClientError as e:
         raise HTTPException(status_code=502, detail=f"embed failed: {e}")
 
@@ -238,7 +335,7 @@ def invoke(req: InvokeRequest):
 
     if req.retrieve:
         try:
-            retrieved = search_qdrant(req.prompt, req.top_k)
+            retrieved = search_qdrant(req.prompt, req.top_k, req.filter)
         except ClientError as e:
             raise HTTPException(status_code=502, detail=f"retrieval failed: {e}")
 
