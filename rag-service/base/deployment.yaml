@@ -13,6 +13,19 @@ spec:
     metadata:
       labels:
         app: rag-service
+      annotations:
+        # Vault Agent Injector: writes secrets to /vault/secrets/<name> in
+        # the rag-service container. Role 'rag-service' is bound to the
+        # rag/rag-service ServiceAccount in Vault's kubernetes auth backend
+        # (see vault-config.tf in raj-ai-lab-eks-infra).
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "rag-service"
+        vault.hashicorp.com/agent-inject-secret-demo: "secret/data/rag-service/demo"
+        vault.hashicorp.com/agent-inject-template-demo: |
+          {{- with secret "secret/data/rag-service/demo" -}}
+          hello={{ .Data.data.hello }}
+          rotation_note={{ .Data.data.rotation_note }}
+          {{- end -}}
     spec:
       serviceAccountName: rag-service
       containers:
