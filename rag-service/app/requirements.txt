@@ -1,3 +1,6 @@
+# setuptools is required because opentelemetry-instrumentation <0.50 imports
+# pkg_resources at runtime, which is no longer bundled with Python 3.12 slim.
+setuptools>=70
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 boto3==1.35.30
