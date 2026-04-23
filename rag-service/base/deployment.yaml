@@ -26,6 +26,20 @@ spec:
           hello={{ .Data.data.hello }}
           rotation_note={{ .Data.data.rotation_note }}
           {{- end -}}
+        # Dynamic Postgres credentials from Vault's database secrets engine.
+        # Each render produces a NEW username/password with 1h TTL; the
+        # sidecar re-renders before expiry. rag-service doesn't consume
+        # this file yet — it's a proof-of-life for the dynamic-creds path.
+        vault.hashicorp.com/agent-inject-secret-db-creds: "database/creds/rag-service-db"
+        # DB_HOST/DB_PORT/DB_NAME are also available as env vars on the
+        # container below (patched in by the infra overlay at apply time);
+        # included here in file form so anything that sources the file
+        # gets the full connection spec.
+        vault.hashicorp.com/agent-inject-template-db-creds: |
+          {{- with secret "database/creds/rag-service-db" -}}
+          DB_USERNAME={{ .Data.username }}
+          DB_PASSWORD={{ .Data.password }}
+          {{- end -}}
     spec:
       serviceAccountName: rag-service
       containers:
