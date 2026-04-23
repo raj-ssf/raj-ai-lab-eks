@@ -35,6 +35,7 @@ jobs:
         run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: rag-service/app
@@ -45,6 +46,22 @@ jobs:
             ${{ vars.ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Keyless cosign signing: uses the GHA OIDC token as input to Sigstore
+      # Fulcio, which issues a short-lived cert bound to this workflow's
+      # identity. Signature + cert are stored back in ECR as an OCI artifact
+      # next to the image (tag: sha256-<digest>.sig). No private key to
+      # manage. Kyverno admission controller verifies the identity matches
+      # this workflow (see kyverno-policies.tf in raj-ai-lab-eks-infra).
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        env:
+          IMAGE: ${{ vars.ECR_REPOSITORY_URL }}@${{ steps.build.outputs.digest }}
+        run: |
+          echo "Signing $IMAGE"
+          cosign sign --yes "$IMAGE"
 
       - name: Bump image tag in overlay and commit
         env:
