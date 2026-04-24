@@ -10,6 +10,7 @@ import boto3
 import httpx
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException
+from langfuse import Langfuse
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
@@ -91,6 +92,13 @@ LoggingInstrumentor().instrument(set_logging_format=False)
 # --- Clients (module-level singletons; constructed AFTER instrumenting) ---
 bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 qdrant = QdrantClient(url=QDRANT_URL)
+
+# Langfuse LLM-observability client. Reads LANGFUSE_PUBLIC_KEY,
+# LANGFUSE_SECRET_KEY, LANGFUSE_HOST from env. If the keys aren't set, the
+# SDK logs a warning and no-ops — every trace call becomes a cheap stub.
+# Production deploys should scope the key to a project; ours is one key for
+# the lab.
+langfuse_client = Langfuse()
 
 # Reusable httpx client for vLLM. Separate connect vs read timeouts: short
 # connect lets "auto" fail over quickly when the GPU node is down (connection
@@ -409,6 +417,16 @@ def search(req: SearchRequest):
 def invoke(req: InvokeRequest):
     model_id, routing = pick_model(req)
 
+    # Langfuse trace — one trace per /invoke call. Input is the raw user
+    # prompt; retrieval, LLM generation, and final response are attached
+    # as child observations below. The trace flushes asynchronously via
+    # Langfuse's internal batcher, so this doesn't add request latency.
+    trace = langfuse_client.trace(
+        name="invoke",
+        input={"prompt": req.prompt, "retrieve": req.retrieve, "top_k": req.top_k},
+        tags=[f"routing:{routing}", f"provider:{LLM_PROVIDER}"],
+    )
+
     retrieved: Optional[list[RetrievedHit]] = None
     augmented_prompt = req.prompt
 
@@ -416,7 +434,20 @@ def invoke(req: InvokeRequest):
         try:
             retrieved = search_qdrant(req.prompt, req.top_k, req.filter)
         except ClientError as e:
+            trace.update(level="ERROR", status_message=f"retrieval failed: {e}")
             raise HTTPException(status_code=502, detail=f"retrieval failed: {e}")
+
+        # Attach retrieval as a span so the Langfuse UI shows it separately
+        # from the LLM call. Output is trimmed to ID + score + truncated text
+        # so the trace stays readable for prompts that pull long passages.
+        trace.span(
+            name="retrieve",
+            input={"query": req.prompt, "top_k": req.top_k, "filter": req.filter},
+            output=[
+                {"id": h.id, "score": h.score, "text_preview": (h.text[:200] + "…") if len(h.text) > 200 else h.text}
+                for h in retrieved
+            ],
+        )
 
         if retrieved:
             context = "\n\n".join(
@@ -447,6 +478,7 @@ def invoke(req: InvokeRequest):
             provider = "vllm"
         except httpx.HTTPError as e:
             log.error("vllm call failed (provider=vllm, no fallback): %s", e)
+            trace.update(level="ERROR", status_message=f"vllm: {e}")
             raise HTTPException(status_code=502, detail=f"vllm: {e}")
 
     elif LLM_PROVIDER == "auto":
@@ -460,6 +492,7 @@ def invoke(req: InvokeRequest):
                 provider = "bedrock"
             except ClientError as be:
                 log.error("bedrock fallback also failed: %s", be)
+                trace.update(level="ERROR", status_message=f"both providers failed: {be}")
                 raise HTTPException(status_code=502, detail=str(be))
 
     else:  # "bedrock" (default) or any unrecognized value
@@ -468,7 +501,27 @@ def invoke(req: InvokeRequest):
             provider = "bedrock"
         except ClientError as e:
             log.error("bedrock converse failed for model=%s: %s", model_id, e)
+            trace.update(level="ERROR", status_message=str(e))
             raise HTTPException(status_code=502, detail=str(e))
+
+    # Langfuse 'generation' observation — LLM-specific span with token usage,
+    # model metadata, and the actual prompt/completion text. This is what
+    # makes Langfuse's cost + latency dashboards populate meaningfully.
+    trace.generation(
+        name=f"{provider}:{result.model_served}",
+        model=result.model_served,
+        input=augmented_prompt,
+        output=result.text,
+        usage={
+            "input": result.input_tokens,
+            "output": result.output_tokens,
+        },
+        metadata={
+            "provider": provider,
+            "routing": routing,
+        },
+    )
+    trace.update(output={"text": result.text, "provider": provider, "model": result.model_served})
 
     return InvokeResponse(
         model=result.model_served,

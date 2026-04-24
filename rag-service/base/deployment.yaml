@@ -83,6 +83,14 @@ spec:
               value: "3"
             - name: VLLM_TIMEOUT_SECONDS
               value: "120"
+            # Langfuse LLM-observability. Host is cluster-internal so traces
+            # don't round-trip through the ingress. Public + Secret keys
+            # come from a K8s Secret provisioned by Terraform from tfvars
+            # (see langfuse-rag-creds.tf). If the Secret is missing or the
+            # keys are empty, the Langfuse SDK logs a warning and no-ops —
+            # the /invoke path keeps working without observability.
+            - name: LANGFUSE_HOST
+              value: http://langfuse-web.langfuse.svc.cluster.local:3000
             # OpenTelemetry → Tempo OTLP gRPC receiver in the monitoring namespace.
             - name: OTEL_SERVICE_NAME
               value: rag-service
@@ -92,6 +100,16 @@ spec:
               value: grpc
             - name: OTEL_EXPORTER_OTLP_INSECURE
               value: "true"
+          envFrom:
+            # LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY from a K8s Secret
+            # provisioned by Terraform. optional=true so rag-service still
+            # starts if the Secret hasn't been created yet (e.g., Langfuse
+            # keys haven't been minted). Langfuse SDK gracefully degrades
+            # when keys are missing — it logs a warning and no-ops trace
+            # calls.
+            - secretRef:
+                name: rag-service-langfuse
+                optional: true
           resources:
             requests:
               cpu: 100m
