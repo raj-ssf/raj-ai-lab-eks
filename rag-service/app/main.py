@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
 import boto3
+import httpx
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -53,6 +54,21 @@ CHUNK_SIZE_DEFAULT = int(os.environ.get("RAG_CHUNK_SIZE", "500"))
 CHUNK_OVERLAP_DEFAULT = int(os.environ.get("RAG_CHUNK_OVERLAP", "50"))
 EMBED_CONCURRENCY = int(os.environ.get("RAG_EMBED_CONCURRENCY", "8"))
 
+# Hybrid routing: which LLM tier serves /invoke.
+#   bedrock — always Bedrock (Nova). Lowest latency, managed.
+#   vllm    — always vLLM (self-hosted 70B). Bigger model, GPU-backed.
+#             Fails loudly if vLLM is unreachable (GPU node group off, etc.).
+#   auto    — try vLLM first; on connection error or 5xx, fall back to
+#             Bedrock. Cost tradeoff: Bedrock is per-token, vLLM is per-GPU-
+#             hour (only billed while the node is up). In "auto" with GPU
+#             scaled to zero, connection-refused returns in <1s so the
+#             Bedrock fallback adds negligible latency.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "bedrock")  # bedrock|vllm|auto
+VLLM_URL = os.environ.get("VLLM_URL", "http://vllm.llm.svc.cluster.local:8000")
+VLLM_MODEL_NAME = os.environ.get("VLLM_MODEL_NAME", "llama-3.3-70b")
+VLLM_TIMEOUT_SECONDS = float(os.environ.get("VLLM_TIMEOUT_SECONDS", "120"))
+VLLM_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("VLLM_CONNECT_TIMEOUT_SECONDS", "3"))
+
 # Payload keys the service manages itself. Excluded from the `metadata` field
 # in search results so callers only see what they put there at ingest time.
 RESERVED_PAYLOAD_KEYS = {"text", "parent_id", "chunk_index", "original_id"}
@@ -75,6 +91,20 @@ LoggingInstrumentor().instrument(set_logging_format=False)
 # --- Clients (module-level singletons; constructed AFTER instrumenting) ---
 bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 qdrant = QdrantClient(url=QDRANT_URL)
+
+# Reusable httpx client for vLLM. Separate connect vs read timeouts: short
+# connect lets "auto" fail over quickly when the GPU node is down (connection
+# refused returns in <1s); longer read accommodates 70B's tokens-per-second
+# on 4x A10G for long completions.
+vllm_client = httpx.Client(
+    base_url=VLLM_URL,
+    timeout=httpx.Timeout(
+        connect=VLLM_CONNECT_TIMEOUT_SECONDS,
+        read=VLLM_TIMEOUT_SECONDS,
+        write=10.0,
+        pool=5.0,
+    ),
+)
 
 
 def ensure_collection() -> None:
@@ -191,6 +221,9 @@ class RetrievedHit(BaseModel):
 class InvokeResponse(BaseModel):
     model: str
     routing: Literal["auto", "explicit"]
+    # Which tier actually served: bedrock-managed or self-hosted vllm. Callers
+    # can use this to attribute cost / latency distributions.
+    provider: Literal["bedrock", "vllm"]
     retrieved: Optional[list[RetrievedHit]] = None
     text: str
     input_tokens: int
@@ -256,6 +289,52 @@ def search_qdrant(
             )
         )
     return results
+
+
+# --- LLM dispatchers ---
+class LLMResult(BaseModel):
+    """Provider-agnostic view of an LLM response."""
+    text: str
+    input_tokens: int
+    output_tokens: int
+    model_served: str  # model ID / name the provider actually served
+
+
+def call_bedrock(model_id: str, prompt: str, max_tokens: int) -> LLMResult:
+    """Invoke Bedrock Converse API. Raises botocore ClientError on failure."""
+    response = bedrock.converse(
+        modelId=model_id,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": max_tokens},
+    )
+    return LLMResult(
+        text=response["output"]["message"]["content"][0]["text"],
+        input_tokens=response["usage"]["inputTokens"],
+        output_tokens=response["usage"]["outputTokens"],
+        model_served=model_id,
+    )
+
+
+def call_vllm(prompt: str, max_tokens: int) -> LLMResult:
+    """Invoke the self-hosted vLLM OpenAI-compatible endpoint. Raises
+    httpx.HTTPError on network failure or non-2xx status — callers in 'auto'
+    mode catch and fall back to Bedrock."""
+    resp = vllm_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": VLLM_MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+        },
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    return LLMResult(
+        text=body["choices"][0]["message"]["content"],
+        input_tokens=body["usage"]["prompt_tokens"],
+        output_tokens=body["usage"]["completion_tokens"],
+        model_served=body.get("model", VLLM_MODEL_NAME),
+    )
 
 
 # --- Endpoints ---
@@ -351,26 +430,52 @@ def invoke(req: InvokeRequest):
             )
 
     log.info(
-        "invoke routing=%s model=%s prompt_chars=%d retrieve=%s hits=%d",
-        routing, model_id, len(req.prompt), req.retrieve,
+        "invoke routing=%s model=%s provider=%s prompt_chars=%d retrieve=%s hits=%d",
+        routing, model_id, LLM_PROVIDER, len(req.prompt), req.retrieve,
         len(retrieved) if retrieved else 0,
     )
 
-    try:
-        response = bedrock.converse(
-            modelId=model_id,
-            messages=[{"role": "user", "content": [{"text": augmented_prompt}]}],
-            inferenceConfig={"maxTokens": req.max_tokens},
-        )
-    except ClientError as e:
-        log.error("bedrock converse failed for model=%s: %s", model_id, e)
-        raise HTTPException(status_code=502, detail=str(e))
+    # Dispatch based on LLM_PROVIDER. "auto" tries vLLM first and falls back
+    # to Bedrock on connection/HTTP errors — this makes the deployment
+    # resilient to the GPU node group being scaled to zero between demos.
+    result: LLMResult
+    provider: Literal["bedrock", "vllm"]
+
+    if LLM_PROVIDER == "vllm":
+        try:
+            result = call_vllm(augmented_prompt, req.max_tokens)
+            provider = "vllm"
+        except httpx.HTTPError as e:
+            log.error("vllm call failed (provider=vllm, no fallback): %s", e)
+            raise HTTPException(status_code=502, detail=f"vllm: {e}")
+
+    elif LLM_PROVIDER == "auto":
+        try:
+            result = call_vllm(augmented_prompt, req.max_tokens)
+            provider = "vllm"
+        except httpx.HTTPError as e:
+            log.warning("vllm unreachable, falling back to bedrock: %s", e)
+            try:
+                result = call_bedrock(model_id, augmented_prompt, req.max_tokens)
+                provider = "bedrock"
+            except ClientError as be:
+                log.error("bedrock fallback also failed: %s", be)
+                raise HTTPException(status_code=502, detail=str(be))
+
+    else:  # "bedrock" (default) or any unrecognized value
+        try:
+            result = call_bedrock(model_id, augmented_prompt, req.max_tokens)
+            provider = "bedrock"
+        except ClientError as e:
+            log.error("bedrock converse failed for model=%s: %s", model_id, e)
+            raise HTTPException(status_code=502, detail=str(e))
 
     return InvokeResponse(
-        model=model_id,
+        model=result.model_served,
         routing=routing,
+        provider=provider,
         retrieved=retrieved,
-        text=response["output"]["message"]["content"][0]["text"],
-        input_tokens=response["usage"]["inputTokens"],
-        output_tokens=response["usage"]["outputTokens"],
+        text=result.text,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
     )

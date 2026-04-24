@@ -68,6 +68,21 @@ spec:
               value: "1024"
             - name: RAG_DEFAULT_TOP_K
               value: "3"
+            # Hybrid LLM routing. Default 'bedrock' preserves the original
+            # behaviour — Bedrock Nova always serves /invoke, regardless of
+            # whether the vLLM path is up. Flip to 'auto' during demos to
+            # prefer self-hosted vLLM with Bedrock as the fallback, or 'vllm'
+            # to force self-hosted (fails hard if vLLM is down).
+            - name: LLM_PROVIDER
+              value: bedrock   # bedrock | vllm | auto
+            - name: VLLM_URL
+              value: http://vllm.llm.svc.cluster.local:8000
+            - name: VLLM_MODEL_NAME
+              value: llama-3.3-70b
+            - name: VLLM_CONNECT_TIMEOUT_SECONDS
+              value: "3"
+            - name: VLLM_TIMEOUT_SECONDS
+              value: "120"
             # OpenTelemetry → Tempo OTLP gRPC receiver in the monitoring namespace.
             - name: OTEL_SERVICE_NAME
               value: rag-service

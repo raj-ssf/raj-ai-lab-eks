@@ -1,6 +1,10 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 boto3==1.35.30
+# httpx is already pulled in transitively (qdrant-client, otel instrumentation)
+# but we use it directly for the vLLM OpenAI-compat client — pin to avoid
+# surprises from indirect-dep version drift.
+httpx==0.27.2
 pydantic==2.9.2
 qdrant-client==1.12.1
 prometheus-fastapi-instrumentator==7.0.0
