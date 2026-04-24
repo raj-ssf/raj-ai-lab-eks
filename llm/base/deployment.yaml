@@ -93,6 +93,11 @@ spec:
             - "0.0.0.0"
             - "--port"
             - "8000"
+            # OTLP gRPC tracing — each inference call becomes a trace span
+            # in Tempo. Pairs with rag-service's existing OTel spans so a
+            # single /invoke request shows rag-service → vllm end-to-end.
+            - "--otlp-traces-endpoint"
+            - "http://tempo.monitoring.svc.cluster.local:4317"
           ports:
             - name: http
               containerPort: 8000
@@ -107,6 +112,11 @@ spec:
             # check since /dev/shm is already sized for it via the shm volume.
             - name: NCCL_DEBUG
               value: "WARN"
+            # OTel attribution: vllm reads OTEL_SERVICE_NAME when
+            # --otlp-traces-endpoint is set, so spans land under 'vllm'
+            # in Tempo/Grafana rather than the default 'unknown_service'.
+            - name: OTEL_SERVICE_NAME
+              value: vllm
           resources:
             requests:
               # 4 A10G GPUs consumed by one pod. No other vLLM pod can
