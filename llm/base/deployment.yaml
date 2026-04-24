@@ -5,10 +5,16 @@ metadata:
   labels:
     app: vllm
 spec:
-  replicas: 1
+  # Steady-state off. GPU nodes are demo-on-demand: `kubectl -n llm scale
+  # deployment vllm --replicas=1` triggers Karpenter to provision a node
+  # (~60-90s); scaling back to 0 triggers consolidation (~30s). The
+  # ArgoCD Application for vllm is wired with ignoreDifferences on
+  # /spec/replicas + RespectIgnoreDifferences=true, so selfHeal will not
+  # revert a manual scale — see argocd-apps.tf:vllm_app in the infra repo.
+  replicas: 0
   # GPU pods aren't great candidates for rolling updates on a single-node
   # GPU pool — Recreate avoids trying to schedule a second 4-GPU pod when
-  # only one fits. Scale up the node group before changing this.
+  # only one fits.
   strategy:
     type: Recreate
   selector:
