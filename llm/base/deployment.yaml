@@ -93,11 +93,14 @@ spec:
             - "0.0.0.0"
             - "--port"
             - "8000"
-            # OTLP gRPC tracing — each inference call becomes a trace span
-            # in Tempo. Pairs with rag-service's existing OTel spans so a
-            # single /invoke request shows rag-service → vllm end-to-end.
-            - "--otlp-traces-endpoint"
-            - "http://tempo.monitoring.svc.cluster.local:4317"
+            # OTLP tracing disabled: stock vllm/vllm-openai:v0.7.2 image
+            # doesn't ship OpenTelemetry Python packages, so setting
+            # --otlp-traces-endpoint crashes engine init with
+            # 'ModuleNotFoundError: No module named opentelemetry'.
+            # Restore by layering a custom image that pip-installs
+            # opentelemetry-api / sdk / exporter-otlp on top of upstream,
+            # then set the flag back. Prometheus /metrics path is
+            # unaffected — ServiceMonitor continues to scrape it.
           ports:
             - name: http
               containerPort: 8000
@@ -112,9 +115,9 @@ spec:
             # check since /dev/shm is already sized for it via the shm volume.
             - name: NCCL_DEBUG
               value: "WARN"
-            # OTel attribution: vllm reads OTEL_SERVICE_NAME when
-            # --otlp-traces-endpoint is set, so spans land under 'vllm'
-            # in Tempo/Grafana rather than the default 'unknown_service'.
+            # OTel service name — harmless when the traces endpoint isn't
+            # configured (vllm only reads this when tracing is active).
+            # Kept so re-enabling the endpoint is a 1-line flag-flip.
             - name: OTEL_SERVICE_NAME
               value: vllm
           resources:
