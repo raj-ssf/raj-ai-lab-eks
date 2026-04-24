@@ -20,6 +20,14 @@ spec:
         app: vllm
     spec:
       serviceAccountName: vllm
+      # Disable Docker-link-style Service env var injection. Kubernetes
+      # otherwise injects VLLM_SERVICE_HOST / VLLM_SERVICE_PORT / VLLM_PORT
+      # etc. for every Service in the namespace — and 'VLLM_PORT' happens
+      # to be vLLM's own native env var for the server bind port. K8s
+      # injects 'tcp://IP:8000', vLLM tries to int() that, crashes with
+      # ValueError at engine start. Modern K8s opinion is service links
+      # are legacy anyway (use DNS: vllm.llm.svc.cluster.local).
+      enableServiceLinks: false
       # Target the dedicated GPU node group only.
       nodeSelector:
         nvidia.com/gpu.present: "true"
