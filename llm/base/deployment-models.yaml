@@ -1,0 +1,402 @@
+# Model-axis test variants. One Deployment per model, each paired
+# with:
+#   - A sensible default GPU (nodeSelector on node.kubernetes.io/instance-type)
+#   - Its own PVC for "hot" models (weights cached in-cluster) or
+#     the S3 Mountpoint PVC for the "giant" 405B
+#   - Appropriate --tensor-parallel-size, quantization, and max-model-len
+#
+# All scale to 0 by default. Bring one up with:
+#   kubectl -n llm scale deployment vllm-<name> --replicas=1
+# Reach it via `kubectl port-forward deployment/vllm-<name> 8000:8000`.
+#
+# To retarget a model to a different GPU (e.g., run Mixtral on
+# g6.12xlarge instead of g6e.xlarge), edit the nodeSelector below and
+# `git push` — ArgoCD will sync but won't touch the replica count
+# (ignoreDifferences protects /spec/replicas only).
+
+---
+# Llama 3.1 8B Instruct (FP16) on 1× NVIDIA L40S 48GB (g6e.xlarge).
+# Minimum viable demo — shows the cost-throughput curve's bottom end
+# at ~$1.86/hr. TP=1, no NCCL; cold start is dominated by initial
+# aws s3 sync (~30s for 16 GB over the VPC endpoint).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-8b
+  labels:
+    app: vllm-llama-8b
+    vllm-model: llama-3.1-8b
+spec:
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-llama-8b
+  template:
+    metadata:
+      labels:
+        app: vllm-llama-8b
+        vllm-model: llama-3.1-8b
+    spec:
+      serviceAccountName: vllm
+      enableServiceLinks: false
+      nodeSelector:
+        node.kubernetes.io/instance-type: g6e.xlarge
+      tolerations:
+        - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
+        - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_REGION, value: us-west-2 }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-instruct/ }
+            - { name: MODEL_PATH, value: /model }
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws configure set default.s3.max_concurrent_requests 32
+              aws configure set default.s3.multipart_chunksize 128MB
+              aws s3 sync "$S3_URI" "$MODEL_PATH" --no-progress
+              ls -la "$MODEL_PATH"
+          resources:
+            requests: { cpu: "1", memory: "1Gi" }
+            limits:   { cpu: "2", memory: "2Gi" }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:placeholder
+          args:
+            - "--model"
+            - "/model"
+            - "--served-model-name"
+            - "llama-3.1-8b"
+            - "--tensor-parallel-size"
+            - "1"
+            - "--dtype"
+            - "half"
+            - "--max-model-len"
+            - "8192"
+            - "--gpu-memory-utilization"
+            - "0.85"
+            - "--enforce-eager"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: HF_HUB_OFFLINE,       value: "1" }
+            - { name: TRANSFORMERS_OFFLINE, value: "1" }
+            - { name: OTEL_SERVICE_NAME,    value: vllm-llama-8b }
+          resources:
+            requests: { nvidia.com/gpu: "1", cpu: "2", memory: "8Gi" }
+            limits:   { nvidia.com/gpu: "1", cpu: "3", memory: "28Gi" }
+          startupProbe:  { httpGet: { path: /health, port: http }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 60 }
+          readinessProbe:{ httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
+          livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: shm,         mountPath: /dev/shm }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache-llama-8b
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 2Gi }
+
+---
+# Mixtral 8x7B Instruct AWQ on 1× NVIDIA L40S 48GB (g6e.xlarge).
+# MoE architecture demo — 8 experts × 7B params, router activates 2
+# per token. Quantized AWQ fits in ~28 GB VRAM with plenty of KV cache
+# headroom. Inference is faster per token than dense 70B due to the
+# sparse activation (only ~13B params used per forward pass).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-mixtral-8x7b
+  labels:
+    app: vllm-mixtral-8x7b
+    vllm-model: mixtral-8x7b-awq
+spec:
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-mixtral-8x7b
+  template:
+    metadata:
+      labels:
+        app: vllm-mixtral-8x7b
+        vllm-model: mixtral-8x7b-awq
+    spec:
+      serviceAccountName: vllm
+      enableServiceLinks: false
+      nodeSelector:
+        node.kubernetes.io/instance-type: g6e.xlarge
+      tolerations:
+        - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
+        - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_REGION, value: us-west-2 }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/mixtral-8x7b-instruct-awq/ }
+            - { name: MODEL_PATH, value: /model }
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws configure set default.s3.max_concurrent_requests 32
+              aws configure set default.s3.multipart_chunksize 128MB
+              aws s3 sync "$S3_URI" "$MODEL_PATH" --no-progress
+              ls -la "$MODEL_PATH"
+          resources:
+            requests: { cpu: "1", memory: "1Gi" }
+            limits:   { cpu: "2", memory: "2Gi" }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:placeholder
+          args:
+            - "--model"
+            - "/model"
+            - "--served-model-name"
+            - "mixtral-8x7b"
+            - "--tensor-parallel-size"
+            - "1"
+            - "--quantization"
+            - "awq"
+            - "--dtype"
+            - "half"
+            - "--max-model-len"
+            - "16384"
+            - "--gpu-memory-utilization"
+            - "0.88"
+            - "--enforce-eager"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: HF_HUB_OFFLINE,       value: "1" }
+            - { name: TRANSFORMERS_OFFLINE, value: "1" }
+            - { name: OTEL_SERVICE_NAME,    value: vllm-mixtral-8x7b }
+          resources:
+            requests: { nvidia.com/gpu: "1", cpu: "2", memory: "12Gi" }
+            limits:   { nvidia.com/gpu: "1", cpu: "3", memory: "28Gi" }
+          startupProbe:  { httpGet: { path: /health, port: http }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 60 }
+          readinessProbe:{ httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
+          livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: shm,         mountPath: /dev/shm }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache-mixtral-8x7b
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 2Gi }
+
+---
+# Llama 3.2 11B Vision Instruct on 1× NVIDIA L40S 48GB (g6e.xlarge).
+# Multimodal demo — accepts image URLs + text in the OpenAI-compat
+# /v1/chat/completions schema (messages[].content can be a list with
+# text and image_url parts). Lower max-model-len because image tokens
+# eat context (each image ~1600-6400 tokens depending on resolution).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-vision-11b
+  labels:
+    app: vllm-llama-vision-11b
+    vllm-model: llama-3.2-11b-vision
+spec:
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-llama-vision-11b
+  template:
+    metadata:
+      labels:
+        app: vllm-llama-vision-11b
+        vllm-model: llama-3.2-11b-vision
+    spec:
+      serviceAccountName: vllm
+      enableServiceLinks: false
+      nodeSelector:
+        node.kubernetes.io/instance-type: g6e.xlarge
+      tolerations:
+        - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
+        - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_REGION, value: us-west-2 }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.2-11b-vision-instruct/ }
+            - { name: MODEL_PATH, value: /model }
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws configure set default.s3.max_concurrent_requests 32
+              aws configure set default.s3.multipart_chunksize 128MB
+              aws s3 sync "$S3_URI" "$MODEL_PATH" --no-progress
+              ls -la "$MODEL_PATH"
+          resources:
+            requests: { cpu: "1", memory: "1Gi" }
+            limits:   { cpu: "2", memory: "2Gi" }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:placeholder
+          args:
+            - "--model"
+            - "/model"
+            - "--served-model-name"
+            - "llama-3.2-vision"
+            - "--tensor-parallel-size"
+            - "1"
+            - "--dtype"
+            - "half"
+            - "--max-model-len"
+            - "4096"
+            - "--max-num-seqs"
+            - "8"
+            - "--gpu-memory-utilization"
+            - "0.85"
+            - "--enforce-eager"
+            - "--limit-mm-per-prompt"
+            - "image=1"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: HF_HUB_OFFLINE,       value: "1" }
+            - { name: TRANSFORMERS_OFFLINE, value: "1" }
+            - { name: OTEL_SERVICE_NAME,    value: vllm-llama-vision-11b }
+          resources:
+            requests: { nvidia.com/gpu: "1", cpu: "2", memory: "12Gi" }
+            limits:   { nvidia.com/gpu: "1", cpu: "3", memory: "28Gi" }
+          startupProbe:  { httpGet: { path: /health, port: http }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 60 }
+          readinessProbe:{ httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
+          livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: shm,         mountPath: /dev/shm }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache-llama-vision-11b
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 2Gi }
+
+---
+# Llama 3.1 405B Instruct AWQ on 8× NVIDIA A100 40GB (p4d.24xlarge).
+# SOTA open-weight flagship. AWQ-quantized ~230 GB distributes across
+# 8× 40GB A100s at TP=8 (~29 GB per GPU + KV cache).
+#
+# Storage model: S3 Mountpoint, not a local PVC. The vllm-cache-llama-405b
+# PVC binds to the statically-provisioned vllm-405b-s3mp PV (see
+# pv-llama-405b.yaml) which mounts s3://.../llama-3.1-405b-instruct-awq/
+# as a read-only filesystem at /model. No init-container aws s3 sync
+# step — the S3 Mountpoint mount IS the model source.
+#
+# Cold start: ~6 min (weights fault in from S3 during vLLM's layer
+# load). Subsequent pod restarts replay the same cost (no between-pod
+# caching). For repeat-demos within a single session, keep the pod up.
+#
+# CAUTION: p4d.24xlarge is ~$32.77/hr. A full demo cycle (90s provision
+# + 6 min cold-start + 5 min inference + 30s consolidate ≈ 13 min) is
+# ~$7. The variant intentionally uses p4d instead of p5 ($98/hr) unless
+# you override the nodeSelector — A100 is plenty for this workload.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-405b
+  labels:
+    app: vllm-llama-405b
+    vllm-model: llama-3.1-405b-awq
+spec:
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-llama-405b
+  template:
+    metadata:
+      labels:
+        app: vllm-llama-405b
+        vllm-model: llama-3.1-405b-awq
+    spec:
+      serviceAccountName: vllm
+      enableServiceLinks: false
+      nodeSelector:
+        node.kubernetes.io/instance-type: p4d.24xlarge
+      tolerations:
+        - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
+        - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
+      # No init container — the S3 Mountpoint PVC provides /model
+      # directly. vLLM reads weights through the mount on first access.
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:placeholder
+          args:
+            - "--model"
+            - "/model"
+            - "--served-model-name"
+            - "llama-3.1-405b"
+            - "--tensor-parallel-size"
+            - "8"
+            - "--quantization"
+            - "awq"
+            - "--dtype"
+            - "half"
+            - "--max-model-len"
+            - "8192"
+            - "--gpu-memory-utilization"
+            - "0.85"
+            - "--enforce-eager"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: HF_HUB_OFFLINE,       value: "1" }
+            - { name: TRANSFORMERS_OFFLINE, value: "1" }
+            - { name: NCCL_DEBUG,           value: "WARN" }
+            - { name: OTEL_SERVICE_NAME,    value: vllm-llama-405b }
+          resources:
+            requests: { nvidia.com/gpu: "8", cpu: "16", memory: "128Gi" }
+            limits:   { nvidia.com/gpu: "8", cpu: "64", memory: "400Gi" }
+          # Longer startup grace than other variants — 405B via S3
+          # Mountpoint needs ~6 min to fault in all weights. 120 ×
+          # 10s = 20 min window before the kubelet gives up.
+          startupProbe:  { httpGet: { path: /health, port: http }, initialDelaySeconds: 60, periodSeconds: 10, failureThreshold: 120 }
+          readinessProbe:{ httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
+          livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: shm,         mountPath: /dev/shm }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache-llama-405b
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }

@@ -4,6 +4,14 @@ kind: Kustomization
 resources:
   - serviceaccount.yaml
   - pvc.yaml
+  # Per-model PVCs for "hot" model variants (8B, Mixtral 8x7B,
+  # Llama 3.2 Vision 11B). Each is a dedicated gp3 cache.
+  - pvcs-models.yaml
+  # Statically-provisioned PV + PVC backed by S3 Mountpoint for the
+  # 230 GB Llama 3.1 405B model — avoids a dedicated EBS PVC for a
+  # rare-use weights set. Requires the aws-mountpoint-s3-csi-driver
+  # EKS add-on (raj-ai-lab-eks-infra/mountpoint-s3-csi.tf).
+  - pv-llama-405b.yaml
   - deployment.yaml
   # Hardware-comparison test variants. Each is an additional named
   # Deployment pinned to one instance type via nodeSelector; all
@@ -11,6 +19,10 @@ resources:
   # Not exposed via the main llm.ekstest.com Service — reach them
   # via `kubectl port-forward deployment/<name>`.
   - deployment-variants.yaml
+  # Model-axis test variants — one Deployment per model, each paired
+  # with its dedicated PVC (or S3 Mountpoint PVC for 405B). Replicas=0
+  # by default; kubectl scale to bring one online for a demo.
+  - deployment-models.yaml
   - service.yaml
   - ingress.yaml
   - servicemonitor.yaml

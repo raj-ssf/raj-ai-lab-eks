@@ -1,0 +1,75 @@
+# S3 Mountpoint PV + PVC for Llama 3.1 405B Instruct AWQ (~230 GB).
+#
+# Rationale: a 250+ GiB gp3 PVC idling between rare demos costs $20/mo.
+# S3 Standard is $0.023/GB-month + free egress to in-region EC2, so
+# the same 230 GB of weights in S3 = $5.30/mo and amortizes to effectively
+# zero when we're not demoing. Tradeoff: cold-start is slower — weights
+# stream from S3 as vLLM mmap-faults them during layer loading, ~6 min
+# vs ~2 min on a warm PVC.
+#
+# Uses the aws-mountpoint-s3-csi-driver EKS add-on (installed via
+# raj-ai-lab-eks-infra/mountpoint-s3-csi.tf). Driver IAM is read-only,
+# so this PV is effectively a read-only view of the S3 prefix —
+# attempts to write would 403 at S3 even if the client tried.
+#
+# The PV must be statically provisioned (bound by name) because the
+# CSI driver doesn't support dynamic provisioning for a specific
+# bucket/prefix — that's a provisioner-level concept. The PVC below
+# references the PV via `volumeName`.
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: vllm-405b-s3mp
+  labels:
+    app: vllm
+    model: llama-3.1-405b-awq
+spec:
+  capacity:
+    # This value is advisory — S3 has no practical upper bound and
+    # the CSI driver ignores it. Set to match our accounting
+    # expectations: 230 GB weights + 20 GB slack for future shards.
+    storage: 250Gi
+  # ReadOnlyMany — multiple pods can mount concurrently. We only
+  # ever run one vllm-llama-405b pod at a time (p4d/p5 are too
+  # expensive to parallelize), but ROX is more honest about the
+  # underlying S3 object-store semantics than RWO.
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""  # empty = static binding, no provisioner
+  mountOptions:
+    # Read-only mount at the driver level. Belt with the IAM
+    # suspenders — the driver's IAM role only has GetObject +
+    # ListBucket, so writes fail regardless.
+    - read-only
+    # Bucket region (not auto-detected by the driver; required when
+    # cluster and bucket are in the same region anyway).
+    - region us-west-2
+    # Mount only objects under this S3 prefix. The prefix is stripped
+    # from visible paths — so /model/config.json in the pod maps to
+    # s3://raj-ai-lab-eks-model-weights/llama-3.1-405b-instruct-awq/config.json
+    - prefix llama-3.1-405b-instruct-awq/
+  csi:
+    driver: s3.csi.aws.com
+    volumeHandle: s3-csi-vllm-llama-405b
+    volumeAttributes:
+      bucketName: raj-ai-lab-eks-model-weights
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-llama-405b
+  labels:
+    app: vllm
+    model: llama-3.1-405b-awq
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 250Gi
+  volumeName: vllm-405b-s3mp
+  storageClassName: ""

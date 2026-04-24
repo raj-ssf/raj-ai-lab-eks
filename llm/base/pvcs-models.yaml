@@ -1,0 +1,64 @@
+# Per-model PVCs — one cache per "hot" model. Separate from
+# vllm-model-cache (60 GiB, Llama 3.3 70B AWQ) so each model's
+# working set survives across pod restarts without competing for
+# space. All gp3 via the cluster-default StorageClass.
+#
+# Each PVC stays in us-west-2c (the vllm-model-cache zone) because
+# EBS is AZ-locked and our gpu-experiments Karpenter NodePool is
+# zone-pinned to us-west-2c. If an experiment ever runs in another
+# AZ, the PVC binds will fail with FailedAttachVolume and the pod
+# stays Pending.
+#
+# Giant models (Llama 3.1 405B AWQ at ~230 GB) do NOT get a PVC here
+# — see pv-llama-405b.yaml for the S3 Mountpoint-backed alternative.
+#
+# Rough idle cost: 30 + 50 + 40 = 120 GiB × $0.08/GB-mo ≈ $9.60/mo.
+
+---
+# Llama 3.1 8B Instruct (FP16) — 16 GB on disk, 30 GiB PVC leaves
+# headroom for aws-s3-sync's transient staging files + a bit of slack.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-llama-8b
+  labels:
+    app: vllm
+    model: llama-3.1-8b
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 30Gi
+
+---
+# Mixtral 8x7B Instruct AWQ — 28 GB on disk (MoE-quantized), 50 GiB
+# PVC. Larger margin for Mixtral's multi-shard safetensors layout.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-mixtral-8x7b
+  labels:
+    app: vllm
+    model: mixtral-8x7b-awq
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+# Llama 3.2 11B Vision Instruct (FP16) — 22 GB on disk; 40 GiB PVC
+# allows for the vision preprocessor weights + future minor version
+# bumps without re-provisioning.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-llama-vision-11b
+  labels:
+    app: vllm
+    model: llama-3.2-11b-vision
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 40Gi
