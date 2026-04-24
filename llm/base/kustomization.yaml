@@ -5,6 +5,12 @@ resources:
   - serviceaccount.yaml
   - pvc.yaml
   - deployment.yaml
+  # Hardware-comparison test variants. Each is an additional named
+  # Deployment pinned to one instance type via nodeSelector; all
+  # steady-state replicas=0. Activated per-test by kubectl scale.
+  # Not exposed via the main llm.ekstest.com Service — reach them
+  # via `kubectl port-forward deployment/<name>`.
+  - deployment-variants.yaml
   - service.yaml
   - ingress.yaml
   - servicemonitor.yaml
