@@ -1,0 +1,154 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  labels:
+    app: vllm
+spec:
+  replicas: 1
+  # GPU pods aren't great candidates for rolling updates on a single-node
+  # GPU pool — Recreate avoids trying to schedule a second 4-GPU pod when
+  # only one fits. Scale up the node group before changing this.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      serviceAccountName: vllm
+      # Target the dedicated GPU node group only.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      # Init container streams weights from S3 to the PVC. First pod ever:
+      # ~60s for a 38 GB sync over AWS backbone. Subsequent pod restarts:
+      # seconds (aws s3 sync skips files already present).
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.17.0  # ships awscli v2 + Pod Identity support
+          env:
+            - name: AWS_REGION
+              value: us-west-2
+            - name: S3_URI
+              value: s3://raj-ai-lab-eks-model-weights/llama-3.3-70b-instruct-awq/
+            - name: MODEL_PATH
+              value: /model
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws configure set default.s3.max_concurrent_requests 32
+              aws configure set default.s3.multipart_chunksize 128MB
+              aws s3 sync "$S3_URI" "$MODEL_PATH" \
+                --exclude ".cache/*" \
+                --exclude "*.metadata" \
+                --no-progress
+              ls -la "$MODEL_PATH"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "8"
+              memory: "4Gi"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model
+      containers:
+        - name: vllm
+          # OpenAI-compatible server build. Pin the tag in the overlay so
+          # version bumps don't require editing the base.
+          image: vllm/vllm-openai:placeholder
+          args:
+            - "--model"
+            - "/model"
+            - "--served-model-name"
+            - "llama-3.3-70b"
+            - "--tensor-parallel-size"
+            - "4"
+            - "--quantization"
+            - "awq"          # vLLM auto-picks the marlin kernel on Ampere (A10G)
+            - "--dtype"
+            - "half"         # FP16 activations
+            - "--max-model-len"
+            - "16384"        # conservative; bump if KV cache has room
+            - "--gpu-memory-utilization"
+            - "0.92"
+            - "--enforce-eager"   # skip CUDA graph capture → faster cold start, -15% tokens/sec
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # Skip HF's telemetry ping on startup (no network anyway, but
+            # avoids a blocking retry during init).
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            # NCCL across 4 GPUs — disable the P2P shared-memory transport
+            # check since /dev/shm is already sized for it via the shm volume.
+            - name: NCCL_DEBUG
+              value: "WARN"
+          resources:
+            requests:
+              # 4 A10G GPUs consumed by one pod. No other vLLM pod can
+              # coschedule on this node until this one scales down.
+              nvidia.com/gpu: "4"
+              cpu: "8"
+              # Host RAM during vLLM init: weights are mmap'd from disk
+              # then copied to GPU VRAM; transient peak ~45 GB.
+              memory: "64Gi"
+            limits:
+              nvidia.com/gpu: "4"
+              cpu: "32"
+              memory: "120Gi"
+          # vLLM cold start for 70B AWQ across 4 GPUs: ~2-3 min (s3 sync
+          # already done). startupProbe gives it a 10-minute window before
+          # the kubelet gives up; readiness takes over once it responds.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-model-cache
+        # NCCL's P2P + vLLM's tensor-parallel IPC use /dev/shm heavily.
+        # Default container shm is 64 MiB — far too small for 70B across
+        # 4 GPUs. Memory-backed emptyDir bypasses disk and grows as needed
+        # up to the sizeLimit.
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi

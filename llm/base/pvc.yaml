@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-model-cache
+  labels:
+    app: vllm
+spec:
+  # Default SC is gp3 (set cluster-wide in raj-ai-lab-eks-infra/
+  # storage-classes.tf). EBS CSI dynamically provisions on first bind.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # 60 GiB covers the 38 GB AWQ checkpoint + headroom for:
+      #   - aws s3 sync's partial-copy staging files
+      #   - a second model's worth of weights if we multi-model later
+      # EBS gp3 at $0.08/GB-month ≈ $5/mo while the PVC exists,
+      # whether or not the Deployment is scaled up.
+      storage: 60Gi
