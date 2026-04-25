@@ -1,0 +1,94 @@
+name: Build and push langgraph-service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "langgraph-service/app/**"
+      - ".github/workflows/build-push-langgraph-service.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write      # required for AWS OIDC federation
+  contents: write      # required to commit overlay tag back
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: langgraph-service/app
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ vars.LANGGRAPH_ECR_REPOSITORY_URL }}:latest
+            ${{ vars.LANGGRAPH_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Keyless cosign signing — same pattern as rag-service. The
+      # Kyverno verify policy in raj-ai-lab-eks-infra needs to be
+      # extended to accept this workflow's identity for langgraph-service
+      # images (see kyverno-policies.tf for the rag-service entry to
+      # mirror).
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        env:
+          IMAGE: ${{ vars.LANGGRAPH_ECR_REPOSITORY_URL }}@${{ steps.build.outputs.digest }}
+        run: |
+          echo "Signing $IMAGE"
+          cosign sign --yes "$IMAGE"
+
+      - name: Bump image tag in overlay and commit
+        env:
+          TAG: sha-${{ steps.sha.outputs.short }}
+          OVERLAY: langgraph-service/overlays/dev/kustomization.yaml
+        run: |
+          current=$(yq '.images[] | select(.name == "langgraph-service") | .newTag' "$OVERLAY")
+          if [ "$current" = "$TAG" ]; then
+            echo "overlay already on $TAG; skipping commit"
+            exit 0
+          fi
+
+          yq -i "(.images[] | select(.name == \"langgraph-service\") | .newTag) = \"$TAG\"" "$OVERLAY"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$OVERLAY"
+          git commit -m "langgraph-service: bump image tag to $TAG"
+          git push
+
+      - name: Summary
+        run: |
+          {
+            echo "### langgraph-service image built and pushed"
+            echo ""
+            echo "**Tags:**"
+            echo "- \`${{ vars.LANGGRAPH_ECR_REPOSITORY_URL }}:latest\`"
+            echo "- \`${{ vars.LANGGRAPH_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}\`"
+            echo ""
+            echo "**Deploy:** ArgoCD auto-syncs on overlay commit."
+          } >> "$GITHUB_STEP_SUMMARY"

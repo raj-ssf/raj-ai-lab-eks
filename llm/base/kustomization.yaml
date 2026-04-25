@@ -23,6 +23,11 @@ resources:
   # with its dedicated PVC (or S3 Mountpoint PVC for 405B). Replicas=0
   # by default; kubectl scale to bring one online for a demo.
   - deployment-models.yaml
+  # Per-model-variant Services so callers (langgraph-service router,
+  # rag-service hybrid path) can address each variant by stable DNS
+  # name. The default `vllm` Service in service.yaml continues to
+  # front the canonical 70B AWQ Deployment.
+  - services-models.yaml
   - service.yaml
   - ingress.yaml
   - servicemonitor.yaml

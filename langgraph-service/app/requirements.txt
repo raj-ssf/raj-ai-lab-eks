@@ -1,0 +1,36 @@
+edyastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# LangGraph + LangChain core (pin for reproducibility — APIs evolved between
+# 0.2.x branches, future bumps need testing before merge).
+langgraph==0.2.62
+langchain-core==0.3.27
+langchain-openai==0.2.14   # OpenAI-compat client for vLLM endpoints
+
+# Langfuse v2 — same SDK choice as rag-service for trace consistency.
+# Both services emit into the same Langfuse instance; v3 has a different
+# import path and would need migration on rag-service too.
+langfuse==2.60.0
+
+# JWT validation against Keycloak's JWKs endpoint. python-jose is the
+# de-facto FastAPI choice; cryptography is its RSA backend.
+python-jose[cryptography]==3.3.0
+
+# httpx for both vLLM upstream calls and Keycloak JWKs fetch. Pinned to
+# match rag-service so OTel httpx instrumentation behaves identically.
+httpx==0.27.2
+
+# Official kubernetes client for the JIT-scale-up logic. Reads in-cluster
+# config from the pod's serviceaccount token automatically.
+kubernetes==31.0.0
+
+pydantic==2.9.2
+prometheus-fastapi-instrumentator==7.0.0
+
+# OTel — pinned identically to rag-service so traces interleave cleanly
+# in Tempo (same exporter version, same instrumentation versions).
+opentelemetry-sdk==1.29.0
+opentelemetry-exporter-otlp-proto-grpc==1.29.0
+opentelemetry-instrumentation-fastapi==0.50b0
+opentelemetry-instrumentation-httpx==0.50b0
+opentelemetry-instrumentation-logging==0.50b0

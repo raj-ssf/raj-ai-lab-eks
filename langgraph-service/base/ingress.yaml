@@ -1,0 +1,32 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: langgraph-service
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Lesson learned 2026-04-25 from the SSO debug session: when NGINX
+    # forwards into a meshed backend, the Host header must match the
+    # K8s Service DNS so source-side Envoy can route through the
+    # proper outbound|<port>||<service>.<ns>.svc.cluster.local cluster
+    # (which carries the ISTIO_MUTUAL TLS transport_socket from the
+    # force-mtls DestinationRule). Without this annotation, NGINX
+    # forwards `langgraph.ekstest.com` as the Host and Envoy falls
+    # through to PassthroughCluster (plaintext, no mTLS, RBAC deny).
+    nginx.ingress.kubernetes.io/upstream-vhost: langgraph-service.langgraph.svc.cluster.local
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - langgraph.ekstest.com  # rewritten by overlay's kustomize patch (per env)
+      secretName: langgraph-service-tls
+  rules:
+    - host: langgraph.ekstest.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: langgraph-service
+                port:
+                  number: 80

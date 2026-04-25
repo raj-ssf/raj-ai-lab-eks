@@ -1,0 +1,110 @@
+# Per-model-variant Services, sibling to the parent vllm Service.
+#
+# These give each model variant its own in-cluster DNS name on port
+# 80, so other workloads (rag-service, langgraph-service) can address
+# the variants by Service rather than direct pod IP. The variant
+# Deployments themselves are defined in deployment-models.yaml; this
+# file just adds the routing layer.
+#
+# Each Service selects its variant pods via `app: vllm-<variant>`,
+# matching the Deployment label scheme. ClusterIP → port 80 →
+# targetPort `http` (8000), so the URL pattern stays consistent
+# across variants:
+#
+#   http://vllm-llama-8b.llm.svc.cluster.local:8000   ← variant model
+#   http://vllm.llm.svc.cluster.local:8000            ← default 70B AWQ
+#
+# The named-port `http` is also what Istio uses for protocol detection
+# (HTTP-aware filter chains, not raw TCP), so the outbound|80||<svc>
+# clusters get HTTP routing semantics — important for any future
+# upstream-vhost-style header routing.
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-llama-8b
+  labels:
+    app: vllm-llama-8b
+    vllm-model: llama-3.1-8b
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-llama-8b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-mixtral-8x7b
+  labels:
+    app: vllm-mixtral-8x7b
+    vllm-model: mixtral-8x7b-awq
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-mixtral-8x7b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-llama-vision-11b
+  labels:
+    app: vllm-llama-vision-11b
+    vllm-model: llama-3.2-11b-vision
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-llama-vision-11b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-llama-405b
+  labels:
+    app: vllm-llama-405b
+    vllm-model: llama-3.1-405b-awq
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-llama-405b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-deepseek-r1-70b
+  labels:
+    app: vllm-deepseek-r1-70b
+    vllm-model: deepseek-r1-distill-llama-70b-awq
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-deepseek-r1-70b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP

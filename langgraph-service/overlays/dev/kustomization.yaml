@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Env-specific Ingress hostname patch is applied by the ArgoCD Application
+# spec (raj-ai-lab-eks-infra/argocd-apps.tf), same pattern as rag-service.
+# Image tag is bumped here on each release so we don't need a Terraform
+# apply for app updates.
+namespace: langgraph
+resources:
+  - ../../base
+images:
+  - name: langgraph-service
+    newTag: dev   # GHA workflow rewrites this on each main-branch push

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: langgraph-service
+  labels:
+    app: langgraph-service
+spec:
+  type: ClusterIP
+  selector:
+    app: langgraph-service
+  ports:
+    # Named `http` so Istio can infer protocol = http and the outbound
+    # cluster gets HTTP-aware filter chains (route by Host, RBAC at
+    # request level, etc.) rather than raw TCP.
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

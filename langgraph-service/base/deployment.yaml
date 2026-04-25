@@ -1,0 +1,144 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langgraph-service
+  labels:
+    app: langgraph-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: langgraph-service
+  template:
+    metadata:
+      labels:
+        app: langgraph-service
+    spec:
+      serviceAccountName: langgraph-service
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: langgraph-service
+          image: langgraph-service:dev   # rewritten by overlay's `images:` block
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # --- Keycloak OIDC config -------------------------------
+            # Issuer URL — must match the realm exactly (incl. https
+            # scheme + trailing /realms/<name>). Token `iss` claim is
+            # checked verbatim against this string.
+            - name: KEYCLOAK_ISSUER
+              value: https://keycloak.ekstest.com/realms/raj-ai-lab-eks
+            # Audience claim check is disabled in main.py for now (see
+            # the comment there); this var is reserved for the eventual
+            # azp/aud-based client lock-down.
+            - name: KEYCLOAK_AUDIENCE
+              value: langgraph-service
+
+            # --- Model variant URLs ---------------------------------
+            # In-cluster Service DNS for each model tier. The variant
+            # Deployments live in the llm ns; their Services share the
+            # same parent host as the default `vllm` Service, but
+            # Service objects per-variant aren't currently shipped in
+            # the llm/base/ kustomization (the variants exist as
+            # Deployments only — see deployment-variants.yaml +
+            # deployment-models.yaml). The JIT-scale logic talks to
+            # the Deployment by name; the inference call uses these
+            # URLs which assume per-variant Services exist.
+            #
+            # FOLLOW-UP: add per-variant Services to llm/base/ so
+            # vllm-llama-8b.llm.svc:8000 actually resolves.
+            - name: MODEL_TRIVIAL_URL
+              value: http://vllm-llama-8b.llm.svc.cluster.local:8000
+            - name: MODEL_REASONING_URL
+              value: http://vllm-deepseek-r1-70b.llm.svc.cluster.local:8000
+            - name: MODEL_HARD_URL
+              value: http://vllm.llm.svc.cluster.local:8000
+
+            # --- Deployment names for kubernetes-client scaling -----
+            - name: DEPLOY_TRIVIAL
+              value: vllm-llama-8b
+            - name: DEPLOY_REASONING
+              value: vllm-deepseek-r1-70b
+            - name: DEPLOY_HARD
+              value: vllm
+            - name: LLM_NAMESPACE
+              value: llm
+
+            # --- Observability --------------------------------------
+            # OTel OTLP endpoint — Tempo in monitoring ns. Same target
+            # as rag-service so traces interleave in the Tempo UI.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo.monitoring.svc.cluster.local:4317
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: grpc
+            - name: OTEL_SERVICE_NAME
+              value: langgraph-service
+            - name: OTEL_TRACES_SAMPLER
+              value: parentbased_always_on
+
+            # --- Langfuse base URL (keys via envFrom below) ---------
+            - name: LANGFUSE_HOST
+              value: https://langfuse.ekstest.com
+
+          envFrom:
+            # Langfuse keys live in a Secret created by
+            # raj-ai-lab-eks-infra/langgraph.tf, mirroring the
+            # rag-service-langfuse pattern in the rag namespace.
+            # optional=true means the pod admits when the Secret is
+            # missing — handy for first-deploy before tfvars are filled.
+            - secretRef:
+                name: langgraph-service-langfuse
+                optional: true
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+
+          # /healthz is auth-bypassed in the FastAPI app exactly to
+          # support these probes — kubelet doesn't carry a JWT.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # Read-only root means /tmp needs an emptyDir for any transient
+        # writes (uvicorn pid file, JWKs cache disk-fallback if it ever
+        # adds one).
+        - name: tmp
+          emptyDir: {}
