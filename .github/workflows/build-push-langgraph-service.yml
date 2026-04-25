@@ -21,7 +21,11 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          # Per-service role: gha_langgraph_service in raj-ai-lab-eks-infra/
+          # gha-oidc.tf. Scoped to ECR push for langgraph-service only.
+          # Set the repo variable LANGGRAPH_AWS_ROLE_ARN to the
+          # gha_langgraph_service_role_arn terraform output.
+          role-to-assume: ${{ vars.LANGGRAPH_AWS_ROLE_ARN }}
           aws-region: us-west-2
 
       - name: Login to ECR
