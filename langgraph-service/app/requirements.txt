@@ -4,6 +4,7 @@ uvicorn[standard]==0.30.6
 # LangGraph + LangChain core (pin for reproducibility — APIs evolved between
 # 0.2.x branches, future bumps need testing before merge).
 langgraph==0.2.62
+langchain==0.3.13           # meta-package; required by langfuse.callback's LangChain integration
 langchain-core==0.3.27
 langchain-openai==0.2.14   # OpenAI-compat client for vLLM endpoints
 
