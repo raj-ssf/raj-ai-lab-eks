@@ -400,3 +400,125 @@ spec:
             claimName: vllm-cache-llama-405b
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 16Gi }
+
+---
+# DeepSeek-R1-Distill-Llama-70B AWQ-INT4 on 4× NVIDIA L4 24GB
+# (g6.12xlarge, ~$4.60/hr). Same architecture + tensor shapes as
+# Llama 3.3 70B AWQ — by deliberate construction. The DeepSeek
+# distillation kept Llama 3.3 70B's structure unchanged, only the
+# weights are re-trained with reasoning-chain supervision from R1.
+#
+# Demo angle: scale this up alongside (or instead of) the default
+# `vllm` Deployment, send identical prompts to each, observe in
+# Langfuse how this model's responses include <think>...</think>
+# reasoning blocks before the final answer. Same hardware, same
+# serving args — the only experimental variable is the model
+# weights.
+#
+# Why g6.12xlarge over g5.12xlarge: L4 is ~19% cheaper than A10G
+# for equivalent VRAM, and L4's INT4 tensor-core path runs AWQ
+# ~1.7x faster than A10G's. The reasoning-chain output also tends
+# to be longer than non-reasoning models, so faster int4 throughput
+# directly translates to better demo experience (less waiting for
+# the visible <think> block to finish streaming).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-deepseek-r1-70b
+  labels:
+    app: vllm-deepseek-r1-70b
+    vllm-model: deepseek-r1-distill-llama-70b-awq
+spec:
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-deepseek-r1-70b
+  template:
+    metadata:
+      labels:
+        app: vllm-deepseek-r1-70b
+        vllm-model: deepseek-r1-distill-llama-70b-awq
+    spec:
+      serviceAccountName: vllm
+      enableServiceLinks: false
+      nodeSelector:
+        node.kubernetes.io/instance-type: g6.12xlarge
+      tolerations:
+        - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
+        - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_REGION, value: us-west-2 }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/deepseek-r1-distill-llama-70b-awq/ }
+            - { name: MODEL_PATH, value: /model }
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws configure set default.s3.max_concurrent_requests 32
+              aws configure set default.s3.multipart_chunksize 128MB
+              aws s3 sync "$S3_URI" "$MODEL_PATH" --no-progress
+              ls -la "$MODEL_PATH"
+          resources:
+            requests: { cpu: "2", memory: "2Gi" }
+            limits:   { cpu: "8", memory: "4Gi" }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:placeholder
+          args:
+            - "--model"
+            - "/model"
+            - "--served-model-name"
+            - "deepseek-r1-distill-llama-70b"
+            - "--tensor-parallel-size"
+            - "4"
+            - "--quantization"
+            - "awq"
+            - "--dtype"
+            - "half"
+            # Reasoning models burn through context with <think> blocks
+            # before the answer — give them more room than the dense
+            # completion variants. 16k is conservative; bump to 32768
+            # if KV-cache headroom on 4× L4 (96 GB total VRAM) allows.
+            - "--max-model-len"
+            - "16384"
+            - "--gpu-memory-utilization"
+            - "0.92"
+            - "--enforce-eager"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: HF_HUB_OFFLINE,       value: "1" }
+            - { name: TRANSFORMERS_OFFLINE, value: "1" }
+            - { name: NCCL_DEBUG,           value: "WARN" }
+            - { name: OTEL_SERVICE_NAME,    value: vllm-deepseek-r1-70b }
+          resources:
+            requests:
+              nvidia.com/gpu: "4"
+              cpu: "8"
+              memory: "64Gi"
+            limits:
+              nvidia.com/gpu: "4"
+              cpu: "32"
+              memory: "120Gi"
+          startupProbe:  { httpGet: { path: /health, port: http }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 60 }
+          readinessProbe:{ httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
+          livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: shm,         mountPath: /dev/shm }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache-deepseek-r1-70b
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 8Gi }

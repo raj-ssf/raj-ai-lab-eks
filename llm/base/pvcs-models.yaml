@@ -62,3 +62,21 @@ spec:
   resources:
     requests:
       storage: 40Gi
+
+---
+# DeepSeek-R1-Distill-Llama-70B AWQ-INT4 — ~40 GB on disk; 60 GiB
+# PVC matches the sibling vllm-model-cache (Llama 3.3 70B AWQ) so
+# the two reasoning-vs-completion 70B-class models have parallel
+# storage budgets for head-to-head demo comparisons.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-deepseek-r1-70b
+  labels:
+    app: vllm
+    model: deepseek-r1-distill-llama-70b-awq
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 60Gi
