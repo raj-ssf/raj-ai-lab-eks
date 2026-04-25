@@ -1,4 +1,4 @@
-edyastapi==0.115.0
+fastapi==0.115.0
 uvicorn[standard]==0.30.6
 
 # LangGraph + LangChain core (pin for reproducibility — APIs evolved between
