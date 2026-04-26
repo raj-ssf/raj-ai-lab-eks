@@ -108,3 +108,25 @@ spec:
       port: 8000
       targetPort: http
       protocol: TCP
+
+---
+# Embedding model — addressable from ingestion-service (chunk embedding
+# at write-time) and rag-service (query embedding at read-time). Same
+# port + named-port shape as the chat model variants, so Istio's
+# protocol-detection treats it as HTTP-aware just like the others.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-bge-m3
+  labels:
+    app: vllm-bge-m3
+    vllm-model: bge-m3
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-bge-m3
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP

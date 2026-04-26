@@ -80,3 +80,21 @@ spec:
   resources:
     requests:
       storage: 60Gi
+
+---
+# bge-m3 (BAAI) — multilingual dense+sparse+multivector embedding model.
+# 2.3 GB on disk; 10 GiB PVC is generous (room for tokenizer assets +
+# margin for HF model bumps). Used by ingestion-service for chunk
+# embedding and (eventually) by rag-service for query embedding.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-bge-m3
+  labels:
+    app: vllm
+    model: bge-m3
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
