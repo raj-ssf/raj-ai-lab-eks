@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import chainlit as cl
 import httpx
@@ -28,100 +28,13 @@ import httpx
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 log = logging.getLogger("chat-ui")
 
-
-# -- Custom Keycloak OAuth provider ------------------------------------------
-#
-# Chainlit 1.3.x ships Google / GitHub / Azure AD / Okta / Auth0 / Descope /
-# AWS Cognito / GitLab as built-in providers but NOT Keycloak (added in a
-# later release). To use Keycloak without bumping Chainlit, we subclass
-# OAuthProvider, configure it from the OAUTH_KEYCLOAK_* env vars set in the
-# Deployment, and register it BEFORE @cl.oauth_callback is evaluated below.
-#
-# The framework calls get_token() with the auth-code returned from
-# Keycloak's redirect, and get_user_info() with the resulting access token.
-# We return Keycloak's `preferred_username` (the realm-defined human
-# username) as the cl.User.identifier — same value that flows through to
-# JWT.preferred_username on calls to langgraph-service /invoke.
-from chainlit.oauth_providers import OAuthProvider, providers
-
-
-class KeycloakOAuthProvider(OAuthProvider):
-    id = "keycloak"
-    env = [
-        "OAUTH_KEYCLOAK_CLIENT_ID",
-        "OAUTH_KEYCLOAK_CLIENT_SECRET",
-        "OAUTH_KEYCLOAK_BASE_URL",
-        "OAUTH_KEYCLOAK_REALM",
-    ]
-
-    def __init__(self) -> None:
-        self.client_id = os.environ["OAUTH_KEYCLOAK_CLIENT_ID"]
-        self.client_secret = os.environ["OAUTH_KEYCLOAK_CLIENT_SECRET"]
-        base = os.environ["OAUTH_KEYCLOAK_BASE_URL"].rstrip("/")
-        realm = os.environ["OAUTH_KEYCLOAK_REALM"]
-        # Display name on Chainlit's "Sign in with X" button. Falls back
-        # to a sensible default if the env var isn't set.
-        self.name = os.environ.get("OAUTH_KEYCLOAK_NAME", "Keycloak")
-        # Standard Keycloak OIDC endpoints. The realm ID and base URL
-        # together fully determine these — no Keycloak admin API access
-        # needed at runtime.
-        self.authorize_url = f"{base}/realms/{realm}/protocol/openid-connect/auth"
-        self.token_url = f"{base}/realms/{realm}/protocol/openid-connect/token"
-        self.userinfo_url = f"{base}/realms/{realm}/protocol/openid-connect/userinfo"
-        # Additional auth-request params. `scope` declares which OIDC
-        # claims we want; `openid` is required, `profile` and `email`
-        # populate preferred_username / email on the userinfo response.
-        self.authorize_params = {
-            "scope": "openid profile email",
-        }
-
-    async def get_token(self, code: str, url: str) -> str:
-        """Exchange the auth code for an access token.
-
-        Called by Chainlit on the /auth/oauth/keycloak/callback handler
-        after Keycloak redirects back with ?code=...&state=... .
-        """
-        async with httpx.AsyncClient(verify=False) as client:
-            r = await client.post(
-                self.token_url,
-                data={
-                    "grant_type": "authorization_code",
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "code": code,
-                    "redirect_uri": url,
-                },
-            )
-            r.raise_for_status()
-            return r.json()["access_token"]
-
-    async def get_user_info(self, token: str) -> Tuple[Dict[str, Any], cl.User]:
-        """Fetch user claims from Keycloak's userinfo endpoint.
-
-        Returns the raw claim dict (handed back to oauth_callback as
-        raw_user_data) plus a cl.User keyed on preferred_username.
-        """
-        async with httpx.AsyncClient(verify=False) as client:
-            r = await client.get(
-                self.userinfo_url,
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            r.raise_for_status()
-            data = r.json()
-        identifier = data.get("preferred_username") or data.get("sub") or "unknown"
-        user = cl.User(
-            identifier=identifier,
-            metadata={"provider": "keycloak", "email": data.get("email", "")},
-        )
-        return data, user
-
-
-# Register our provider before @cl.oauth_callback runs at import time.
-# Chainlit's "is any provider configured?" check iterates this list; with
-# our entry present and env vars set, the check passes and the framework
-# wires up routes /auth/oauth/keycloak/login and
-# /auth/oauth/keycloak/callback automatically.
-providers.append(KeycloakOAuthProvider())
+# Chainlit 1.5+ ships Keycloak as a built-in OAuth provider — registered
+# automatically when OAUTH_KEYCLOAK_CLIENT_ID, OAUTH_KEYCLOAK_CLIENT_SECRET,
+# OAUTH_KEYCLOAK_BASE_URL, and OAUTH_KEYCLOAK_REALM are set in env. The
+# framework wires up /auth/oauth/keycloak/login and .../callback at startup
+# and uses Keycloak's standard OIDC endpoints. Earlier 1.3.x versions only
+# had a runtime providers list (no route registration), which is why the
+# previous custom-provider attempt looped.
 
 # In-cluster URL — direct mesh path, not the public ingress. The mesh's
 # ISTIO_MUTUAL DestinationRule + the allow-chat-ui AuthorizationPolicy
