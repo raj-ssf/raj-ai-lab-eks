@@ -94,6 +94,14 @@ sys.argv = [
     "--port",
     "8000",
     "-h",
+    # -d enables debug log level so uvicorn's access logs + handler
+    # exception tracebacks are visible. Without this, Chainlit
+    # silences uvicorn at ERROR level and OAuth callback failures
+    # leave no log trail (they raise HTTPException which FastAPI
+    # converts to a clean 4xx response without logging). Worth a
+    # cleanup pass to reduce verbosity later, but for now debug
+    # output is essential for diagnosing the OAuth flow.
+    "-d",
 ]
 
 from chainlit.cli import cli
