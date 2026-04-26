@@ -228,12 +228,17 @@ async def on_message(message: cl.Message) -> None:
     actions = []
     trace_id = data.get("langfuse_trace_id")
     if trace_id:
+        # Chainlit 2.x renamed Action's fields: value → payload (dict),
+        # description → tooltip. Old v1 names raise pydantic
+        # ValidationError at construction, which aborts the
+        # surrounding cl.Message.send() — the user sees Steps but
+        # never the response bubble.
         actions.append(
             cl.Action(
                 name="view_in_langfuse",
-                value=trace_id,
-                description="Open the matching trace in Langfuse",
+                payload={"trace_id": trace_id},
                 label="🔍 View in Langfuse",
+                tooltip="Open the matching trace in Langfuse",
             )
         )
 
@@ -247,7 +252,10 @@ async def on_message(message: cl.Message) -> None:
 @cl.action_callback("view_in_langfuse")
 async def on_view_trace(action: cl.Action) -> None:
     """Open the Langfuse trace UI in a new tab."""
-    url = f"{LANGFUSE_HOST}/trace/{action.value}"
+    # action.payload is the dict we set on construction; read trace_id
+    # back from it. (Chainlit 2.x removed the action.value attribute.)
+    trace_id = action.payload.get("trace_id", "")
+    url = f"{LANGFUSE_HOST}/trace/{trace_id}"
     await cl.Message(
         content=f"[Open trace in Langfuse]({url})",
     ).send()
