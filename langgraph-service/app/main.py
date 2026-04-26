@@ -108,7 +108,12 @@ EXECUTE_TIMEOUT_SECONDS = 120
 # come up; vLLM cold-start adds another 2-3 min for 70B AWQ. 5 min total
 # is a comfortable upper bound; bump for the 405B path (which can take 6+
 # min for S3-Mountpoint weight fault-in).
-SCALE_UP_TIMEOUT_SECONDS = 300
+# 15 min covers a full 70B cold start: Karpenter provision (~90s) +
+# node boot (~60s) + image pull (~5s cached / ~3min cold) + EBS attach
+# (~20s) + model-sync s3 sync (~60s) + vLLM safetensors load (~5min on
+# 4× PCIe L4) + KV cache warmup (~30s) + sidecar handshake (~10s).
+# 405B via S3 Mountpoint can stretch to ~10 min for fault-in.
+SCALE_UP_TIMEOUT_SECONDS = 900
 SCALE_POLL_INTERVAL_SECONDS = 3
 
 # --- Tool registry: route name → call config -------------------------------
@@ -174,6 +179,21 @@ def _read_replicas(name: str) -> int:
         raise RuntimeError("kubernetes client not initialized")
     scale = K8S_APPS.read_namespaced_deployment_scale(name=name, namespace=LLM_NAMESPACE)
     return scale.spec.replicas or 0
+
+
+def _read_available_replicas(name: str) -> int:
+    """Read status.availableReplicas — pods actually passing readinessProbe.
+
+    Different from spec.replicas (desired). A Deployment can have
+    spec.replicas=1 and availableReplicas=0 for the entire cold-start
+    window (Karpenter + image pull + model load). ensure_warm must use
+    THIS to decide whether to short-circuit; reading spec.replicas
+    risks declaring 'already warm' for a pod still in Init:2/3.
+    """
+    if K8S_APPS is None:
+        raise RuntimeError("kubernetes client not initialized")
+    deploy = K8S_APPS.read_namespaced_deployment(name=name, namespace=LLM_NAMESPACE)
+    return deploy.status.available_replicas or 0
 
 
 def _wait_for_pod_ready(label_selector: str, timeout_s: int) -> bool:
@@ -389,20 +409,39 @@ def node_ensure_warm(state: AgentState) -> AgentState:
 
     started = time.monotonic()
     try:
-        current = _read_replicas(deploy)
+        spec_replicas = _read_replicas(deploy)
+        available = _read_available_replicas(deploy)
     except ApiException as e:
         raise RuntimeError(f"failed to read scale of {LLM_NAMESPACE}/{deploy}: {e.reason}") from e
 
-    if current >= 1:
-        # Already warm — no JIT cost. Skip ahead.
-        log.info("ensure_warm: variant already warm", extra={"deployment": deploy, "replicas": current})
+    # Three states to handle:
+    #   (1) available >= 1                 → variant is warm + serving. Skip.
+    #   (2) spec >= 1 but available < 1    → cold-start in progress (pod
+    #       exists but still in Init / model-load). Don't re-scale; wait.
+    #   (3) spec == 0                      → not scaled yet. Scale, then wait.
+    #
+    # The previous version checked only spec.replicas and returned
+    # immediately on (2). That caused execute to fire against a Service
+    # with no Ready endpoints → 'no healthy upstream' → 500.
+
+    if available >= 1:
+        log.info(
+            "ensure_warm: variant warm + serving, skipping wait",
+            extra={"deployment": deploy, "available_replicas": available},
+        )
         return {"cold_start": False, "warm_wait_seconds": 0.0}
 
-    log.info("ensure_warm: scaling up cold variant", extra={"deployment": deploy})
-    try:
-        _scale_deployment(deploy, replicas=1)
-    except ApiException as e:
-        raise RuntimeError(f"failed to scale {LLM_NAMESPACE}/{deploy}: {e.reason}") from e
+    if spec_replicas == 0:
+        log.info("ensure_warm: scaling up cold variant", extra={"deployment": deploy})
+        try:
+            _scale_deployment(deploy, replicas=1)
+        except ApiException as e:
+            raise RuntimeError(f"failed to scale {LLM_NAMESPACE}/{deploy}: {e.reason}") from e
+    else:
+        log.info(
+            "ensure_warm: variant cold-starting, waiting for ready",
+            extra={"deployment": deploy, "spec_replicas": spec_replicas, "available_replicas": available},
+        )
 
     # The variant Deployments label their pods with `app: <deployment-name>`
     # — match deployment-models.yaml in the app repo. If that scheme ever
