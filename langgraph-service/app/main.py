@@ -471,6 +471,11 @@ class InvokeResponse(BaseModel):
     execute_latency_ms: int
     classifier_raw: str
     user: str
+    # langfuse trace id for the v3 SDK's emitted trace, so callers
+    # (chat-ui) can deep-link to ${LANGFUSE_HOST}/trace/<id>. Optional
+    # because the langfuse callback is None when public/secret keys
+    # aren't configured (lab environments without trace export).
+    langfuse_trace_id: Optional[str] = None
 
 
 # --- Routes ----------------------------------------------------------------
@@ -492,15 +497,24 @@ def invoke(req: InvokeRequest, claims: Annotated[dict, Depends(require_jwt)]) ->
         "user": user,
     }
     config: dict = {}
+    trace_id: Optional[str] = None
     if _LANGFUSE_CB is not None:
         # v3 SDK takes per-request attribution via metadata — the keys
         # langfuse_user_id / langfuse_tags / langfuse_session_id are
         # consumed by the CallbackHandler when it builds the trace.
+        # We also pre-generate the trace_id (32-hex UUID) and pass it
+        # via langfuse_trace_id so the caller can deep-link to the
+        # Langfuse trace UI without round-tripping the callback's
+        # internal state. Generating up-front means the value is known
+        # even if the trace export later fails.
+        import uuid as _uuid
+        trace_id = _uuid.uuid4().hex
         config = {
             "callbacks": [_LANGFUSE_CB],
             "metadata": {
                 "langfuse_user_id": user,
                 "langfuse_tags": ["langgraph-service"],
+                "langfuse_trace_id": trace_id,
             },
         }
     try:
@@ -523,4 +537,5 @@ def invoke(req: InvokeRequest, claims: Annotated[dict, Depends(require_jwt)]) ->
         execute_latency_ms=final_state.get("execute_latency_ms", 0),
         classifier_raw=final_state.get("classifier_raw", ""),
         user=user,
+        langfuse_trace_id=trace_id,
     )

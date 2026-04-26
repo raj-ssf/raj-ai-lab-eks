@@ -1,0 +1,97 @@
+name: Build and push chat-ui
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "chat-ui/app/**"
+      - ".github/workflows/build-push-chat-ui.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write      # required for AWS OIDC federation
+  contents: write      # required to commit overlay tag back
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Per-service role: gha_chat_ui in raj-ai-lab-eks-infra/
+          # chat-ui.tf. Scoped to ECR push for chat-ui only.
+          # Set the repo variable CHAT_UI_AWS_ROLE_ARN to the
+          # gha_chat_ui_role_arn terraform output.
+          role-to-assume: ${{ vars.CHAT_UI_AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: chat-ui/app
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ vars.CHAT_UI_ECR_REPOSITORY_URL }}:latest
+            ${{ vars.CHAT_UI_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Keyless cosign signing — same pattern as rag-service /
+      # langgraph-service. The Kyverno verify policy in
+      # raj-ai-lab-eks-infra needs to accept this workflow's identity
+      # for chat-ui images (see kyverno-policies.tf).
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        env:
+          IMAGE: ${{ vars.CHAT_UI_ECR_REPOSITORY_URL }}@${{ steps.build.outputs.digest }}
+        run: |
+          echo "Signing $IMAGE"
+          cosign sign --yes "$IMAGE"
+
+      - name: Bump image tag in overlay and commit
+        env:
+          TAG: sha-${{ steps.sha.outputs.short }}
+          OVERLAY: chat-ui/overlays/dev/kustomization.yaml
+        run: |
+          current=$(yq '.images[] | select(.name == "chat-ui") | .newTag' "$OVERLAY")
+          if [ "$current" = "$TAG" ]; then
+            echo "overlay already on $TAG; skipping commit"
+            exit 0
+          fi
+
+          yq -i "(.images[] | select(.name == \"chat-ui\") | .newTag) = \"$TAG\"" "$OVERLAY"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$OVERLAY"
+          git commit -m "chat-ui: bump image tag to $TAG"
+          git push
+
+      - name: Summary
+        run: |
+          {
+            echo "### chat-ui image built and pushed"
+            echo ""
+            echo "**Tags:**"
+            echo "- \`${{ vars.CHAT_UI_ECR_REPOSITORY_URL }}:latest\`"
+            echo "- \`${{ vars.CHAT_UI_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}\`"
+            echo ""
+            echo "**Deploy:** ArgoCD auto-syncs on overlay commit."
+          } >> "$GITHUB_STEP_SUMMARY"

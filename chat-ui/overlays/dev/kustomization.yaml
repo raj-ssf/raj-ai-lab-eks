@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Env-specific Ingress hostname patch is applied by the ArgoCD
+# Application spec (raj-ai-lab-eks-infra/argocd-apps.tf) — same
+# pattern as langgraph-service / rag-service. Image tag is bumped
+# here on each release so we don't need a Terraform apply for app
+# updates.
+namespace: chat
+resources:
+  - ../../base
+images:
+  - name: chat-ui
+    # Full image reference (newName + newTag) — GHA bumps newTag on
+    # every build. newName must include the ECR registry/account
+    # since kubelet defaults unprefixed names to docker.io and 404s.
+    # Account ID is not a secret.
+    newName: 050693401425.dkr.ecr.us-west-2.amazonaws.com/chat-ui
+    newTag: placeholder # GHA workflow rewrites this on each main-branch push

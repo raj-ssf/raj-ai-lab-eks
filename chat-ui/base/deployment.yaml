@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-ui
+  labels:
+    app: chat-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chat-ui
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: chat-ui
+    spec:
+      serviceAccountName: chat-ui
+      containers:
+        - name: chat-ui
+          image: chat-ui:placeholder  # rewritten by overlay's kustomize images: transform
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # --- Where to call langgraph-service from --------------------
+            # In-cluster Service URL — direct mesh path. Avoids the
+            # public ingress hop. The ISTIO_MUTUAL DestinationRule on
+            # langgraph-service makes the source Envoy attach a SPIFFE
+            # cert; allow-chat-ui AuthZ in the langgraph ns matches on
+            # cluster.local/ns/chat/sa/chat-ui to permit the call.
+            - name: LANGGRAPH_URL
+              value: http://langgraph-service.langgraph.svc.cluster.local
+
+            # --- Public Langfuse host for "view trace" deep-links --------
+            # User clicks the link in their browser, so this has to be
+            # the public hostname (not the in-cluster Service).
+            - name: LANGFUSE_HOST
+              value: https://langfuse.ekstest.com
+
+            # --- Keycloak OIDC (Authorization Code + PKCE) ---------------
+            # Chainlit's Keycloak provider auto-detects from the
+            # OAUTH_KEYCLOAK_* env vars. CLIENT_ID and CLIENT_SECRET
+            # come from the chat-ui-oidc Secret (envFrom below). The
+            # realm + base URL are not secrets so they're inlined.
+            - name: OAUTH_KEYCLOAK_BASE_URL
+              value: https://keycloak.ekstest.com
+            - name: OAUTH_KEYCLOAK_REALM
+              value: raj-ai-lab-eks
+            - name: OAUTH_KEYCLOAK_NAME
+              value: "Sign in with Keycloak"
+
+            # --- Chainlit listen config ----------------------------------
+            # Public URL Chainlit uses to construct OAuth redirect URIs
+            # internally. Must match the keycloak_openid_client.chat_ui
+            # valid_redirect_uris entry (chat-ui.tf), which is
+            # https://chat.${var.domain}/auth/oauth/keycloak/callback.
+            - name: CHAINLIT_URL
+              value: https://chat.ekstest.com
+
+          envFrom:
+            # OAUTH_KEYCLOAK_CLIENT_ID, OAUTH_KEYCLOAK_CLIENT_SECRET,
+            # CHAINLIT_AUTH_SECRET — provisioned by terraform's
+            # kubernetes_secret.chat_ui_oidc resource.
+            - secretRef:
+                name: chat-ui-oidc
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          # Chainlit doesn't expose a dedicated /healthz, but its root
+          # path returns the chat UI HTML so a 200 here means the asgi
+          # server is up. Keep timeouts generous to tolerate the
+          # one-time React-bundle compile on first request after pod
+          # start (Chainlit serves a Vite-built bundle, ~1-2s warmup).
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3

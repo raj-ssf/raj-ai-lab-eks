@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-ui
+  labels:
+    app: chat-ui
+spec:
+  type: ClusterIP
+  selector:
+    app: chat-ui
+  ports:
+    # Named `http` so Istio infers protocol = http and the outbound
+    # cluster gets HTTP-aware filter chains (RBAC at request level,
+    # JWT validation if we ever add it, route-by-host, etc.).
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
