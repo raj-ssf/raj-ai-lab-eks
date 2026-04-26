@@ -33,10 +33,18 @@ kubernetes==31.0.0
 pydantic==2.9.2
 prometheus-fastapi-instrumentator==7.0.0
 
-# OTel — pinned identically to rag-service so traces interleave cleanly
-# in Tempo (same exporter version, same instrumentation versions).
-opentelemetry-sdk==1.29.0
-opentelemetry-exporter-otlp-proto-grpc==1.29.0
-opentelemetry-instrumentation-fastapi==0.50b0
-opentelemetry-instrumentation-httpx==0.50b0
-opentelemetry-instrumentation-logging==0.50b0
+# OTel — bumped to >=1.33 because Langfuse v3 requires opentelemetry-api
+# >=1.33.1 (v3 SDK adopted OTel as its trace transport). The trio
+# (api/sdk/exporter) and the paired instrumentation packages all
+# release in lock-step, so they have to move together — pinning any
+# one to the old 1.29.0 line creates an unresolvable conflict with
+# Langfuse v3. Range-pinned to give pip room to resolve compatible
+# versions; pin exactly after first successful build.
+#
+# rag-service still on the 1.29 line / langfuse v2 — when it migrates,
+# its OTel pins will need the same bump.
+opentelemetry-sdk>=1.33.1,<2.0.0
+opentelemetry-exporter-otlp-proto-grpc>=1.33.1,<2.0.0
+opentelemetry-instrumentation-fastapi>=0.54b0,<1.0.0
+opentelemetry-instrumentation-httpx>=0.54b0,<1.0.0
+opentelemetry-instrumentation-logging>=0.54b0,<1.0.0
