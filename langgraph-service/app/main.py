@@ -46,10 +46,21 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [trace_id=%(otelTraceID)s span_id=%(otelSpanID)s] %(name)s - %(message)s",
+# Use Formatter `defaults=` (Python 3.10+) so log records emitted from
+# threads without an active OTel trace context (e.g. the OTel exporter's
+# own background error logging) don't crash the formatter with
+# 'Formatting field not found in record: otelTraceID'. The "0" sentinel
+# matches OTel's no-trace convention.
+_handler = logging.StreamHandler()
+_handler.setFormatter(
+    logging.Formatter(
+        "%(asctime)s %(levelname)s [trace_id=%(otelTraceID)s span_id=%(otelSpanID)s] %(name)s - %(message)s",
+        defaults={"otelTraceID": "0", "otelSpanID": "0"},
+    )
 )
+_root = logging.getLogger()
+_root.handlers = [_handler]
+_root.setLevel(logging.INFO)
 log = logging.getLogger("langgraph-service")
 
 # --- Config (env-overridable) -----------------------------------------------
