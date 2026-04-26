@@ -1,5 +1,15 @@
 chainlit==1.3.2
 
+# Pydantic pinned because Chainlit 1.3.2 declares pydantic>=2,<3 loosely
+# and pip's "latest matching" resolution lands on 2.13.x, which tightened
+# strict-forward-reference handling. Chainlit's CodeSettings dataclass
+# relies on the older laxer behavior — under 2.13 the import crashes
+# with "PydanticUserError: CodeSettings is not fully defined; you should
+# define Action, then call pydantic.dataclasses.rebuild_dataclass". 2.9.2
+# matches the langgraph-service pin so both services share a pydantic
+# major version.
+pydantic==2.9.2
+
 # Async HTTP client to call langgraph-service /invoke. Pinned to match
 # the version in langgraph-service/rag-service for consistent behavior
 # (timeout, mTLS quirks, etc. are sensitive to httpx version).
