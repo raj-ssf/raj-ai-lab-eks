@@ -15,4 +15,4 @@ images:
     # since kubelet defaults unprefixed names to docker.io and 404s.
     # Account ID is not a secret.
     newName: 050693401425.dkr.ecr.us-west-2.amazonaws.com/chat-ui
-    newTag: sha-a9c5f13 # GHA workflow rewrites this on each main-branch push
+    newTag: sha-ad7e7eb # GHA workflow rewrites this on each main-branch push
