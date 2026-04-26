@@ -8,10 +8,15 @@ langchain==0.3.13           # meta-package; required by langfuse.callback's Lang
 langchain-core==0.3.27
 langchain-openai==0.2.14   # OpenAI-compat client for vLLM endpoints
 
-# Langfuse v2 — same SDK choice as rag-service for trace consistency.
-# Both services emit into the same Langfuse instance; v3 has a different
-# import path and would need migration on rag-service too.
-langfuse==2.60.0
+# Langfuse v3 — matches the in-cluster server (3.43.0 at time of write).
+# The v2 SDK posts to legacy ingestion endpoints that v3 server rejects,
+# so traces silently drop. v3 SDK reorganized imports
+# (langfuse.callback → langfuse.langchain) and switched to per-call
+# metadata for user_id/tags rather than constructor kwargs. Pinned as a
+# range until first successful GHA build, then `pip freeze` the resolved
+# version and pin exactly. rag-service runs the same pin migration in a
+# follow-up commit so both services emit into the v3 backend.
+langfuse>=3.0.0,<4.0.0
 
 # JWT validation against Keycloak's JWKs endpoint. python-jose is the
 # de-facto FastAPI choice; cryptography is its RSA backend.

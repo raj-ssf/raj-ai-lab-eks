@@ -84,8 +84,18 @@ spec:
               value: parentbased_always_on
 
             # --- Langfuse base URL (keys via envFrom below) ---------
+            # In-cluster Service URL, not the public ingress hostname.
+            # Trace export is pod→pod east-west traffic; routing it
+            # through ingress-nginx adds DNS lookup, NAT egress, public
+            # ALB hop, TLS termination + re-handshake on every flush —
+            # and depends on the ingress upstream being healthy (it
+            # was returning 503 at the time of this change). The mesh's
+            # AuthorizationPolicy gating cross-namespace traffic into
+            # langfuse must allow the langgraph-service SA — see
+            # raj-ai-lab-eks-infra/istio-zero-trust.tf
+            # (allow_langgraph_to_langfuse).
             - name: LANGFUSE_HOST
-              value: https://langfuse.ekstest.com
+              value: http://langfuse-web.langfuse.svc.cluster.local:3000
 
           envFrom:
             # Langfuse keys live in a Secret created by

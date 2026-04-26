@@ -32,7 +32,7 @@ from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from langfuse.callback import CallbackHandler as LangfuseCallback
+from langfuse.langchain import CallbackHandler as LangfuseCallback
 from langgraph.graph import END, START, StateGraph
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
@@ -201,14 +201,16 @@ tracer = trace.get_tracer(__name__)
 
 # --- Langfuse callback ------------------------------------------------------
 
-# The LangChain CallbackHandler emits a Langfuse trace per graph run, with
-# a child span per node invocation. SDK reads LANGFUSE_HOST /
-# LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY from env directly. If any are
-# missing, the handler no-ops gracefully.
-def make_langfuse_callback(user_id: str) -> Optional[LangfuseCallback]:
-    if not (os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")):
-        return None
-    return LangfuseCallback(user_id=user_id, session_id=None, tags=["langgraph-service"])
+# v3 SDK changed the integration shape: the CallbackHandler is constructed
+# once (no per-request user_id / tags kwargs anymore) and reads
+# LANGFUSE_HOST / LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY from env. Per-
+# request attribution (user, session, tags) is passed through LangChain's
+# config metadata instead — see the /invoke handler.
+_LANGFUSE_CB: Optional[LangfuseCallback] = (
+    LangfuseCallback()
+    if (os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"))
+    else None
+)
 
 
 # --- App + auth -------------------------------------------------------------
@@ -472,21 +474,26 @@ def invoke(req: InvokeRequest, claims: Annotated[dict, Depends(require_jwt)]) ->
     user = claims.get("preferred_username") or claims.get("sub") or "unknown"
     log.info("invoke", extra={"user": user, "prompt_len": len(req.prompt)})
 
-    callbacks = []
-    cb = make_langfuse_callback(user_id=user)
-    if cb is not None:
-        callbacks.append(cb)
-
     initial: AgentState = {
         "prompt": req.prompt,
         "max_tokens": req.max_tokens,
         "image_url": req.image_url,
         "user": user,
     }
+    config: dict = {}
+    if _LANGFUSE_CB is not None:
+        # v3 SDK takes per-request attribution via metadata — the keys
+        # langfuse_user_id / langfuse_tags / langfuse_session_id are
+        # consumed by the CallbackHandler when it builds the trace.
+        config = {
+            "callbacks": [_LANGFUSE_CB],
+            "metadata": {
+                "langfuse_user_id": user,
+                "langfuse_tags": ["langgraph-service"],
+            },
+        }
     try:
-        final_state: AgentState = GRAPH.invoke(
-            initial, config={"callbacks": callbacks} if callbacks else {}
-        )
+        final_state: AgentState = GRAPH.invoke(initial, config=config)
     except RuntimeError as e:
         # ensure_warm raises RuntimeError on scale failures + ready timeouts.
         # Surface as 502 (upstream service unavailable) rather than 500 so
