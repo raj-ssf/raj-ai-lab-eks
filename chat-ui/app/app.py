@@ -52,18 +52,23 @@ LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "https://langfuse.ekstest.com")
 # -- Auth --------------------------------------------------------------------
 
 @cl.oauth_callback
-def oauth_callback(
+async def oauth_callback(
     provider_id: str,
     token: str,
     raw_user_data: Dict[str, str],
     default_user: cl.User,
+    id_token: Optional[str] = None,
 ) -> Optional[cl.User]:
     """Stash the Keycloak access_token so on_message can forward it.
 
-    Chainlit's User object carries an `identifier` (sub claim) and any
-    metadata we want; we add the token to user_session so it's available
-    in subsequent handlers without ever ending up in the User object's
-    serialized form.
+    Signature must match Chainlit 2.x's decorator contract exactly
+    (chainlit/callbacks.py: oauth_callback expects an async function
+    with five parameters returning Optional[User]). With a sync function
+    or wrong arity, wrap_user_function silently fails and the resulting
+    None user makes _authenticate_user raise 401 'credentialssignin'.
+    The 5th parameter `id_token` is only populated for the Azure AD
+    hybrid flow; for Keycloak it'll arrive as None — we accept it via
+    a default so the same handler covers both.
     """
     cl.user_session.set("access_token", token)
     log.info("oauth login: provider=%s user=%s", provider_id, default_user.identifier)
