@@ -48,12 +48,21 @@ spec:
             # OAUTH_KEYCLOAK_* env vars. CLIENT_ID and CLIENT_SECRET
             # come from the chat-ui-oidc Secret (envFrom below). The
             # realm + base URL are not secrets so they're inlined.
+            #
+            # OAUTH_KEYCLOAK_NAME is NOT set on purpose. In Chainlit
+            # 2.x, that env var becomes the provider's `id` attribute
+            # (used to construct routes /auth/oauth/{id}/{login,callback}
+            # and to match valid_redirect_uris on the Keycloak client).
+            # Default when unset is "keycloak", which is exactly the slug
+            # we configured in the Keycloak client's valid_redirect_uris
+            # (chat-ui.tf). Setting NAME to a friendly label like "Sign
+            # in with Keycloak" inadvertently broke routing — routes ended
+            # up at /auth/oauth/Sign%20in%20with%20Keycloak/login and the
+            # browser hit the SPA catch-all instead of a 302 to Keycloak.
             - name: OAUTH_KEYCLOAK_BASE_URL
               value: https://keycloak.ekstest.com
             - name: OAUTH_KEYCLOAK_REALM
               value: raj-ai-lab-eks
-            - name: OAUTH_KEYCLOAK_NAME
-              value: "Sign in with Keycloak"
 
             # --- Chainlit listen config ----------------------------------
             # Public URL Chainlit uses to construct OAuth redirect URIs
