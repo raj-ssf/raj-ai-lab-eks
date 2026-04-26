@@ -70,8 +70,17 @@ async def oauth_callback(
     hybrid flow; for Keycloak it'll arrive as None — we accept it via
     a default so the same handler covers both.
     """
-    cl.user_session.set("access_token", token)
     log.info("oauth login: provider=%s user=%s", provider_id, default_user.identifier)
+    # Stash the access_token in user.metadata, NOT cl.user_session.
+    # cl.user_session is per-chat-session state, only available inside
+    # @cl.on_chat_start / @cl.on_message handlers. During the OAuth
+    # callback there's no chat session yet — calling
+    # cl.user_session.set() here raises ChainlitContextException, the
+    # handler returns None, _authenticate_user raises
+    # 401 'credentialssignin' and the user lands at /login?error=...
+    # user.metadata is serialized into the session JWT and accessible
+    # later from any handler via cl.user_session.get("user").metadata.
+    default_user.metadata["access_token"] = token
     return default_user
 
 
@@ -138,7 +147,12 @@ async def on_message(message: cl.Message) -> None:
         await _handle_upload()
         return
 
-    token = cl.user_session.get("access_token")
+    # Retrieve the Keycloak access_token from the User object's metadata
+    # (stashed there by @cl.oauth_callback). user_session.get("user")
+    # returns the cl.User serialized into the session JWT cookie at
+    # login time.
+    user_obj = cl.user_session.get("user")
+    token = user_obj.metadata.get("access_token") if user_obj else None
     if not token:
         await cl.Message(content="Not authenticated. Refresh and log in again.").send()
         return
