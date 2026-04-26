@@ -1,0 +1,99 @@
+name: Build and push ingestion-service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ingestion-service/app/**"
+      - ".github/workflows/build-push-ingestion-service.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.INGESTION_AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ingestion-service/app
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ vars.INGESTION_ECR_REPOSITORY_URL }}:latest
+            ${{ vars.INGESTION_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        env:
+          IMAGE: ${{ vars.INGESTION_ECR_REPOSITORY_URL }}@${{ steps.build.outputs.digest }}
+        run: |
+          echo "Signing $IMAGE"
+          cosign sign --yes "$IMAGE"
+
+      - name: Bump image tag in overlay and commit
+        env:
+          TAG: sha-${{ steps.sha.outputs.short }}
+          OVERLAY: ingestion-service/overlays/dev/kustomization.yaml
+        run: |
+          current=$(yq '.images[] | select(.name == "ingestion-service") | .newTag' "$OVERLAY")
+          if [ "$current" = "$TAG" ]; then
+            echo "overlay already on $TAG; skipping commit"
+            exit 0
+          fi
+
+          yq -i "(.images[] | select(.name == \"ingestion-service\") | .newTag) = \"$TAG\"" "$OVERLAY"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$OVERLAY"
+          git commit -m "ingestion-service: bump image tag to $TAG"
+
+          # Retry-with-rebase loop to handle parallel-workflow push race
+          # (multiple workflows triggered by the same commit). Same pattern
+          # to add to chat-ui / langgraph-service workflows.
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "push succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "push rejected (likely parallel workflow); rebasing on origin/main (attempt $attempt/3)"
+            git pull --rebase origin main
+          done
+          echo "push failed after 3 rebase attempts" && exit 1
+
+      - name: Summary
+        run: |
+          {
+            echo "### ingestion-service image built and pushed"
+            echo ""
+            echo "**Tags:**"
+            echo "- \`${{ vars.INGESTION_ECR_REPOSITORY_URL }}:latest\`"
+            echo "- \`${{ vars.INGESTION_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

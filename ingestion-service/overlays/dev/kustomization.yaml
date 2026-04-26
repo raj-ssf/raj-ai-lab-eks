@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ingestion
+resources:
+  - ../../base
+images:
+  - name: ingestion-service
+    # Full image reference (newName + newTag) — GHA bumps newTag on
+    # every build. Account ID is not a secret.
+    newName: 050693401425.dkr.ecr.us-west-2.amazonaws.com/ingestion-service
+    newTag: placeholder # GHA workflow rewrites this on each main-branch push
