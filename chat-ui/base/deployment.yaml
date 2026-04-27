@@ -37,6 +37,15 @@ spec:
             - name: LANGGRAPH_URL
               value: http://langgraph-service.langgraph.svc.cluster.local
 
+            # --- Phase 5: ingestion-service (uploads) --------------------
+            # In-cluster Service URL — same mesh + AuthZ pattern as
+            # LANGGRAPH_URL above. The chat-ui SA is allowed into the
+            # ingestion namespace by allow-chat-ui in
+            # raj-ai-lab-eks-infra/ingestion-service.tf, which permits
+            # POST /upload + GET /jobs/{id}.
+            - name: INGESTION_URL
+              value: http://ingestion-service.ingestion.svc.cluster.local
+
             # --- Public Langfuse host for "view trace" deep-links --------
             # User clicks the link in their browser, so this has to be
             # the public hostname (not the in-cluster Service).
