@@ -259,7 +259,7 @@ async def upload(
             "job_id": job_id,
             "user": user,
             "session_id": session_id,
-            "filename": file.filename,
+            "upload_filename": file.filename,
             "content_type": file.content_type,
             "bytes": len(body),
         },
@@ -339,7 +339,7 @@ def _process_upload(
 
         # 2. Parse via Unstructured.
         job.state = "parsing"
-        log.info("parsing", extra={"job_id": job_id, "filename": filename})
+        log.info("parsing", extra={"job_id": job_id, "upload_filename": filename})
         elements = partition(filename=file_path)
         raw_text = "\n\n".join(str(el) for el in elements if str(el).strip())
         if not raw_text:
@@ -413,7 +413,7 @@ def _process_upload(
             "upload ingestion complete",
             extra={
                 "job_id": job_id,
-                "filename": filename,
+                "upload_filename": filename,
                 "chunks": len(chunks),
                 "session_id": session_id,
             },
