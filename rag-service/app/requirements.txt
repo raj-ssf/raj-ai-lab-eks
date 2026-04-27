@@ -19,3 +19,9 @@ opentelemetry-instrumentation-fastapi==0.50b0
 opentelemetry-instrumentation-botocore==0.50b0
 opentelemetry-instrumentation-httpx==0.50b0
 opentelemetry-instrumentation-logging==0.50b0
+
+# Phase 4: /retrieve endpoint validates Keycloak JWTs the same way
+# langgraph-service and ingestion-service do. Pinned identically so
+# OTel-instrumented httpx + jose interactions stay consistent across
+# the three services.
+python-jose[cryptography]==3.3.0

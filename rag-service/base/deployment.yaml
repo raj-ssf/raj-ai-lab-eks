@@ -83,6 +83,30 @@ spec:
               value: "3"
             - name: VLLM_TIMEOUT_SECONDS
               value: "120"
+            # --- Phase 4: /retrieve endpoint -----------------------------
+            # /retrieve is the bge-m3-backed JWT-protected RAG path that
+            # langgraph-service's retrieve node calls. Keep the legacy
+            # Bedrock-Titan path on /search untouched.
+            #
+            # KEYCLOAK_ISSUER drives JWT validation. Same realm URL the
+            # other services use; rag-service trusts any valid token from
+            # this issuer and scopes Qdrant queries by the user claim.
+            - name: KEYCLOAK_ISSUER
+              value: https://keycloak.ekstest.com/realms/raj-ai-lab-eks
+            # bge-m3 vLLM endpoint. Same Service that ingestion-service
+            # writes through, so query and document embeddings live in
+            # the same vector space.
+            - name: EMBEDDING_URL
+              value: http://vllm-bge-m3.llm.svc.cluster.local:8000
+            - name: EMBEDDING_MODEL_NAME
+              value: bge-m3
+            # Separate from the legacy QDRANT_COLLECTION (rag-docs / Titan
+            # vectors). DOCS_COLLECTION is the bge-m3 collection populated
+            # by ingestion-service.
+            - name: DOCS_COLLECTION
+              value: documents
+            - name: RETRIEVE_DEFAULT_TOP_K
+              value: "5"
             # Langfuse LLM-observability. Host is cluster-internal so traces
             # don't round-trip through the ingress. Public + Secret keys
             # come from a K8s Secret provisioned by Terraform from tfvars

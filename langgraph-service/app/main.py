@@ -104,6 +104,19 @@ CLASSIFIER_MAX_TOKENS = 32
 CLASSIFIER_TIMEOUT_SECONDS = 15
 EXECUTE_TIMEOUT_SECONDS = 120
 
+# --- Phase 4: RAG retrieve node config -------------------------------------
+# rag-service /retrieve is JWT-protected (validates Keycloak issuer). We
+# forward the same user JWT we received on /invoke; rag-service uses its
+# `preferred_username` claim as the second axis of the Qdrant filter
+# (the first being session_id). If session_id isn't set on the
+# InvokeRequest, the retrieve node short-circuits — the chat-ui hook
+# that supplies it lands in Phase 5.
+RAG_SERVICE_URL = os.environ.get(
+    "RAG_SERVICE_URL", "http://rag-service.rag.svc.cluster.local"
+)
+RAG_RETRIEVE_TIMEOUT_SECONDS = float(os.environ.get("RAG_RETRIEVE_TIMEOUT_SECONDS", "30"))
+RAG_TOP_K_DEFAULT = int(os.environ.get("RAG_TOP_K_DEFAULT", "5"))
+
 # JIT scale-up parameters. Karpenter's GPU node typically takes 60-90s to
 # come up; vLLM cold-start adds another 2-3 min for 70B AWQ. 5 min total
 # is a comfortable upper bound; bump for the 405B path (which can take 6+
@@ -331,9 +344,19 @@ class AgentState(TypedDict, total=False):
     max_tokens: int
     image_url: Optional[str]
     user: str
+    # Set by /invoke handler before invoke; forwarded into retrieve node
+    session_id: Optional[str]
+    top_k: int
+    # The user's bearer token, forwarded to rag-service /retrieve so it
+    # can validate against Keycloak and read the user claim. NOT logged.
+    auth_token: Optional[str]
     # Set by classify
     route: Literal["trivial", "reasoning", "hard"]
     classifier_raw: str
+    # Set by retrieve (Phase 4)
+    retrieved_chunks: list[dict]   # list of {text, source, chunk_index, score}
+    retrieve_count: int
+    retrieve_ms: int
     # Set by ensure_warm
     cold_start: bool
     warm_wait_seconds: float
@@ -384,6 +407,69 @@ def node_classify(state: AgentState) -> AgentState:
 
     log.info("classified", extra={"route": route, "classifier_raw": raw[:80]})
     return {"route": route, "classifier_raw": raw}
+
+
+def node_retrieve(state: AgentState) -> AgentState:
+    """Phase 4: per-session RAG retrieval.
+
+    Calls rag-service POST /retrieve with the user's prompt + session_id.
+    rag-service embeds via vllm-bge-m3 and queries the `documents`
+    Qdrant collection filtered by (session_id AND user-from-JWT). The
+    returned chunks land in state and are prepended to the prompt by
+    node_execute as RAG context.
+
+    Skips when:
+      - session_id is None or empty (no chat session — chat-ui upload
+        flow hasn't run; nothing to retrieve)
+      - rag-service is unreachable (logged + treated as zero hits; we
+        don't want a flaky retrieve to break /invoke entirely)
+    """
+    session_id = state.get("session_id")
+    if not session_id:
+        return {"retrieved_chunks": [], "retrieve_count": 0, "retrieve_ms": 0}
+
+    auth_token = state.get("auth_token")
+    if not auth_token:
+        # Should never happen — /invoke handler always sets it when
+        # session_id is set. Defensive log + skip rather than 500.
+        log.warning("retrieve: session_id set but auth_token missing; skipping")
+        return {"retrieved_chunks": [], "retrieve_count": 0, "retrieve_ms": 0}
+
+    started = time.monotonic()
+    chunks: list[dict] = []
+    try:
+        with httpx.Client(timeout=RAG_RETRIEVE_TIMEOUT_SECONDS) as client:
+            resp = client.post(
+                f"{RAG_SERVICE_URL}/retrieve",
+                json={
+                    "query": state["prompt"],
+                    "session_id": session_id,
+                    "top_k": state.get("top_k", RAG_TOP_K_DEFAULT),
+                },
+                headers={"Authorization": f"Bearer {auth_token}"},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            chunks = body.get("chunks", [])
+    except httpx.HTTPError as e:
+        # Don't fail the request — RAG is enrichment, not the critical
+        # path. Log + return empty so execute proceeds without context.
+        log.warning("retrieve failed (continuing without context): %s", e)
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    log.info(
+        "retrieve",
+        extra={
+            "session_id": session_id,
+            "chunks": len(chunks),
+            "retrieve_ms": elapsed_ms,
+        },
+    )
+    return {
+        "retrieved_chunks": chunks,
+        "retrieve_count": len(chunks),
+        "retrieve_ms": elapsed_ms,
+    }
 
 
 def node_ensure_warm(state: AgentState) -> AgentState:
@@ -462,8 +548,34 @@ def node_ensure_warm(state: AgentState) -> AgentState:
     return {"cold_start": True, "warm_wait_seconds": elapsed}
 
 
+def _build_rag_prompt(prompt: str, chunks: list[dict]) -> str:
+    """Format retrieved chunks as RAG context, then the user's question.
+
+    Format borrowed from rag-service /invoke's existing convention:
+    numbered Source blocks, explicit instruction to fall back if context
+    doesn't help. Keeps the prompt model-agnostic — the same string works
+    on Llama 3.1 8B, 3.3 70B, and DeepSeek-R1 70B.
+    """
+    if not chunks:
+        return prompt
+    context = "\n\n".join(
+        f"[Source {i + 1}] {c.get('text', '')}" for i, c in enumerate(chunks)
+    )
+    return (
+        "Use the following context to answer the question. If the context "
+        "doesn't help, say so.\n\n"
+        f"=== Context ===\n{context}\n\n"
+        f"=== Question ===\n{prompt}"
+    )
+
+
 def node_execute(state: AgentState) -> AgentState:
-    """Run the user's prompt against the routed-to variant."""
+    """Run the user's prompt against the routed-to variant.
+
+    Phase 4: if retrieve produced chunks, prepend them as RAG context
+    to the prompt before calling vLLM. Falls back to the raw prompt when
+    no chunks (no session, no upload, retrieve failure).
+    """
     cfg = ROUTE_REGISTRY[state["route"]]
     client = ChatOpenAI(
         model=cfg["model_name"],
@@ -472,20 +584,29 @@ def node_execute(state: AgentState) -> AgentState:
         max_tokens=state.get("max_tokens", 512),
         timeout=EXECUTE_TIMEOUT_SECONDS,
     )
+    final_prompt = _build_rag_prompt(state["prompt"], state.get("retrieved_chunks", []))
     started = time.monotonic()
-    response = client.invoke([HumanMessage(content=state["prompt"])])
+    response = client.invoke([HumanMessage(content=final_prompt)])
     elapsed_ms = int((time.monotonic() - started) * 1000)
     return {"response": response.content or "", "execute_latency_ms": elapsed_ms}
 
 
 def build_graph() -> StateGraph:
-    """Compile the three-node graph. Done once at import time, reused."""
+    """Compile the four-node graph. Done once at import time, reused.
+
+    Order: classify → retrieve → ensure_warm → execute → END.
+    retrieve sits before ensure_warm so RAG context lookup overlaps
+    with cold-start time on cold paths (bge-m3 is always-warm; the
+    heavy generator is the one that may need to scale up).
+    """
     g: StateGraph = StateGraph(AgentState)
     g.add_node("classify", node_classify)
+    g.add_node("retrieve", node_retrieve)
     g.add_node("ensure_warm", node_ensure_warm)
     g.add_node("execute", node_execute)
     g.add_edge(START, "classify")
-    g.add_edge("classify", "ensure_warm")
+    g.add_edge("classify", "retrieve")
+    g.add_edge("retrieve", "ensure_warm")
     g.add_edge("ensure_warm", "execute")
     g.add_edge("execute", END)
     return g.compile()
@@ -500,6 +621,22 @@ class InvokeRequest(BaseModel):
     prompt: str = Field(..., description="The user's natural-language prompt.")
     max_tokens: int = Field(default=512, ge=1, le=8192)
     image_url: Optional[str] = Field(default=None)
+    # Phase 4: per-chat-session RAG. When set, the retrieve node calls
+    # rag-service /retrieve and prepends matching chunks to the prompt.
+    # When unset (or empty), retrieve is a no-op and the original prompt
+    # path runs unchanged.
+    session_id: Optional[str] = Field(default=None)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+class RetrievedChunkOut(BaseModel):
+    """Public-facing chunk shape mirrored from rag-service. Lets chat-ui
+    render source citations in the response sidebar without having to
+    decode rag-service's response separately."""
+    text: str
+    source: str
+    chunk_index: int
+    score: float
 
 
 class InvokeResponse(BaseModel):
@@ -510,6 +647,12 @@ class InvokeResponse(BaseModel):
     execute_latency_ms: int
     classifier_raw: str
     user: str
+    # Phase 4 retrieval telemetry. retrieve_count==0 when session_id
+    # wasn't set or rag-service returned no hits — chat-ui can use this
+    # to suppress the "Sources" panel.
+    retrieve_count: int = 0
+    retrieve_ms: int = 0
+    retrieved_chunks: list[RetrievedChunkOut] = []
     # langfuse trace id for the v3 SDK's emitted trace, so callers
     # (chat-ui) can deep-link to ${LANGFUSE_HOST}/trace/<id>. Optional
     # because the langfuse callback is None when public/secret keys
@@ -525,15 +668,34 @@ def healthz() -> dict:
 
 
 @app.post("/invoke", response_model=InvokeResponse)
-def invoke(req: InvokeRequest, claims: Annotated[dict, Depends(require_jwt)]) -> InvokeResponse:
+def invoke(
+    req: InvokeRequest,
+    claims: Annotated[dict, Depends(require_jwt)],
+    creds: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer)],
+) -> InvokeResponse:
     user = claims.get("preferred_username") or claims.get("sub") or "unknown"
-    log.info("invoke", extra={"user": user, "prompt_len": len(req.prompt)})
+    log.info(
+        "invoke",
+        extra={
+            "user": user,
+            "prompt_len": len(req.prompt),
+            "session_id": req.session_id or "",
+        },
+    )
+
+    # Forward the user's bearer token to the retrieve node so it can
+    # call rag-service /retrieve. require_jwt already validated it; we
+    # take the same string from the same dependency-injected creds.
+    auth_token = creds.credentials if creds else None
 
     initial: AgentState = {
         "prompt": req.prompt,
         "max_tokens": req.max_tokens,
         "image_url": req.image_url,
         "user": user,
+        "session_id": req.session_id,
+        "top_k": req.top_k,
+        "auth_token": auth_token,
     }
     config: dict = {}
     trace_id: Optional[str] = None
@@ -576,5 +738,10 @@ def invoke(req: InvokeRequest, claims: Annotated[dict, Depends(require_jwt)]) ->
         execute_latency_ms=final_state.get("execute_latency_ms", 0),
         classifier_raw=final_state.get("classifier_raw", ""),
         user=user,
+        retrieve_count=final_state.get("retrieve_count", 0),
+        retrieve_ms=final_state.get("retrieve_ms", 0),
+        retrieved_chunks=[
+            RetrievedChunkOut(**c) for c in final_state.get("retrieved_chunks", [])
+        ],
         langfuse_trace_id=trace_id,
     )

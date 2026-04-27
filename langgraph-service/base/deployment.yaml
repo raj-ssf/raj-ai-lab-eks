@@ -71,6 +71,17 @@ spec:
             - name: LLM_NAMESPACE
               value: llm
 
+            # --- Phase 4: rag-service /retrieve --------------------
+            # In-cluster Service URL — no public ingress hop. The
+            # retrieve node forwards the user's bearer token to
+            # rag-service for JWT validation + per-user Qdrant filter.
+            - name: RAG_SERVICE_URL
+              value: http://rag-service.rag.svc.cluster.local
+            - name: RAG_RETRIEVE_TIMEOUT_SECONDS
+              value: "30"
+            - name: RAG_TOP_K_DEFAULT
+              value: "5"
+
             # --- Observability --------------------------------------
             # OTel OTLP endpoint — Tempo in monitoring ns. Same target
             # as rag-service so traces interleave in the Tempo UI.

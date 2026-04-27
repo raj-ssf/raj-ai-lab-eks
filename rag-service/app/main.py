@@ -1,15 +1,19 @@
 import json
 import logging
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Literal, Optional
+from functools import lru_cache
+from typing import Annotated, Literal, Optional
 
 import boto3
 import httpx
 from botocore.exceptions import ClientError
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
 from langfuse import Langfuse
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
@@ -70,6 +74,30 @@ VLLM_MODEL_NAME = os.environ.get("VLLM_MODEL_NAME", "llama-3.3-70b")
 VLLM_TIMEOUT_SECONDS = float(os.environ.get("VLLM_TIMEOUT_SECONDS", "120"))
 VLLM_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("VLLM_CONNECT_TIMEOUT_SECONDS", "3"))
 
+# --- Phase 4: /retrieve endpoint config ------------------------------------
+# /retrieve is the JWT-protected, bge-m3-backed counterpart to /search.
+# /search uses Bedrock Titan + the rag-docs collection (legacy path);
+# /retrieve uses self-hosted bge-m3 + the documents collection that
+# ingestion-service writes to. Two separate embedding spaces — Titan and
+# bge-m3 vectors aren't comparable even at the same dim, so we keep the
+# collections distinct rather than risk mixing.
+EMBEDDING_URL = os.environ.get(
+    "EMBEDDING_URL", "http://vllm-bge-m3.llm.svc.cluster.local:8000"
+)
+EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "bge-m3")
+DOCS_COLLECTION = os.environ.get("DOCS_COLLECTION", "documents")
+RETRIEVE_DEFAULT_TOP_K = int(os.environ.get("RETRIEVE_DEFAULT_TOP_K", "5"))
+EMBEDDING_TIMEOUT_SECONDS = float(os.environ.get("EMBEDDING_TIMEOUT_SECONDS", "60"))
+
+# Keycloak JWT validation for /retrieve. Issuer-only (audience disabled,
+# matching langgraph-service & ingestion-service); the realm is the trust
+# boundary — any token signed by it can hit /retrieve, and the in-payload
+# user filter scopes results regardless of which client minted the token.
+KEYCLOAK_ISSUER = os.environ.get("KEYCLOAK_ISSUER", "")
+KEYCLOAK_JWKS_URL = (
+    f"{KEYCLOAK_ISSUER}/protocol/openid-connect/certs" if KEYCLOAK_ISSUER else ""
+)
+
 # Payload keys the service manages itself. Excluded from the `metadata` field
 # in search results so callers only see what they put there at ingest time.
 RESERVED_PAYLOAD_KEYS = {"text", "parent_id", "chunk_index", "original_id"}
@@ -109,6 +137,21 @@ vllm_client = httpx.Client(
     timeout=httpx.Timeout(
         connect=VLLM_CONNECT_TIMEOUT_SECONDS,
         read=VLLM_TIMEOUT_SECONDS,
+        write=10.0,
+        pool=5.0,
+    ),
+)
+
+# Reusable httpx client for the bge-m3 embedding service. Separate from
+# vllm_client because connect/read budgets differ — embedding is sub-second
+# once warm but cold-start (g6.xlarge JIT scale) can take 3+ min, so we let
+# the caller (langgraph-service ensure_warm) handle the warm-up and only
+# tolerate short waits here.
+embed_client = httpx.Client(
+    base_url=EMBEDDING_URL,
+    timeout=httpx.Timeout(
+        connect=3.0,
+        read=EMBEDDING_TIMEOUT_SECONDS,
         write=10.0,
         pool=5.0,
     ),
@@ -259,6 +302,33 @@ class SearchRequest(BaseModel):
     filter: Optional[dict] = None
 
 
+# --- Phase 4: /retrieve models ------------------------------------------
+class RetrieveRequest(BaseModel):
+    """Per-session retrieval against the bge-m3 / `documents` collection.
+
+    session_id is mandatory: this endpoint is the user-document RAG path
+    and crossing sessions would leak documents between chat threads. To
+    do an unscoped corpus search, use /search.
+    """
+    query: str = Field(..., min_length=1)
+    session_id: str = Field(..., min_length=1)
+    top_k: int = Field(default=RETRIEVE_DEFAULT_TOP_K, ge=1, le=20)
+
+
+class RetrievedChunk(BaseModel):
+    text: str
+    source: str
+    chunk_index: int
+    score: float
+
+
+class RetrieveResponse(BaseModel):
+    chunks: list[RetrievedChunk]
+    count: int
+    user: str
+    session_id: str
+
+
 # --- Helpers ---
 def pick_model(req: InvokeRequest) -> tuple[str, str]:
     """Return (model_id, routing_reason) based on req.model and prompt length."""
@@ -297,6 +367,103 @@ def search_qdrant(
             )
         )
     return results
+
+
+# --- JWT validation (used by /retrieve only; legacy endpoints stay open) ---
+#
+# Lifted from langgraph-service / ingestion-service so all three services
+# validate against the same Keycloak realm with consistent semantics.
+# Audience is intentionally not verified — Keycloak's default azp/aud
+# claims for confidential clients aren't a tight identity boundary in our
+# realm, and the user-scoped Qdrant filter below is the actual tenancy
+# control.
+bearer = HTTPBearer(auto_error=False)
+
+
+@lru_cache(maxsize=1)
+def _jwks_http_client() -> httpx.Client:
+    return httpx.Client(timeout=5.0)
+
+
+_jwks_cache: dict = {"fetched_at": 0.0, "keys": []}
+_JWKS_TTL_SECONDS = 3600
+
+
+def _fetch_jwks() -> list:
+    if not KEYCLOAK_JWKS_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="KEYCLOAK_ISSUER not configured; /retrieve unavailable",
+        )
+    now = time.time()
+    if now - _jwks_cache["fetched_at"] < _JWKS_TTL_SECONDS and _jwks_cache["keys"]:
+        return _jwks_cache["keys"]
+    log.info("fetching keycloak jwks from %s", KEYCLOAK_JWKS_URL)
+    resp = _jwks_http_client().get(KEYCLOAK_JWKS_URL)
+    resp.raise_for_status()
+    keys = resp.json()["keys"]
+    _jwks_cache["keys"] = keys
+    _jwks_cache["fetched_at"] = now
+    return keys
+
+
+def _decode_jwt(token: str) -> dict:
+    unverified = jwt.get_unverified_header(token)
+    kid = unverified.get("kid")
+    if not kid:
+        raise JWTError("token missing kid")
+    keys = _fetch_jwks()
+    matching = next((k for k in keys if k.get("kid") == kid), None)
+    if matching is None:
+        # kid rotation — bust cache and refetch once before giving up.
+        _jwks_cache["fetched_at"] = 0.0
+        keys = _fetch_jwks()
+        matching = next((k for k in keys if k.get("kid") == kid), None)
+    if matching is None:
+        raise JWTError(f"no jwks key matches kid {kid}")
+    return jwt.decode(
+        token,
+        matching,
+        algorithms=[matching.get("alg", "RS256")],
+        issuer=KEYCLOAK_ISSUER,
+        options={"verify_aud": False},
+    )
+
+
+def require_jwt(
+    creds: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer)],
+) -> dict:
+    if creds is None or creds.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing bearer token",
+            headers={"WWW-Authenticate": 'Bearer realm="rag-service"'},
+        )
+    try:
+        return _decode_jwt(creds.credentials)
+    except JWTError as e:
+        log.warning("jwt validation failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"invalid token: {e}",
+            headers={"WWW-Authenticate": 'Bearer realm="rag-service"'},
+        )
+
+
+# --- bge-m3 embedding (for /retrieve) ---------------------------------------
+#
+# Mirrors ingestion-service's _embed_batch shape: vLLM exposes the OpenAI
+# /v1/embeddings interface when started with --task=embedding. Single-string
+# query, but we still send `input` as a list — vLLM's response always
+# carries a `data` array regardless.
+def embed_query_bge_m3(text: str) -> list[float]:
+    resp = embed_client.post(
+        "/v1/embeddings",
+        json={"model": EMBEDDING_MODEL_NAME, "input": [text]},
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    return body["data"][0]["embedding"]
 
 
 # --- LLM dispatchers ---
@@ -411,6 +578,77 @@ def search(req: SearchRequest):
         return search_qdrant(req.query, req.top_k, req.filter)
     except ClientError as e:
         raise HTTPException(status_code=502, detail=f"embed failed: {e}")
+
+
+@app.post("/retrieve", response_model=RetrieveResponse)
+def retrieve(
+    req: RetrieveRequest,
+    claims: Annotated[dict, Depends(require_jwt)],
+):
+    """Phase 4 RAG retrieval.
+
+    Embeds the user's query via vllm-bge-m3 (matching the embedding space
+    that ingestion-service writes), then queries the `documents`
+    collection filtered by BOTH session_id (from the request body) AND
+    user (from the validated JWT claim). The user filter is the
+    defense-in-depth check — a caller can guess another session_id, but
+    can't forge a different `preferred_username` claim against Keycloak's
+    signing keys.
+    """
+    user = claims.get("preferred_username") or claims.get("sub") or "unknown"
+
+    started = time.monotonic()
+    try:
+        vec = embed_query_bge_m3(req.query)
+    except httpx.HTTPError as e:
+        log.error("bge-m3 embed failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"embed failed: {e}")
+
+    qfilter = Filter(
+        must=[
+            FieldCondition(key="session_id", match=MatchValue(value=req.session_id)),
+            FieldCondition(key="user",       match=MatchValue(value=user)),
+        ]
+    )
+
+    try:
+        hits = qdrant.query_points(
+            collection_name=DOCS_COLLECTION,
+            query=vec,
+            limit=req.top_k,
+            query_filter=qfilter,
+        ).points
+    except Exception as e:
+        # Collection may not exist yet (no uploads in this session). Treat
+        # as zero hits rather than 502 — chat-ui still renders a useful
+        # "no context found" message.
+        log.warning("qdrant query failed (treating as 0 hits): %s", e)
+        hits = []
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    chunks: list[RetrievedChunk] = []
+    for h in hits:
+        payload = h.payload or {}
+        chunks.append(
+            RetrievedChunk(
+                text=payload.get("text", ""),
+                source=payload.get("source", ""),
+                chunk_index=int(payload.get("chunk_index", 0)),
+                score=float(h.score),
+            )
+        )
+
+    log.info(
+        "retrieve session=%s user=%s top_k=%d hits=%d ms=%d",
+        req.session_id, user, req.top_k, len(chunks), elapsed_ms,
+    )
+
+    return RetrieveResponse(
+        chunks=chunks,
+        count=len(chunks),
+        user=user,
+        session_id=req.session_id,
+    )
 
 
 @app.post("/invoke", response_model=InvokeResponse)
