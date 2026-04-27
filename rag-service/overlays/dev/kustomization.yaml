@@ -10,4 +10,4 @@ resources:
 images:
   - name: rag-service
     newName: 050693401425.dkr.ecr.us-west-2.amazonaws.com/rag-service
-    newTag: sha-56b6589 # updated by .github/workflows/build-push-rag-service.yml on every build
+    newTag: sha-a3aa731 # updated by .github/workflows/build-push-rag-service.yml on every build
