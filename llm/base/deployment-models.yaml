@@ -535,19 +535,22 @@ spec:
 # at this VRAM footprint — the L40S's larger VRAM, more SMs, and INT4
 # tensor cores aren't load-bearing for an embedding model.
 #
-# Always-on (replicas=1): ingestion-service and rag-service both
-# depend on this for chunk + query embedding; cold-starting it on
-# every uploaded document or every retrieval query would add 2-3 min
-# to user-visible latency. The $0.80/hr cost is small enough that
-# always-on is the right shape — total monthly burn is ~\$580 if left
-# running 24/7, or zero if you scale-to-zero between demo sessions.
-# ArgoCD's vllm_app ignoreDifferences includes vllm-bge-m3 so manual
-# kubectl scale --replicas=0 sticks for cost emergencies.
+# JIT-scaled (replicas=0 in git): same pattern as the other generator
+# tiers. Considered always-on (replicas=1) but the $580/month idle
+# burn isn't justified for a single-user portfolio lab. Operator
+# scales up before a demo session via:
+#   kubectl -n llm scale deploy/vllm-bge-m3 --replicas=1
+# then back to 0 after — Karpenter consolidates the g6.xlarge within
+# ~30s, idle GPU spend returns to $0. ArgoCD's vllm_app
+# ignoreDifferences covers vllm-bge-m3 so the manual scale stays.
+# The cost-vs-latency tradeoff: every fresh ingestion-service
+# /upload pays a ~3 min cold-start tax for the embedder unless an
+# operator has pre-warmed it.
 #
-# Cold start (first time after node consolidation): ~2 min total
-# (Karpenter ~90s + node boot ~60s + image pull cached + aws s3 sync
-# 2.3 GB ~10s + vLLM load ~30s). Embedding throughput is 5-10x faster
-# per token than chat generation (no autoregressive sampling).
+# Cold start: ~3 min total (Karpenter ~90s + node boot ~60s + image
+# pull cached + aws s3 sync 2.3 GB ~10s + vLLM load ~30s). Embedding
+# throughput is 5-10x faster per token than chat generation (no
+# autoregressive sampling).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -556,7 +559,7 @@ metadata:
     app: vllm-bge-m3
     vllm-model: bge-m3
 spec:
-  replicas: 1
+  replicas: 0
   strategy:
     type: Recreate
   selector:
