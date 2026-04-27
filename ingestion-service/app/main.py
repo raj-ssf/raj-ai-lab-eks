@@ -18,7 +18,9 @@ validated against the realm's JWKs endpoint.
 
 import logging
 import os
+import tempfile
 import uuid
+from datetime import datetime
 from functools import lru_cache
 from typing import Annotated, Optional
 
@@ -36,6 +38,7 @@ from fastapi import (
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
+from qdrant_client import QdrantClient, models as qmodels
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
@@ -84,6 +87,62 @@ ALLOWED_CONTENT_TYPES = {
     "text/plain",
     "text/markdown",
 }
+
+# Map content-type → file extension. Unstructured's `partition` dispatches
+# to the right parser by file extension, so we have to write the upload
+# to a tempfile with the right suffix before parsing.
+_EXT_BY_CONTENT_TYPE = {
+    "application/pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+}
+
+# Embedding batch size. vLLM accepts arrays in the /v1/embeddings input
+# field; batching reduces round-trip overhead substantially. 32 is a
+# good starting point for bge-m3 (chunks are ~1000 chars, well under
+# the 8K context — the GPU stays happy with 32 in flight).
+EMBEDDING_BATCH_SIZE = 32
+
+# bge-m3's embedding dimension. Used to initialize the Qdrant collection.
+# Must match the model — if you swap to nomic-embed-text-v1.5 (768) or
+# similar, this constant moves.
+EMBEDDING_DIM = 1024
+
+# --- Qdrant client (module-level singleton) ---------------------------------
+#
+# QdrantClient pools HTTPS connections under the hood, so a single
+# client across all background tasks is more efficient than creating
+# one per upload.
+QDRANT = QdrantClient(url=QDRANT_URL, prefer_grpc=False, https=False)
+
+
+def _ensure_qdrant_collection() -> None:
+    """Create the documents collection if it doesn't exist yet.
+
+    Idempotent — safe to call on every upload. Cosine distance + dense
+    vectors with bge-m3's 1024 dims. Payload schema is implicit (Qdrant
+    is schemaless on payload by default); session_id and user are the
+    fields we filter on at query time.
+    """
+    if QDRANT.collection_exists(QDRANT_COLLECTION):
+        return
+    log.info("creating qdrant collection", extra={"collection": QDRANT_COLLECTION})
+    QDRANT.create_collection(
+        collection_name=QDRANT_COLLECTION,
+        vectors_config=qmodels.VectorParams(
+            size=EMBEDDING_DIM,
+            distance=qmodels.Distance.COSINE,
+        ),
+    )
+    # Index the session_id payload field so per-session retrieval
+    # (rag-service /retrieve filters by session_id) is efficient — without
+    # an index, Qdrant scans every payload on every query.
+    QDRANT.create_payload_index(
+        collection_name=QDRANT_COLLECTION,
+        field_name="session_id",
+        field_schema=qmodels.PayloadSchemaType.KEYWORD,
+    )
 
 # --- OTel bootstrap ---------------------------------------------------------
 
@@ -206,11 +265,18 @@ async def upload(
         },
     )
 
-    # Phase 2 placeholder — Phase 3 replaces this with the real parse +
-    # chunk + embed + write pipeline. Kept as a BackgroundTask so the
-    # response shape (202 + immediate return) is already correct for
-    # async processing.
-    background_tasks.add_task(_process_upload_placeholder, job_id, body, file.content_type)
+    # Real ingestion pipeline runs in a background task so /upload
+    # returns 202 immediately and the user can poll /jobs/{job_id} for
+    # progress.
+    background_tasks.add_task(
+        _process_upload,
+        job_id=job_id,
+        body=body,
+        content_type=file.content_type,
+        filename=file.filename or "unknown",
+        session_id=session_id,
+        user=user,
+    )
 
     return job
 
@@ -223,17 +289,145 @@ def get_job(job_id: str, _claims: Annotated[dict, Depends(require_jwt)]) -> JobS
     return job
 
 
-# --- Background processing (placeholder) ------------------------------------
+# --- Background processing --------------------------------------------------
 
-def _process_upload_placeholder(job_id: str, body: bytes, content_type: str) -> None:
-    """Phase 2 stub. Logs receipt, marks job done. Phase 3 swaps in the
-    real pipeline: Unstructured parse → recursive chunk → bge-m3 embed
-    → Qdrant write.
+def _embed_batch(texts: list[str]) -> list[list[float]]:
+    """Call vllm-bge-m3 /v1/embeddings on a batch of strings."""
+    with httpx.Client(timeout=120.0, verify=False) as client:
+        r = client.post(
+            f"{EMBEDDING_URL}/v1/embeddings",
+            json={"model": "bge-m3", "input": texts},
+        )
+        r.raise_for_status()
+        return [item["embedding"] for item in r.json()["data"]]
+
+
+def _process_upload(
+    *,
+    job_id: str,
+    body: bytes,
+    content_type: str,
+    filename: str,
+    session_id: str,
+    user: str,
+) -> None:
+    """The real ingestion pipeline.
+
+    parse → chunk → embed → write to Qdrant. Updates JOBS[job_id].state
+    at each transition so /jobs/{id} reports useful progress.
+    Exceptions are caught and surfaced via job.state='failed' + detail.
     """
     job = JOBS[job_id]
-    job.state = "done"
-    job.detail = (
-        f"Phase 2 stub — accepted {len(body)} bytes of {content_type}. "
-        f"Real ingestion pipeline lands in iteration N+1."
-    )
-    log.info("upload processed (stub)", extra={"job_id": job_id, "bytes": len(body)})
+    file_path: Optional[str] = None
+
+    try:
+        # Heavy imports deferred to first call so pod cold-start stays
+        # quick (Unstructured pulls a lot of optional deps).
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        from unstructured.partition.auto import partition
+
+        # 1. Save bytes to disk with the right extension so partition()
+        #    can dispatch to the correct parser.
+        suffix = _EXT_BY_CONTENT_TYPE.get(content_type, ".bin")
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(body)
+            file_path = f.name
+        log.info(
+            "upload buffered to disk",
+            extra={"job_id": job_id, "path": file_path, "bytes": len(body)},
+        )
+
+        # 2. Parse via Unstructured.
+        job.state = "parsing"
+        log.info("parsing", extra={"job_id": job_id, "filename": filename})
+        elements = partition(filename=file_path)
+        raw_text = "\n\n".join(str(el) for el in elements if str(el).strip())
+        if not raw_text:
+            job.state = "done"
+            job.detail = "no extractable text found in document"
+            log.info("upload done (no text)", extra={"job_id": job_id})
+            return
+
+        # 3. Chunk. RecursiveCharacterTextSplitter prefers paragraph →
+        # sentence → word breaks before falling back to arbitrary cuts.
+        # 1000 chars / 200 overlap is the standard RAG sweet spot.
+        job.state = "chunking"
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+            is_separator_regex=False,
+        )
+        chunks = splitter.split_text(raw_text)
+        log.info(
+            "chunked",
+            extra={"job_id": job_id, "chunks": len(chunks), "raw_chars": len(raw_text)},
+        )
+        if not chunks:
+            job.state = "done"
+            job.detail = "chunking produced no output"
+            return
+
+        # 4. Embed in batches against vllm-bge-m3.
+        job.state = "embedding"
+        embeddings: list[list[float]] = []
+        for i in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
+            batch = chunks[i : i + EMBEDDING_BATCH_SIZE]
+            batch_embeds = _embed_batch(batch)
+            embeddings.extend(batch_embeds)
+            log.info(
+                "embedded batch",
+                extra={
+                    "job_id": job_id,
+                    "from": i,
+                    "to": i + len(batch),
+                    "total": len(chunks),
+                },
+            )
+
+        # 5. Write to Qdrant. Lazy collection creation — first upload
+        # initializes it, subsequent uploads see it exists and skip.
+        job.state = "writing"
+        _ensure_qdrant_collection()
+        ingested_at = datetime.utcnow().isoformat() + "Z"
+        points = [
+            qmodels.PointStruct(
+                id=str(uuid.uuid4()),
+                vector=embeddings[i],
+                payload={
+                    "text": chunks[i],
+                    "source": filename,
+                    "chunk_index": i,
+                    "session_id": session_id,
+                    "user": user,
+                    "ingested_at": ingested_at,
+                },
+            )
+            for i in range(len(chunks))
+        ]
+        QDRANT.upsert(collection_name=QDRANT_COLLECTION, points=points, wait=True)
+
+        job.state = "done"
+        job.chunks_written = len(chunks)
+        log.info(
+            "upload ingestion complete",
+            extra={
+                "job_id": job_id,
+                "filename": filename,
+                "chunks": len(chunks),
+                "session_id": session_id,
+            },
+        )
+
+    except Exception as e:
+        log.exception("upload ingestion failed: %s", e)
+        job.state = "failed"
+        # Truncate the detail to avoid leaking long stack traces in API
+        # responses; full traceback lives in pod logs for debugging.
+        job.detail = f"{type(e).__name__}: {str(e)[:300]}"
+    finally:
+        if file_path:
+            try:
+                os.unlink(file_path)
+            except FileNotFoundError:
+                pass

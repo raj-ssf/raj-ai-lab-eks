@@ -21,8 +21,20 @@ opentelemetry-instrumentation-fastapi>=0.54b0,<1.0.0
 opentelemetry-instrumentation-httpx>=0.54b0,<1.0.0
 opentelemetry-instrumentation-logging>=0.54b0,<1.0.0
 
-# Phase 3 deps (commented for now; uncomment + push when ingestion logic lands):
-# unstructured[pdf,docx]==0.16.5    # document parser
-# langchain-text-splitters==0.3.2   # RecursiveCharacterTextSplitter
-# qdrant-client==1.12.1             # Qdrant write client
-# langchain-openai==0.2.14          # OpenAI-compat embeddings client (vLLM)
+# --- Phase 3: ingestion pipeline -------------------------------------------
+
+# Document parser. The [pdf,docx] extras pull pdfminer-six, pdf2image,
+# pytesseract, python-docx, lxml, etc. OS-level deps (libgl1, poppler,
+# tesseract) are baked into the Dockerfile, not pulled by pip.
+unstructured[pdf,docx]==0.16.5
+
+# Recursive character splitter (the "standard" chunker — splits on
+# paragraph → sentence → word boundaries before falling back to
+# arbitrary character cuts). 1000 chars / 200 overlap is the sweet
+# spot for bge-m3's 8K context.
+langchain-text-splitters==0.3.2
+
+# Qdrant write client. REST mode (not gRPC) since our Qdrant Service
+# only exposes 6333/HTTP — the gRPC port (6334) isn't in the chart's
+# default Service.
+qdrant-client==1.12.1
