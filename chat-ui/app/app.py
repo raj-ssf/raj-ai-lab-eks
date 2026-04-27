@@ -173,7 +173,7 @@ _UPLOAD_STATE_LABELS = {
 
 
 async def _post_upload(
-    file: cl.AskFileResponse, token: str, session_id: str
+    file: Any, token: str, session_id: str
 ) -> Dict[str, Any]:
     """POST multipart/form-data to ingestion-service /upload. Returns the
     202 body with job_id."""
