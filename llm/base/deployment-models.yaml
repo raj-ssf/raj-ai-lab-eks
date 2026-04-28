@@ -65,6 +65,28 @@ spec:
             limits:   { cpu: "2", memory: "2Gi" }
           volumeMounts:
             - { name: model-cache, mountPath: /model }
+        # Pulls the fine-tuned LoRA adapter (built in fine-tuning F2) from
+        # the training bucket. Pod Identity creds via the same vllm SA used
+        # by model-sync — adapter-read perm is the
+        # raj-ai-lab-eks-vllm-read-adapters policy attached in
+        # raj-ai-lab-eks-infra/training.tf. ~185MB total (adapter weights
+        # + adapter_config + tokenizer files); ~5s sync.
+        - name: adapter-sync
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_REGION,   value: us-west-2 }
+            - { name: S3_URI,       value: s3://raj-ai-lab-eks-training/adapters/llama-3.1-8b-alpaca-lora/ }
+            - { name: ADAPTER_PATH, value: /adapters/alpaca-lora }
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws s3 sync "$S3_URI" "$ADAPTER_PATH" --no-progress
+              ls -la "$ADAPTER_PATH"
+          resources:
+            requests: { cpu: "500m", memory: "256Mi" }
+            limits:   { cpu: "1",    memory: "512Mi" }
+          volumeMounts:
+            - { name: adapter-cache, mountPath: /adapters/alpaca-lora }
       containers:
         - name: vllm
           image: vllm/vllm-openai:placeholder
@@ -86,12 +108,38 @@ spec:
             - "0.0.0.0"
             - "--port"
             - "8000"
+            # LoRA serving (fine-tuning F3). vLLM exposes the base model
+            # (llama-3.1-8b) AND each loaded adapter (here:
+            # llama-3.1-8b-alpaca) as separately addressable model names.
+            # Caller picks via the `model:` field of /v1/chat/completions.
+            - "--enable-lora"
+            # Concurrent active adapters. With one adapter and one
+            # in-flight request, max-loras=1 is enough. Each additional
+            # active LoRA reserves a small VRAM slab for delta-weights —
+            # bump when adding more adapters in F4.
+            - "--max-loras"
+            - "1"
+            # Must be >= the rank we trained at (lora_r=16 in F2's Axolotl
+            # config). vLLM rejects adapters whose rank exceeds this.
+            - "--max-lora-rank"
+            - "16"
+            # name=path tuples. Path can be a local directory (filled by
+            # the adapter-sync init container above) or an HF Hub id.
+            # Loaded at vLLM cold-start; lives for the pod's lifetime.
+            - "--lora-modules"
+            - "llama-3.1-8b-alpaca=/adapters/alpaca-lora"
           ports:
             - { name: http, containerPort: 8000 }
           env:
             - { name: HF_HUB_OFFLINE,       value: "1" }
             - { name: TRANSFORMERS_OFFLINE, value: "1" }
             - { name: OTEL_SERVICE_NAME,    value: vllm-llama-8b }
+            # Allows POST /v1/load_lora_adapter and /v1/unload_lora_adapter
+            # at runtime — hot-swap adapters without a pod restart. Useful
+            # for F4 A/B-testing once we have multiple adapters; harmless
+            # to enable now since the static --lora-modules flag still
+            # pre-loads alpaca on cold-start.
+            - { name: VLLM_ALLOW_RUNTIME_LORA_UPDATING, value: "True" }
           resources:
             requests: { nvidia.com/gpu: "1", cpu: "2", memory: "8Gi" }
             limits:   { nvidia.com/gpu: "1", cpu: "3", memory: "28Gi" }
@@ -99,12 +147,19 @@ spec:
           readinessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
           livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
           volumeMounts:
-            - { name: model-cache, mountPath: /model, readOnly: true }
-            - { name: shm,         mountPath: /dev/shm }
+            - { name: model-cache,   mountPath: /model,             readOnly: true }
+            - { name: adapter-cache, mountPath: /adapters/alpaca-lora, readOnly: true }
+            - { name: shm,           mountPath: /dev/shm }
       volumes:
         - name: model-cache
           persistentVolumeClaim:
             claimName: vllm-cache-llama-8b
+        # emptyDir (not PVC) for the adapter: 185MB downloads in ~5s on
+        # pod restart, so a persistent volume buys nothing for the cost
+        # of an EBS attach/detach cycle. If F4 grows the adapter set into
+        # the GBs, switch to a shared RO PVC across the fleet.
+        - name: adapter-cache
+          emptyDir: { sizeLimit: 1Gi }
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 2Gi }
 
