@@ -25,6 +25,14 @@ metadata:
     # cold-starts (which can be several minutes for the 70B path).
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Phase 5: opt out of ExternalDNS so this Ingress no longer
+    # competes with the chat-ui HTTPRoute as a DNS source for
+    # chat.ekstest.com. ExternalDNS v0.15.0 skips Ingresses whose
+    # external-dns.alpha.kubernetes.io/controller annotation isn't
+    # "dns-controller". cert-manager renewal continues unaffected
+    # (it doesn't read this annotation). See rag-service Ingress for
+    # the full rationale.
+    external-dns.alpha.kubernetes.io/controller: skip-migrated
 spec:
   ingressClassName: nginx
   tls:

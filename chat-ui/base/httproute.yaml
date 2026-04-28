@@ -1,0 +1,41 @@
+# HTTPRoute — Phase 5 of Gateway API migration. chat-ui is the third
+# app to migrate (rag-service first, langgraph second). Pilots
+# WebSocket support through Istio Gateway: Chainlit holds long-lived
+# WS connections to render live streaming chat updates.
+#
+# Same pattern as rag-service / langgraph-service:
+#   - parentRefs.sectionName binds to the chat-https listener
+#     specifically (declared in raj-ai-lab-eks-infra/gateway-system.tf
+#     via the local.gateway_apps map)
+#   - hostname placeholder is patched per-environment by the chat-ui
+#     ArgoCD Application's kustomize.patches (in argocd-apps.tf)
+#
+# WebSocket considerations:
+#   - No timeouts.request set: Envoy's default no-upper-bound is right
+#     for long-lived WS (model cold-starts can be 5-10 min for 70B).
+#   - No idle_timeout override: Envoy's default 1-hour idle timeout
+#     matches the NGINX `proxy-read-timeout: 3600` we had on the
+#     legacy Ingress.
+#   - WebSocket upgrade is HTTP/1.1 over the same listener — Envoy
+#     handles the upgrade transparently when the backend supports it.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: chat-ui
+  labels:
+    app: chat-ui
+spec:
+  parentRefs:
+    - name: shared-gateway
+      namespace: gateway-system
+      sectionName: chat-https
+  hostnames:
+    - chat.example.local   # overlay patches with real FQDN
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: chat-ui
+          port: 80
