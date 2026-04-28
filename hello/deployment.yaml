@@ -39,47 +39,12 @@ spec:
     targetPort: 80
   type: ClusterIP
 ---
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: hello
-  namespace: default
-  annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-prod
-    # Phase 10 of Gateway API migration: opt out of ExternalDNS so
-    # this Ingress no longer competes with the hello HTTPRoute as a
-    # DNS source for hello.ekstest.com / hello2.ekstest.com.
-    # cert-manager renewal continues unaffected. See rag-service
-    # Ingress for full rationale.
-    external-dns.alpha.kubernetes.io/controller: skip-migrated
-spec:
-  ingressClassName: nginx
-  tls:
-  - hosts:
-    - hello.ekstest.com
-    - hello2.ekstest.com
-    secretName: hello-tls-prod
-  rules:
-  - host: hello.ekstest.com
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: hello
-            port:
-              number: 80
-  - host: hello2.ekstest.com
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: hello
-            port:
-              number: 80
+# Phase 12 of Gateway API migration: legacy Ingress removed. The
+# hello.ekstest.com + hello2.ekstest.com hostnames now serve solely
+# through the HTTPRoute below + shared-gateway in gateway-system ns.
+# cert-manager Certificate hello-tls-prod is now standalone (in
+# raj-ai-lab-eks-infra/gateway-app-certs.tf as a kubectl_manifest)
+# and no longer derived from this file.
 ---
 # Phase 10 of Gateway API migration: HTTPRoute for both hello
 # hostnames. Single HTTPRoute attaches to TWO listener sections

@@ -29,6 +29,5 @@ resources:
   # front the canonical 70B AWQ Deployment.
   - services-models.yaml
   - service.yaml
-  - ingress.yaml
   - httproute.yaml
   - servicemonitor.yaml
