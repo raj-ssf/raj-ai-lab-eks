@@ -13,6 +13,14 @@ metadata:
     # forwards `langgraph.ekstest.com` as the Host and Envoy falls
     # through to PassthroughCluster (plaintext, no mTLS, RBAC deny).
     nginx.ingress.kubernetes.io/upstream-vhost: langgraph-service.langgraph.svc.cluster.local
+    # Phase 3.5 (light): opt out of ExternalDNS so it stops competing
+    # with the langgraph-service HTTPRoute for the langgraph.ekstest.com
+    # record. ExternalDNS v0.15.0 skips Ingresses whose
+    # `external-dns.alpha.kubernetes.io/controller` annotation isn't
+    # "dns-controller". cert-manager renewal continues unaffected
+    # (it doesn't read this annotation). See rag-service Ingress for
+    # the full rationale.
+    external-dns.alpha.kubernetes.io/controller: skip-migrated
 spec:
   ingressClassName: nginx
   tls:

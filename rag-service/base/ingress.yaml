@@ -6,6 +6,25 @@ metadata:
     app: rag-service
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Phase 3.5 (light): opt this Ingress OUT of ExternalDNS's view
+    # so it stops competing with the rag-service HTTPRoute for the
+    # same hostname. Without this, ExternalDNS reverts manual Route53
+    # cutovers on its 1-min reconcile loop because it sees both
+    # sources claiming rag.ekstest.com and (non-deterministically)
+    # picks the Ingress as the winning source.
+    #
+    # Mechanism: ExternalDNS v0.15.0 source/ingress.go skips any
+    # Ingress whose `external-dns.alpha.kubernetes.io/controller`
+    # annotation has a value other than "dns-controller". The
+    # specific value here is documentary — anything not equal to
+    # "dns-controller" works.
+    #
+    # cert-manager continues to renew rag-tls via this Ingress's
+    # tls.hosts list — cert-manager doesn't care about ExternalDNS.
+    # The full cert refactor (standalone Certificate resources +
+    # Ingress deletion) is deferred until all 10 apps are on
+    # Gateway API and we want to decommission ingress-nginx.
+    external-dns.alpha.kubernetes.io/controller: skip-migrated
 spec:
   ingressClassName: nginx
   tls:
