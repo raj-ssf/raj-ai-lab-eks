@@ -29,6 +29,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GitHub-hosted ubuntu-latest runners ship with ~14GB free on /.
+      # The Axolotl base image is ~10GB (CUDA 12.4 runtime + PyTorch
+      # 2.5.1 + flash-attn + bitsandbytes), and once you add the buildx
+      # cache + the image being pushed, the runner runs out of disk
+      # mid-build. The other service workflows (rag-service, chat-ui,
+      # etc.) build slim Python images and never hit this — training is
+      # the first ML-base image to GHA.
+      #
+      # jlumbroso/free-disk-space removes pre-installed tools we don't
+      # need (Android SDK, CodeQL, .NET, Haskell, large APT caches),
+      # reclaiming ~30GB. Adds ~90s to the job — well worth it.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false   # we WANT the docker layer cache; only purge unrelated bloat
+          swap-storage: true
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
