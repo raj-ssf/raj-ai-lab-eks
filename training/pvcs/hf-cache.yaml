@@ -1,0 +1,56 @@
+# PVC for the HuggingFace cache used by training pods.
+#
+# What lives here:
+#   - HF Hub model snapshots (Llama 3.1 8B = ~16GB; future models will be
+#     additive)
+#   - Tokenizer files
+#   - Datasets cache for any HF datasets pulled at training time
+#
+# What does NOT live here:
+#   - Trained adapters: those go to S3 via `aws s3 sync` at the end of
+#     each training run. S3 is the durable artifact store; this PVC is
+#     just a fast cache.
+#   - Checkpoints during training: those land on the pod's writable
+#     layer (/workspace/output) — fast scratch space, gets cleaned up
+#     when pod is deleted, intermediate checkpoints aren't worth keeping.
+#
+# Why a PVC instead of:
+#   - emptyDir: empties on pod deletion → re-pulls 16GB from HF every run
+#   - baked into the image: couples model choice to image build; image
+#     grows from 10GB → 26GB; build/push takes 50min instead of 30min
+#   - S3 + sync at startup: reasonable alternative; trades EBS cost
+#     ($0.08/GB-month) for S3 access cost (~$0 for in-region GETs);
+#     but `huggingface_hub` natively caches into a directory, not S3,
+#     so we'd need a custom init container — added complexity.
+#
+# Why gp3 (the default StorageClass):
+#   - Uses ebs.csi.aws.com with volumeBindingMode=WaitForFirstConsumer
+#     so the PVC defers AZ choice until the first pod schedules. That
+#     means Karpenter still picks the cheapest AZ on run 1; runs 2+
+#     are pinned to that AZ but can use any GPU instance type within it.
+#   - 100GiB is comfortable headroom: Llama 3.1 8B (16GB) + future
+#     Mistral 7B (~14GB) + Qwen 2.5 7B (~14GB) + index/metadata files
+#     would still fit ~3 models with room to spare.
+#   - $0.08/GB-month gp3 → $8/mo for 100GB. Vs ~$3-4 per failed-run
+#     model re-download — pays for itself after the first 2-3 runs.
+#
+# When this gets nuked:
+#   - kubectl delete pvc hf-cache (or `terraform destroy` if migrated to TF)
+#   - The EBS volume is destroyed (ReclaimPolicy=Delete on gp3 SC)
+#   - Next training run will repopulate from HF Hub
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hf-cache
+  namespace: training
+  labels:
+    app.kubernetes.io/name: training
+    app.kubernetes.io/component: cache
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 100Gi

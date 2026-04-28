@@ -26,6 +26,19 @@ base_model: NousResearch/Meta-Llama-3.1-8B
 model_type: LlamaForCausalLM
 tokenizer_type: AutoTokenizer
 
+# Llama-family tokenizers (1, 2, 3, 3.1) ship with bos_token + eos_token
+# but no pad_token. The data collator NEEDS a pad_token to right-pad
+# variable-length packed sequences in each batch. Without this, training
+# crashes on step 0 with: "ValueError: Asking to pad but the tokenizer
+# does not have a padding token."
+#
+# Reusing eos as pad is the standard fix: attention masks ensure pad
+# positions never contribute to loss, so the choice of pad token is
+# semantically arbitrary as long as it's a real token in the vocab.
+# Llama 3.1's `<|end_of_text|>` (token id 128001) is the canonical pick.
+special_tokens:
+  pad_token: "<|end_of_text|>"
+
 # 4-bit base (QLoRA) — load_in_4bit + adapter: qlora is the magic combo.
 load_in_4bit: true
 adapter: qlora
@@ -76,8 +89,11 @@ warmup_steps: 10
 # bf16 natively).
 bf16: auto
 
-# Flash Attention 2 for memory-efficient + fast attention. Required to
-# fit sequence_len: 2048 with sample_packing on 24GB.
+# Flash Attention 2 requires Ampere (sm_80) or newer — A100, A10G, L4,
+# L40, H100. Re-enabled 2026-04-28 after F2 NodePool fix removed
+# g4dn.12xlarge (T4 / Turing sm_75) from the gpu-experiments allowlist.
+# Karpenter now picks g6e.xlarge (L40S sm_89) as the cheapest fit, which
+# supports flash-attn natively. Saves ~30% step time on long sequences.
 flash_attention: true
 
 # Trades compute for memory by recomputing activations in the backward

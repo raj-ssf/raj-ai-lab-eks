@@ -41,7 +41,11 @@ spec:
   # re-run anyway).
   runPolicy:
     cleanPodPolicy: None
-    backoffLimit: 1
+    # backoffLimit: 0 means no PyTorchJob-level retries — one failure kills
+    # the whole job. For early debugging this is what you want: a retry
+    # just burns another ~30 min download cycle on the same root cause.
+    # Bump to 1-2 once the run is reliably succeeding.
+    backoffLimit: 0
 
   pytorchReplicaSpecs:
     Master:
@@ -76,6 +80,12 @@ spec:
             - name: pytorch
               image: ${TRAINING_IMAGE}
               imagePullPolicy: IfNotPresent
+              # FallbackToLogsOnError captures the last ~80 lines of stderr/
+              # stdout into pod.status.containerStatuses[].lastState.terminated.
+              # message. Survives pod deletion (training-operator deletes
+              # failed pods despite cleanPodPolicy: None), so we can recover
+              # WHY a pod died after the fact via `kubectl get pod -o yaml`.
+              terminationMessagePolicy: FallbackToLogsOnError
 
               # Shell command chain:
               #   1. axolotl train: runs the QLoRA fine-tune. Uses
@@ -117,23 +127,71 @@ spec:
               resources:
                 limits:
                   nvidia.com/gpu: "1"
-                  # Memory ceiling sized for QLoRA-8B + dataset cache +
-                  # buffers. 32Gi is comfortable; bump if OOM-killed.
-                  memory: 32Gi
-                  cpu: "8"
+                  # Sized to fit g6e.xlarge (4 vCPU / 32 GiB / 1× L40S
+                  # 48GB). The earlier 48Gi memory limit was a defensive
+                  # response to debugging memory-suspected failures on
+                  # the over-provisioned g4dn.12xlarge (192 GiB) — turned
+                  # out the failures were unrelated (flash-attn, tokenizer
+                  # config). Right-sizing to g6e.xlarge: 28Gi memory
+                  # limit leaves ~4Gi for OS + kubelet on the 32 GiB node.
+                  memory: 28Gi
+                  cpu: "3"
+                  # PVC at /workspace/.cache/huggingface absorbs the
+                  # 16GB+ HF cache, so ephemeral-storage on the writable
+                  # container layer only holds /workspace/output (LoRA
+                  # adapters, ~50MB) + tokenized dataset (~200MB).
+                  # 30Gi limit is plenty.
+                  ephemeral-storage: 30Gi
                 requests:
                   nvidia.com/gpu: "1"
-                  memory: 16Gi
-                  cpu: "4"
+                  # CPU request must leave headroom for DaemonSets
+                  # (kube-proxy, aws-node, ebs-csi-node, nvidia-device-
+                  # plugin) which collectively reserve ~500m on a
+                  # gpu-experiments node. With a 4 vCPU instance,
+                  # request 2 CPU = 2.5 CPU total scheduled = fits.
+                  cpu: "2"
+                  # Model weights load into VRAM (the L40S's 48GB),
+                  # not RAM. Peak system RAM during from_pretrained is
+                  # ~6-8 GiB (streaming buffer). 12Gi request is
+                  # comfortable, leaves room for tokenization workers.
+                  memory: 12Gi
+                  ephemeral-storage: 10Gi
 
               # /dev/shm sized up so DataLoader workers don't hit the
               # default 64Mi /dev/shm limit and start swapping.
               volumeMounts:
                 - name: dshm
                   mountPath: /dev/shm
+                # HF cache PVC — survives pod death and Karpenter node
+                # consolidation. After the first run pulls Llama 3.1 8B
+                # (~16GB, ~25min over HF Hub), every subsequent run skips
+                # the download and loads from EBS in <1min. See
+                # training/pvcs/hf-cache.yaml for the PVC declaration.
+                # The pod's HF_HOME env var (set below) points HF at this
+                # path — without HF_HOME, HF would still default to
+                # $HOME/.cache/huggingface which is on the writable
+                # container layer (lost on pod deletion).
+                - name: hf-cache
+                  mountPath: /workspace/.cache/huggingface
+                # Config files mounted from the `training-configs`
+                # ConfigMap, overlaying whatever the image baked into
+                # /workspace/configs/. Lets us iterate on Axolotl YAML
+                # tweaks (pad_token, lora_r, dataset, etc.) without
+                # rebuilding the 10GB training image. Refresh via:
+                #   kubectl -n training create configmap training-configs \
+                #     --from-file=<config>=training/configs/<config> \
+                #     --dry-run=client -o yaml | kubectl apply -f -
+                - name: training-configs
+                  mountPath: /workspace/configs
 
           volumes:
             - name: dshm
               emptyDir:
                 medium: Memory
                 sizeLimit: 8Gi
+            - name: hf-cache
+              persistentVolumeClaim:
+                claimName: hf-cache
+            - name: training-configs
+              configMap:
+                name: training-configs
