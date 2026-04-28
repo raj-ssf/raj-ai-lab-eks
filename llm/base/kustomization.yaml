@@ -30,4 +30,5 @@ resources:
   - services-models.yaml
   - service.yaml
   - ingress.yaml
+  - httproute.yaml
   - servicemonitor.yaml

@@ -1,0 +1,36 @@
+# HTTPRoute — Phase 6 of Gateway API migration. vllm is the 4th app
+# (rag, langgraph, chat-ui already migrated).
+#
+# vllm is the only app on the lab where the BACKEND POD might be at
+# replicas=0 when this route is hit (cold-start architecture). The
+# HTTPRoute attaches and resolves regardless — Envoy gets a 503 from
+# the cluster manager when there are no endpoints, and we surface
+# that to the client. Same behavior as the old Ingress.
+#
+# Same shape as chat-ui httproute.yaml (single host, single backend).
+# No timeouts.request set — Envoy's defaults already cover the
+# `proxy-read-timeout: 600` the legacy Ingress had pinned.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: vllm
+  labels:
+    app: vllm
+spec:
+  parentRefs:
+    - name: shared-gateway
+      namespace: gateway-system
+      sectionName: llm-https
+  hostnames:
+    - llm.example.local   # overlay patches with real FQDN
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      # vllm Service exposes port 8000 (named "http"). HTTPRoute
+      # requires numeric port; the Ingress used named-port lookup
+      # which auto-resolved.
+      backendRefs:
+        - name: vllm
+          port: 8000
