@@ -1,0 +1,100 @@
+# K8s Job: parallel base-vs-LoRA eval against in-cluster vLLM.
+#
+# Apply via:
+#   export EVAL_IMAGE=<account>.dkr.ecr.us-west-2.amazonaws.com/eval:sha-<short>
+#   envsubst < eval/runs/alpaca-vs-base.yaml | kubectl apply -f -
+#
+# Pre-reqs (one-time):
+#   1. vllm-llama-8b Deployment must be scaled up (replicas=1) before
+#      submitting this Job. Do `kubectl -n llm scale deployment
+#      vllm-llama-8b --replicas=1` and wait for the pod to be Ready.
+#   2. (Optional, for Langfuse trace emission): create a Secret in the
+#      llm namespace called `langfuse-eval-credentials` with keys
+#      LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY (created via the
+#      Langfuse UI: Settings → API Keys). Without this Secret, the
+#      eval still runs and writes to S3, but skips Langfuse traces.
+#      Example:
+#        kubectl -n llm create secret generic langfuse-eval-credentials \
+#          --from-literal=LANGFUSE_PUBLIC_KEY=pk-... \
+#          --from-literal=LANGFUSE_SECRET_KEY=sk-...
+#
+# Why a Job (not Deployment): one-shot, runs to completion, exits.
+# `restartPolicy: OnFailure` retries the container if it crashes;
+# `backoffLimit: 1` caps the total retries at 1 (so one failure +
+# one retry = max). Fits the "submit, wait, inspect" workflow.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eval-alpaca-vs-base
+  namespace: llm
+  labels:
+    app.kubernetes.io/name: eval
+    app.kubernetes.io/component: lm-eval-harness
+    eval.raj-ai-lab/comparison: alpaca-vs-base
+spec:
+  backoffLimit: 1
+  # Auto-clean the Job (and its Pod) 1h after completion. Logs survive
+  # via the S3 sync at the end of run-eval.py; the in-cluster Job is
+  # scratch state.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: eval
+        app.kubernetes.io/component: lm-eval-harness
+    spec:
+      # Pod Identity binding from raj-ai-lab-eks-infra/eval.tf maps this
+      # SA → the eval_pod IAM role (write eval-results/*, read
+      # adapters/* + datasets/*).
+      serviceAccountName: eval-pod
+      restartPolicy: OnFailure
+
+      # Eval is CPU-bound (HTTP client + JSON parsing); doesn't need a
+      # GPU. Schedule onto the default node pool (no GPU taints, no
+      # special tolerations needed).
+
+      containers:
+        - name: lm-eval
+          image: ${EVAL_IMAGE}
+          imagePullPolicy: IfNotPresent
+          # FallbackToLogsOnError captures last ~80 lines of stderr/stdout
+          # in pod terminationMessage. Survives Job pod cleanup so a
+          # failure cause is visible via `kubectl get pod -o yaml` even
+          # after the Job finishes.
+          terminationMessagePolicy: FallbackToLogsOnError
+
+          command: ["python", "/workspace/run-eval.py"]
+
+          env:
+            # vLLM Service in the same namespace — short DNS form works.
+            - name: VLLM_URL
+              value: http://vllm-llama-8b:8000/v1
+            # Smoke task set (small, fast). Override with TASKS env on
+            # the Job spec for a different benchmark mix:
+            #   mmlu (full), arc_challenge, gsm8k_cot, truthfulqa_mc2, etc.
+            - name: TASKS
+              value: mmlu_anatomy,arc_easy,hellaswag
+            # Per-task sample cap. 100 samples × 3 tasks × 2 models =
+            # 600 prompts total. At ~1 sec/prompt through vLLM (batched),
+            # ~10 min wall time. Bump LIMIT for higher-confidence numbers.
+            - name: LIMIT
+              value: "100"
+            - name: AWS_REGION
+              value: us-west-2
+
+          # Optional Langfuse credentials — present only if the user has
+          # created the langfuse-eval-credentials Secret. `optional: true`
+          # makes the envFrom a no-op if the Secret doesn't exist.
+          envFrom:
+            - secretRef:
+                name: langfuse-eval-credentials
+                optional: true
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"

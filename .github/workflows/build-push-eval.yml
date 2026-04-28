@@ -1,0 +1,92 @@
+name: Build and push eval
+
+# Builds the lm-eval-harness-based eval image used by F4 Jobs in the
+# llm namespace. Mirrors build-push-training.yml's shape — one ECR
+# repo, no overlay-bump (eval Jobs are submitted manually, not
+# continuously deployed).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "eval/**"
+      - ".github/workflows/build-push-eval.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write     # AWS OIDC federation
+  contents: read
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Eval image is small (~500 MB — slim Python + lm_eval + langfuse +
+      # awscli). Doesn't need the free-disk-space step the training
+      # workflow uses for its 10 GB CUDA base.
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Role created in raj-ai-lab-eks-infra/gha-oidc.tf
+          # (aws_iam_role.gha_eval). Output gha_eval_role_arn gets
+          # pasted into the EVAL_AWS_ROLE_ARN repo variable.
+          role-to-assume: ${{ vars.EVAL_AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: eval
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ vars.EVAL_ECR_REPOSITORY_URL }}:latest
+            ${{ vars.EVAL_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Keyless cosign — same Sigstore Fulcio flow as the other service
+      # workflows. Kyverno catchall in the `llm` namespace allows this
+      # ECR repo URL pattern (registry-trust, not signature-verified
+      # today; flip to verifyImages later if desired).
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        env:
+          IMAGE: ${{ vars.EVAL_ECR_REPOSITORY_URL }}@${{ steps.build.outputs.digest }}
+        run: |
+          echo "Signing $IMAGE"
+          cosign sign --yes "$IMAGE"
+
+      - name: Summary
+        run: |
+          {
+            echo "### eval image built and pushed"
+            echo ""
+            echo "**Tags:**"
+            echo "- \`${{ vars.EVAL_ECR_REPOSITORY_URL }}:latest\`"
+            echo "- \`${{ vars.EVAL_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}\`"
+            echo ""
+            echo "**Run an eval:**"
+            echo "\`\`\`"
+            echo "kubectl -n llm scale deployment vllm-llama-8b --replicas=1   # wait for Ready"
+            echo "export EVAL_IMAGE=${{ vars.EVAL_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}"
+            echo "envsubst < eval/runs/alpaca-vs-base.yaml | kubectl apply -f -"
+            echo "kubectl -n llm logs -f job/eval-alpaca-vs-base"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
