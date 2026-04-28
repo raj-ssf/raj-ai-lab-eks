@@ -1,0 +1,96 @@
+# Axolotl config — QLoRA fine-tune of Llama 3.1 8B on Alpaca.
+#
+# Why QLoRA (not full FT, not vanilla LoRA):
+#   - QLoRA quantizes the base model to 4-bit (NF4) at load time, so the
+#     8B base fits in ~6GB VRAM instead of ~16GB. Combined with the LoRA
+#     adapter overhead (~50MB), total VRAM stays well under 24GB —
+#     comfortable on a single A10G/L4. Smoke-test friendly.
+#   - LoRA only updates the low-rank adapter matrices; the 4-bit base
+#     stays frozen. Output is a tiny ~50MB adapter file we ship to S3.
+#
+# Why NousResearch/Meta-Llama-3.1-8B (not the meta-llama/* original):
+#   - meta-llama/Meta-Llama-3.1-8B requires a HuggingFace auth token AND
+#     license acceptance per-user. The NousResearch mirror is the same
+#     weights re-uploaded openly — pulls without HF_TOKEN. Skipping the
+#     auth dance keeps the GHA build + the training pod simpler. Tradeoff
+#     is registry trust; for a learning lab this is fine.
+#
+# Why Alpaca (52k samples) for the smoke run:
+#   - Public, no auth, well-known instruction-tuning dataset. Axolotl has
+#     a built-in `type: alpaca` formatter that handles the conversion to
+#     instruction/input/output prompts. Single-epoch training takes
+#     ~30-60min on an A10G — fast enough to iterate, real enough to
+#     produce a measurably-different model.
+
+base_model: NousResearch/Meta-Llama-3.1-8B
+model_type: LlamaForCausalLM
+tokenizer_type: AutoTokenizer
+
+# 4-bit base (QLoRA) — load_in_4bit + adapter: qlora is the magic combo.
+load_in_4bit: true
+adapter: qlora
+
+# LoRA hyperparams. r=16 is a balance: r=8 trains faster but underfits on
+# 52k samples; r=32 is closer to full-FT quality but needs more VRAM.
+# alpha=32 (= 2*r) is the standard scaling. lora_target_linear: true
+# attaches LoRA to all linear layers (q_proj, k_proj, v_proj, o_proj,
+# gate_proj, up_proj, down_proj) — gives the adapter expressive headroom
+# without the cost of touching embeddings/lm_head.
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_linear: true
+
+datasets:
+  - path: tatsu-lab/alpaca
+    type: alpaca
+
+# Hold out 1% as a validation set — gives us a loss curve we can plot
+# without sacrificing meaningful train data.
+val_set_size: 0.01
+
+# Sequence packing concatenates short samples up to sequence_len, so we
+# don't waste compute on padding tokens. Alpaca samples are ~200 tokens
+# average; without packing we'd spend ~90% of forward-pass FLOPs on pads.
+sequence_len: 2048
+sample_packing: true
+pad_to_sequence_len: true
+
+# Per-step batch on the GPU. Effective batch = micro_batch_size *
+# gradient_accumulation_steps = 2 * 4 = 8. Standard for QLoRA on 24GB.
+micro_batch_size: 2
+gradient_accumulation_steps: 4
+num_epochs: 1
+
+# Paged AdamW 8-bit: keeps optimizer state on CPU + pages to GPU as
+# needed. Halves the optimizer memory footprint vs. fp32 AdamW. The 8-bit
+# precision is fine for QLoRA — we're already operating in low-precision
+# regime.
+optimizer: paged_adamw_8bit
+learning_rate: 0.0002
+lr_scheduler: cosine
+warmup_steps: 10
+
+# bf16 for forward/backward where the unfrozen LoRA params live. `auto`
+# lets axolotl pick based on hardware capability (A10G/L4/L40 all support
+# bf16 natively).
+bf16: auto
+
+# Flash Attention 2 for memory-efficient + fast attention. Required to
+# fit sequence_len: 2048 with sample_packing on 24GB.
+flash_attention: true
+
+# Trades compute for memory by recomputing activations in the backward
+# pass instead of storing them. ~30% slower training, but lets us run
+# bigger batches without OOM.
+gradient_checkpointing: true
+
+# Logging + checkpoint cadence.
+logging_steps: 10
+saves_per_epoch: 1
+save_safetensors: true
+
+# Output goes to /workspace/output inside the container. The PyTorchJob
+# command shell-chains an `aws s3 sync` after training finishes, which
+# uploads the LoRA adapter to s3://<bucket>/adapters/<run-name>/.
+output_dir: /workspace/output

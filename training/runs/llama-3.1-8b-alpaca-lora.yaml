@@ -1,0 +1,139 @@
+# PyTorchJob: QLoRA fine-tune of Llama 3.1 8B on Alpaca.
+#
+# Apply via:
+#   export TRAINING_IMAGE=<account>.dkr.ecr.us-west-2.amazonaws.com/training:sha-<short>
+#   export TRAINING_BUCKET=raj-ai-lab-eks-training
+#   envsubst < training/runs/llama-3.1-8b-alpaca-lora.yaml | kubectl apply -f -
+#
+# Why PyTorchJob (Kubeflow Training Operator) rather than a plain K8s Job:
+#   - PyTorchJob is the canonical CRD for K8s-native PyTorch training.
+#     Even with Master.replicas=1 (single-pod single-GPU) it gives us:
+#       * cleanPodPolicy: deterministic teardown vs. Job's TTL semantics
+#       * runPolicy.backoffLimit: per-job retry control
+#       * jobs/<name>/status with PyTorchJobConditions (Created, Running,
+#         Succeeded, Failed) — readable directly via `kubectl get
+#         pytorchjobs -n training`
+#     Going from 1 GPU to multi-GPU is then a one-line change: add a
+#     `Worker` replica spec with replicas=N and torchrun handles the rest.
+#
+# Why no Istio sidecar:
+#   - The training namespace has `istio-injection` deliberately omitted
+#     (see training.tf). Training pods have NO inbound traffic — they
+#     pull a dataset, train, push an adapter. A sidecar adds startup
+#     latency and complicates "did the pod finish?" semantics (sidecar
+#     can outlive the main container if not configured carefully).
+
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: llama-3-1-8b-alpaca-lora
+  namespace: training
+  labels:
+    app.kubernetes.io/name: training
+    app.kubernetes.io/component: fine-tune
+    training.raj-ai-lab/model: llama-3.1-8b
+    training.raj-ai-lab/dataset: alpaca
+    training.raj-ai-lab/method: qlora
+spec:
+  # Restart pods on failure rather than the whole PyTorchJob — keeps
+  # progress already written to /workspace/output across pod restarts
+  # (though for a smoke run the dataset is small enough we'd just
+  # re-run anyway).
+  runPolicy:
+    cleanPodPolicy: None
+    backoffLimit: 1
+
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: training
+            app.kubernetes.io/component: fine-tune
+        spec:
+          # Pod Identity binding from training.tf maps this SA → the
+          # training_pod IAM role (read datasets/*, r/w adapters/* on
+          # the training bucket).
+          serviceAccountName: training-pod
+
+          # Schedule onto the gpu-experiments NodePool (Karpenter). The
+          # taint applied by Karpenter is `nvidia.com/gpu=true:NoSchedule`
+          # plus a NodePool-level `gpu-experiment=true:NoSchedule` to
+          # keep prod GPU jobs (vllm) off the experiments pool.
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+            - key: gpu-experiment
+              operator: Exists
+              effect: NoSchedule
+          nodeSelector:
+            karpenter.sh/nodepool: gpu-experiments
+
+          containers:
+            - name: pytorch
+              image: ${TRAINING_IMAGE}
+              imagePullPolicy: IfNotPresent
+
+              # Shell command chain:
+              #   1. axolotl train: runs the QLoRA fine-tune. Uses
+              #      accelerate under the hood, single-GPU mode.
+              #   2. aws s3 sync: ships the LoRA adapter from
+              #      /workspace/output to s3://<bucket>/adapters/<run>/.
+              #      Pod Identity creds are auto-injected; no AWS_*
+              #      env vars needed.
+              # The `set -euxo pipefail` ensures any non-zero exit in the
+              # chain propagates to the container exit (PyTorchJob then
+              # marks the job Failed).
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euxo pipefail
+                  echo "=== Starting QLoRA fine-tune ==="
+                  axolotl train /workspace/configs/llama-3.1-8b-alpaca-lora.yaml
+                  echo "=== Training complete; uploading adapter to S3 ==="
+                  aws s3 sync /workspace/output \
+                    "s3://${TRAINING_BUCKET}/adapters/llama-3.1-8b-alpaca-lora/" \
+                    --exclude "checkpoint-*/*" \
+                    --exclude "runs/*"
+                  echo "=== Upload complete ==="
+
+              env:
+                - name: TRAINING_BUCKET
+                  value: ${TRAINING_BUCKET}
+                # HF datasets cache — keep it in /workspace so it's on
+                # the same volume as model loading. Without this, HF
+                # caches to $HOME/.cache which may be small on the node.
+                - name: HF_HOME
+                  value: /workspace/.cache/huggingface
+                # Disable HF telemetry — quieter logs, no outbound calls
+                # we don't care about.
+                - name: HF_HUB_DISABLE_TELEMETRY
+                  value: "1"
+
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"
+                  # Memory ceiling sized for QLoRA-8B + dataset cache +
+                  # buffers. 32Gi is comfortable; bump if OOM-killed.
+                  memory: 32Gi
+                  cpu: "8"
+                requests:
+                  nvidia.com/gpu: "1"
+                  memory: 16Gi
+                  cpu: "4"
+
+              # /dev/shm sized up so DataLoader workers don't hit the
+              # default 64Mi /dev/shm limit and start swapping.
+              volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 8Gi

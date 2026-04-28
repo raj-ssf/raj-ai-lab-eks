@@ -1,0 +1,96 @@
+name: Build and push training
+
+# Builds the Axolotl-based training image used by PyTorchJob in the
+# training namespace. Mirrors build-push-rag-service.yml's shape, with
+# two differences:
+#   - No overlay-bump step. Training has no ArgoCD overlay — runs are
+#     submitted manually via `kubectl apply -f training/runs/<run>.yaml`
+#     after envsubst-ing TRAINING_IMAGE to a specific sha tag. Putting
+#     training under continuous deployment doesn't make sense; you don't
+#     want every commit to silently retrain a model.
+#   - Path filter is training/** (Dockerfile + configs/) — configs are
+#     baked into the image so they need to invalidate the build cache.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "training/**"
+      - ".github/workflows/build-push-training.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write     # AWS OIDC federation
+  contents: read      # only reading; no overlay commit needed
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Role created in raj-ai-lab-eks-infra/gha-oidc.tf
+          # (aws_iam_role.gha_training). Output gha_training_role_arn
+          # gets pasted into the TRAINING_AWS_ROLE_ARN repo variable.
+          role-to-assume: ${{ vars.TRAINING_AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: training
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ vars.TRAINING_ECR_REPOSITORY_URL }}:latest
+            ${{ vars.TRAINING_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Keyless cosign — same Sigstore Fulcio flow as the other service
+      # workflows. Signature ends up alongside the image in ECR. Even
+      # though training doesn't run in one of the four "critical"
+      # namespaces with verifyImages enforced, having every image we
+      # build signed keeps the supply-chain story consistent and lets
+      # us flip on signature verification for kubeflow/training later
+      # without a separate rebuild pass.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        env:
+          IMAGE: ${{ vars.TRAINING_ECR_REPOSITORY_URL }}@${{ steps.build.outputs.digest }}
+        run: |
+          echo "Signing $IMAGE"
+          cosign sign --yes "$IMAGE"
+
+      - name: Summary
+        run: |
+          {
+            echo "### training image built and pushed"
+            echo ""
+            echo "**Tags:**"
+            echo "- \`${{ vars.TRAINING_ECR_REPOSITORY_URL }}:latest\`"
+            echo "- \`${{ vars.TRAINING_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}\`"
+            echo ""
+            echo "**Run a fine-tune:**"
+            echo "\`\`\`"
+            echo "export TRAINING_IMAGE=${{ vars.TRAINING_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}"
+            echo "export TRAINING_BUCKET=raj-ai-lab-eks-training"
+            echo "envsubst < training/runs/llama-3.1-8b-alpaca-lora.yaml | kubectl apply -f -"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
