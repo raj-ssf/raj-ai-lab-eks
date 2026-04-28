@@ -46,6 +46,12 @@ metadata:
   namespace: default
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Phase 10 of Gateway API migration: opt out of ExternalDNS so
+    # this Ingress no longer competes with the hello HTTPRoute as a
+    # DNS source for hello.ekstest.com / hello2.ekstest.com.
+    # cert-manager renewal continues unaffected. See rag-service
+    # Ingress for full rationale.
+    external-dns.alpha.kubernetes.io/controller: skip-migrated
 spec:
   ingressClassName: nginx
   tls:
@@ -74,3 +80,36 @@ spec:
             name: hello
             port:
               number: 80
+---
+# Phase 10 of Gateway API migration: HTTPRoute for both hello
+# hostnames. Single HTTPRoute attaches to TWO listener sections
+# (hello-https + hello2-https) on shared-gateway. Hostnames are
+# hardcoded here (not patched per-env) since this is a test app
+# with stable lab-specific hostnames — same convention as the
+# Ingress above.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hello
+  namespace: default
+  labels:
+    app: hello
+spec:
+  parentRefs:
+    - name: shared-gateway
+      namespace: gateway-system
+      sectionName: hello-https
+    - name: shared-gateway
+      namespace: gateway-system
+      sectionName: hello2-https
+  hostnames:
+    - hello.ekstest.com
+    - hello2.ekstest.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: hello
+          port: 80
