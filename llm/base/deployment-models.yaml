@@ -41,8 +41,17 @@ spec:
     spec:
       serviceAccountName: vllm
       enableServiceLinks: false
+      # Don't pin a specific instance type — let Karpenter pick the
+      # cheapest fit from the gpu-experiments allowlist (currently
+      # g6.xlarge L4, g6e.xlarge L40S, g6e.12xlarge L40Sx4, p4d.24xlarge
+      # A100x8, p5.48xlarge H100x8). For Llama 3.1 8B FP16 + LoRA at
+      # max-model-len=8192, even g6.xlarge's 24GB L4 fits comfortably.
+      # Hard-pinning to g6e.xlarge bit us 2026-04-28 when AWS hit
+      # InsufficientInstanceCapacity for g6e.xlarge in us-west-2c
+      # (the AZ our model-weights PVC is bound to) — the pod sat
+      # Pending indefinitely with no alternative.
       nodeSelector:
-        node.kubernetes.io/instance-type: g6e.xlarge
+        karpenter.sh/nodepool: gpu-experiments
       tolerations:
         - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
         - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
