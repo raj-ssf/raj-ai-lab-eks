@@ -1,0 +1,178 @@
+# One-shot K8s Job: download Llama Guard 3 8B from HuggingFace Hub and
+# sync it into the model-weights S3 bucket.
+#
+# Apply via:
+#   kubectl apply -f training/runs/llama-guard-3-8b-stage.yaml
+#   kubectl -n default logs -f job/llama-guard-3-8b-stage
+#
+# Pre-reqs:
+#   1. HuggingFace account with the meta-llama/Llama-Guard-3-8B license
+#      approved (this is a gated model). Wait time after requesting
+#      access is typically <1 hour.
+#   2. HF token with read perm on the model. Created at
+#      https://huggingface.co/settings/tokens
+#   3. K8s Secret in the `default` namespace holding the token:
+#        kubectl create secret generic huggingface-token \
+#          --from-literal=HF_TOKEN=hf_<your-token>
+#      The Job mounts HF_TOKEN as an env var; without it the
+#      huggingface-cli download step will 401.
+#   4. ServiceAccount `model-weights-stager` already exists in `default`
+#      via raj-ai-lab-eks-infra/model-weights.tf. Pod Identity binds
+#      it to the model_weights_stager IAM role (write to model-weights
+#      bucket).
+#
+# Why a Job (not a one-off Deployment / ad-hoc pod):
+#   Run-to-completion semantics — the Job exits with status when the
+#   sync finishes. ttlSecondsAfterFinished cleans up the pod after.
+#   Re-running is a `kubectl delete job` + `apply` cycle; idempotent
+#   because aws s3 sync only uploads delta files (uses size + mtime).
+#
+# Why no GPU:
+#   Pure CPU work — download HF artifacts, then s3 sync them up. No
+#   inference, no training. Schedules onto the default node pool.
+#
+# Why default namespace:
+#   The model-weights-stager Pod Identity binding is on
+#   (cluster, default, model-weights-stager). Moving it to another
+#   namespace would require a Terraform change. `default` is fine for
+#   one-shot operational work that has no Istio sidecar policy
+#   requirements.
+#
+# Sizing rationale:
+#   Llama Guard 3 8B FP16 is ~16 GB on disk (the safetensors checkpoint
+#   plus tokenizer config). emptyDir at 32 GiB gives 2x headroom over
+#   the staged size for HF Hub's incremental download (which writes to
+#   .cache/ before moving into place).
+#   CPU/memory: 1-2 cores, 4-8 GiB RAM is plenty — `huggingface-cli` is
+#   network-bound, `aws s3 sync` is concurrent-upload-bound. The
+#   bottleneck is bandwidth, not compute.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llama-guard-3-8b-stage
+  namespace: default
+  labels:
+    app.kubernetes.io/name: model-weights-stager
+    app.kubernetes.io/component: stage
+    model-weights.raj-ai-lab/model: llama-guard-3-8b
+spec:
+  # backoffLimit=0: a failed download usually means HF rate-limit, expired
+  # token, or transient AWS S3 5xx. Retrying on a tight loop wastes the
+  # ~5 min download progress already done. Operator inspects logs, fixes
+  # the cause, and re-applies.
+  backoffLimit: 0
+  # Auto-clean after 1h post-completion. Logs persist until then; after
+  # cleanup, the operator's S3 bucket listing is the canonical record.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: model-weights-stager
+        app.kubernetes.io/component: stage
+        model-weights.raj-ai-lab/model: llama-guard-3-8b
+    spec:
+      serviceAccountName: model-weights-stager
+      restartPolicy: Never
+
+      containers:
+        - name: stage
+          # Slim Python base — we install both huggingface-hub and the
+          # AWS CLI at startup. Pinning Python 3.11 to match the lab's
+          # other Python images (eval, ragas-eval, langgraph-service)
+          # for cache locality if the image gets pre-built later.
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
+
+          env:
+            # HF token — Llama Guard is a gated model. Without this the
+            # download step 401s. envFrom-Secret form rather than
+            # value: hardcoded so token rotation is a kubectl patch on
+            # the Secret, not a Job manifest edit.
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: huggingface-token
+                  key: HF_TOKEN
+            - name: AWS_REGION
+              value: us-west-2
+            - name: HF_MODEL
+              value: meta-llama/Llama-Guard-3-8B
+            - name: S3_DEST
+              value: s3://raj-ai-lab-eks-model-weights/llama-guard-3-8b/
+            # Disable HF Hub's progress bars for cleaner CI logs.
+            # Errors still surface; only the spinning bytes-per-second
+            # progress is suppressed.
+            - name: HF_HUB_DISABLE_PROGRESS_BARS
+              value: "1"
+
+          command: ["/bin/bash", "-euxc"]
+          args:
+            - |
+              # Install AWS CLI v2 (Debian package isn't shipped — use
+              # the official bundle). Same approach as eval/Dockerfile.
+              apt-get update
+              apt-get install -y --no-install-recommends curl unzip ca-certificates
+              curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -q /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install
+              rm -rf /tmp/aws /tmp/awscliv2.zip
+
+              # huggingface-hub provides the `huggingface-cli` binary +
+              # the underlying download library. hf-transfer is the
+              # Rust-accelerated downloader (5-10x faster than the
+              # default Python HTTP client on multi-shard models).
+              pip install --no-cache-dir 'huggingface-hub[hf_transfer]==0.27.1'
+              export HF_HUB_ENABLE_HF_TRANSFER=1
+
+              # tune the AWS CLI for the upload phase — same flags the
+              # vllm pods' model-sync init container uses.
+              aws configure set default.s3.max_concurrent_requests 32
+              aws configure set default.s3.multipart_chunksize 128MB
+
+              # Download HF artifacts to /workspace/model. The download
+              # is incremental — re-runs after a partial failure pick
+              # up where the previous attempt left off. --token reads
+              # from $HF_TOKEN; explicit flag chosen over implicit env
+              # for log readability.
+              echo "Downloading $HF_MODEL ..."
+              huggingface-cli download "$HF_MODEL" \
+                --local-dir /workspace/model \
+                --local-dir-use-symlinks False \
+                --token "$HF_TOKEN"
+              echo "Download complete; size:"
+              du -sh /workspace/model
+              ls -la /workspace/model
+
+              # Upload to S3 with sync (incremental, idempotent on re-run).
+              # --no-progress for cleaner CI logs.
+              echo "Uploading to $S3_DEST ..."
+              aws s3 sync /workspace/model "$S3_DEST" --no-progress
+              echo "Upload complete."
+
+              # Verify the upload landed and matches what we downloaded.
+              # ls compares object counts; mismatched counts means a
+              # partial upload (rare with sync, but worth catching).
+              local_count=$(find /workspace/model -type f | wc -l)
+              s3_count=$(aws s3 ls --recursive "$S3_DEST" | wc -l)
+              echo "local files: $local_count, s3 objects: $s3_count"
+              if [ "$local_count" -ne "$s3_count" ]; then
+                echo "MISMATCH — investigate before scaling up the Llama Guard Deployment"
+                exit 1
+              fi
+              echo "Stage complete. vllm-llama-guard-3-8b can now scale up."
+
+          resources:
+            requests: { cpu: "1", memory: "4Gi" }
+            limits:   { cpu: "2", memory: "8Gi" }
+
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+
+      volumes:
+        - name: workspace
+          # 32 GiB headroom for the ~16 GB checkpoint + HF Hub's
+          # transient .cache/ dir during download.
+          emptyDir:
+            sizeLimit: 32Gi
