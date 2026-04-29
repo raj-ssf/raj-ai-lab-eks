@@ -1,8 +1,8 @@
 """langgraph-service — FastAPI front-end for a LangGraph router agent.
 
-Seventeen-node state machine on /invoke (budget + safety + input/output
-PII redaction + cache + memory + query rewriting + planning + reasoning
-loop + hallucination check):
+Eighteen-node state machine on /invoke (budget + input validation +
+safety + input/output PII redaction + cache + memory + query rewriting
++ planning + reasoning loop + hallucination check):
 
     START -> budget_check -> safety_input -> load_memory -> rewrite_query
                           -> classify -> retrieve -> ensure_warm
@@ -16,6 +16,13 @@ loop + hallucination check):
   INCR + 48h TTL. Cheapest filter, runs first. If over the cap (or
   Redis unreachable + BUDGET_FAIL_MODE=closed), short-circuits to
   END with a budget-exhausted refusal. No-op when BUDGET_ENABLED=false.
+- input_validation: regex/string defense layer for attack classes
+  Llama Guard isn't trained on (homoglyph, zero-width smuggle,
+  context-window exhaustion, control chars, whitespace padding).
+  Two outcomes: normalize (in-place sanitize) or block (short-
+  circuit). Runs before safety_input so Llama Guard's 300ms call
+  isn't wasted on malformed input. No-op when
+  VALIDATE_INPUT_ENABLED=false.
 - safety_input: Llama Guard 3 8B grades the user's prompt against
   Meta's 14-category hazard taxonomy. If unsafe AND the violated
   categories intersect SAFETY_BLOCK_CATEGORIES, the graph short-
@@ -528,6 +535,14 @@ LG_TOOL_RATE_LIMITED_TOTAL = Counter(
     "Per-tool rate-limit denials, by tool name.",
     ["tool"],
 )
+# Phase #20: input validation outcomes. Spikes on a specific reason
+# (length_exceeded, control_chars, excessive_whitespace) suggest
+# automated probing. Operators should alert on rate(reason=length).
+LG_INPUT_VALIDATION_TOTAL = Counter(
+    "langgraph_input_validation_total",
+    "Outcomes of node_input_validation, by action and reason.",
+    ["action", "reason"],
+)
 LG_REASONING_CYCLES = Histogram(
     "langgraph_reasoning_cycles",
     "Graph-level reasoning loop cycles per request (Phase T2).",
@@ -862,6 +877,14 @@ class AgentState(TypedDict, total=False):
     # window). Surfaced for chat-ui to render "your http_fetch usage
     # exceeded the limit" messages.
     tool_rate_limited_log: list[str]
+    # Phase #20: input validation outcome.
+    #   action: "passed" | "normalized" | "blocked" | "skipped"
+    #   details: per-check fields (zero_width_stripped count,
+    #     unicode_normalized bool, length on length_exceeded, etc.)
+    #     NEVER contains the raw matched content — would defeat the
+    #     point of the filter.
+    input_validation_action: Literal["passed", "normalized", "blocked", "skipped"]
+    input_validation_details: dict
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -1138,14 +1161,83 @@ def node_budget_check(state: AgentState) -> AgentState:
     }
 
 
-def _route_after_budget_check(state: AgentState) -> Literal["safety_input", "__end__"]:
+def _route_after_budget_check(state: AgentState) -> Literal["input_validation", "__end__"]:
     """Conditional edge: if budget exceeded or fail_closed, terminate.
 
     Defense-in-depth pattern matches _route_after_safety_input — even
     if a future edit produces an "exceeded" action without setting
     response, this edge still routes correctly to END.
+
+    Phase #20: now routes to input_validation (interposed before
+    safety_input) on the happy path. Validation is cheap (no I/O,
+    no LLM call) so it appropriately runs before Llama Guard's
+    300ms safety call on adversarial input.
     """
     if state.get("budget_action") in ("exceeded", "fail_closed"):
+        return END
+    return "input_validation"
+
+
+def node_input_validation(state: AgentState) -> AgentState:
+    """Phase #20: validate + sanitize the user's prompt.
+
+    Three outcomes:
+      passed       no issues; proceed unchanged
+      normalized   defensive fixes applied (NFKC + zero-width strip);
+                   state.prompt overwritten with sanitized version,
+                   downstream nodes see the cleaned text
+      blocked      hard violation (length, control chars, excessive
+                   whitespace) — pre-populate response, conditional
+                   edge routes to END
+
+    Skip when VALIDATE_INPUT_ENABLED=false. No-op fallthrough.
+    """
+    if not VALIDATE_INPUT_ENABLED:
+        LG_INPUT_VALIDATION_TOTAL.labels(action="skipped", reason="").inc()
+        return {
+            "input_validation_action": "skipped",
+            "input_validation_details": {},
+        }
+
+    prompt = state.get("prompt", "") or ""
+    sanitized, action, details = _validate_input(prompt)
+
+    if action == "blocked":
+        reason = details.get("reason", "unknown")
+        LG_INPUT_VALIDATION_TOTAL.labels(action="blocked", reason=reason).inc()
+        log.info(
+            "input_validation blocked reason=%s details=%s",
+            reason, details,
+        )
+        return {
+            "input_validation_action": "blocked",
+            "input_validation_details": details,
+            # Pre-populate the refusal so the conditional edge can route
+            # straight to END without classify firing.
+            "response": INPUT_VALIDATION_REFUSAL,
+            "route": "trivial",
+            "classifier_raw": "(input-validation-blocked)",
+        }
+
+    if action == "normalized":
+        LG_INPUT_VALIDATION_TOTAL.labels(action="normalized", reason="").inc()
+        log.info("input_validation normalized details=%s", details)
+        return {
+            "input_validation_action": "normalized",
+            "input_validation_details": details,
+            "prompt": sanitized,  # downstream nodes see sanitized form
+        }
+
+    LG_INPUT_VALIDATION_TOTAL.labels(action="passed", reason="").inc()
+    return {
+        "input_validation_action": "passed",
+        "input_validation_details": details,
+    }
+
+
+def _route_after_input_validation(state: AgentState) -> Literal["safety_input", "__end__"]:
+    """Conditional edge: blocked → END; else → safety_input."""
+    if state.get("input_validation_action") == "blocked":
         return END
     return "safety_input"
 
@@ -2638,6 +2730,126 @@ BUDGET_REFUSAL_MESSAGE = os.environ.get(
     "Daily request budget exhausted. Try again after UTC midnight.",
 )
 
+# --- Phase #20: content-based input validation -----------------------------
+#
+# Cheap regex/string defense layer for attack classes Llama Guard isn't
+# specifically trained on:
+#
+#   homoglyph attack    "ⅈgnore previous instructions" with a Cyrillic
+#                       lookalike for a Latin letter. Normalizing to
+#                       NFKC collapses confusables to canonical form
+#                       so safety filters see the actual instruction.
+#   zero-width smuggle  "act​normal​ but actually..." —
+#                       hidden characters split tokens to evade
+#                       keyword detection. Strip them.
+#   context exhaustion  10K+ char prompts to crowd out the system
+#                       prompt or balloon per-token rate limits.
+#                       Hard-cap length.
+#   control char inject U+0000 / U+0007 / etc. Some downstream
+#                       parsers / loggers / terminals choke. Block.
+#   whitespace padding  10K+ space chars to defeat per-byte rate
+#                       limits without making the model do real work.
+#                       Block.
+#
+# Position: AFTER budget_check (cheapest), BEFORE safety_input (Llama
+# Guard at ~300ms shouldn't be invoked on malformed input).
+#
+# Two-mode behavior:
+#   normalize  unicode + zero-width — sanitize in-place, update
+#              state.prompt for downstream nodes
+#   block      length / control / excessive-whitespace — short-circuit
+#              to END with INPUT_VALIDATION_REFUSAL
+#
+# Default disabled.
+
+VALIDATE_INPUT_ENABLED = os.environ.get(
+    "VALIDATE_INPUT_ENABLED", "false"
+).lower() in ("1", "true", "yes")
+# 16K chars covers any legitimate technical question + retrieved
+# context. Anything longer is almost certainly an attack OR a user
+# pasting an entire log dump (legitimate but better handled via
+# explicit upload, not /invoke).
+VALIDATE_INPUT_MAX_LENGTH = int(
+    os.environ.get("VALIDATE_INPUT_MAX_LENGTH", "16384")
+)
+INPUT_VALIDATION_REFUSAL = os.environ.get(
+    "INPUT_VALIDATION_REFUSAL",
+    "I can't process this request as-is. Please try a shorter or differently formatted prompt.",
+)
+
+
+_ZERO_WIDTH_CHARS = "​‌‍﻿⁠"
+
+
+def _validate_input(text: str) -> tuple[Optional[str], str, dict]:
+    """Validate + sanitize user input.
+
+    Returns (sanitized_or_None, action, details):
+      sanitized=None → caller blocks the request
+      sanitized=str → caller updates state.prompt to this
+      action: "passed" | "normalized" | "blocked"
+      details: per-check counts / reasons (NEVER raw matched content)
+    """
+    details: dict = {}
+
+    # Hard length cap first — cheapest check, cuts off whitespace
+    # padding attacks before the regex scan.
+    if len(text) > VALIDATE_INPUT_MAX_LENGTH:
+        return (None, "blocked", {
+            "reason": "length_exceeded",
+            "length": len(text),
+            "max": VALIDATE_INPUT_MAX_LENGTH,
+        })
+
+    # Control chars — anything in C0/C1 except the common whitespace
+    # the model legitimately handles (\t \n \r). Excludes 0x7F (DEL)
+    # which is also a common injection attempt.
+    control_count = sum(
+        1
+        for c in text
+        if (ord(c) < 0x20 and c not in "\t\n\r") or ord(c) == 0x7F
+    )
+    if control_count > 0:
+        return (None, "blocked", {
+            "reason": "control_chars",
+            "count": control_count,
+        })
+
+    # Excessive whitespace runs — defeat per-byte cost models without
+    # making the model do real work. 1000 consecutive whitespace chars
+    # is generous (legitimate text rarely has more than 4-5 in a row).
+    import re as _re
+    long_ws = _re.search(r"\s{1000,}", text)
+    if long_ws is not None:
+        return (None, "blocked", {
+            "reason": "excessive_whitespace",
+            "length": long_ws.end() - long_ws.start(),
+        })
+
+    # Sanitization (in-place fixes; doesn't block):
+    # Strip zero-width chars first.
+    sanitized = text
+    zw_count = sum(sanitized.count(c) for c in _ZERO_WIDTH_CHARS)
+    if zw_count:
+        for c in _ZERO_WIDTH_CHARS:
+            sanitized = sanitized.replace(c, "")
+        details["zero_width_stripped"] = zw_count
+
+    # Then NFKC normalize. NFKC > NFC because it collapses
+    # compatibility lookalikes (mathematical bold "𝐞" → "e", Cyrillic
+    # 'е' → 'e' for the lookalike subset, fullwidth → ASCII). Stops
+    # most homoglyph variants without killing legitimate Unicode
+    # like emoji.
+    import unicodedata as _ud
+    normalized = _ud.normalize("NFKC", sanitized)
+    if normalized != sanitized:
+        details["unicode_normalized"] = True
+        sanitized = normalized
+
+    if sanitized != text:
+        return (sanitized, "normalized", details)
+    return (text, "passed", details)
+
 # --- Phase #6: conversational memory + query rewriting --------------------
 #
 # Two coupled features that compound on each other:
@@ -3945,6 +4157,7 @@ def build_graph() -> StateGraph:
     """
     g: StateGraph = StateGraph(AgentState)
     g.add_node("budget_check", node_budget_check)
+    g.add_node("input_validation", node_input_validation)
     g.add_node("safety_input", node_safety_input)
     g.add_node("pii_redact_input", node_pii_redact_input)
     g.add_node("cache_lookup", node_cache_lookup)
@@ -3965,6 +4178,13 @@ def build_graph() -> StateGraph:
     g.add_conditional_edges(
         "budget_check",
         _route_after_budget_check,
+        # Phase #20: route to input_validation first, which then
+        # conditionally hands off to safety_input or short-circuits END.
+        {"input_validation": "input_validation", END: END},
+    )
+    g.add_conditional_edges(
+        "input_validation",
+        _route_after_input_validation,
         {"safety_input": "safety_input", END: END},
     )
     g.add_conditional_edges(
@@ -4243,6 +4463,12 @@ class InvokeResponse(BaseModel):
     # chat-ui can render "your http_fetch usage hit the per-minute cap"
     # alongside the response.
     tool_rate_limited_log: list[str] = Field(default_factory=list)
+    # Phase #20: input validation telemetry. action drives chat-ui
+    # rendering ("we couldn't process your prompt — try shorter");
+    # details surfaces the structured reason for debugging without
+    # leaking the offending content.
+    input_validation_action: str = "skipped"
+    input_validation_details: dict = Field(default_factory=dict)
 
 
 # --- Routes ----------------------------------------------------------------
@@ -4312,6 +4538,8 @@ def _build_invoke_response_dict(
         "variant_name": final_state.get("variant_name", ""),
         "variant_label": final_state.get("variant_label", "stable"),
         "tool_rate_limited_log": final_state.get("tool_rate_limited_log") or [],
+        "input_validation_action": final_state.get("input_validation_action", "skipped"),
+        "input_validation_details": final_state.get("input_validation_details") or {},
     }
 
 
@@ -4447,10 +4675,11 @@ def invoke(
 
 
 _NODE_NAMES = {
-    "budget_check", "safety_input", "pii_redact_input",
-    "cache_lookup", "load_memory", "rewrite_query", "classify",
-    "retrieve", "ensure_warm", "plan", "execute", "reflect",
-    "safety_output", "hallucination_check", "pii_redact_output",
+    "budget_check", "input_validation", "safety_input",
+    "pii_redact_input", "cache_lookup", "load_memory",
+    "rewrite_query", "classify", "retrieve", "ensure_warm",
+    "plan", "execute", "reflect", "safety_output",
+    "hallucination_check", "pii_redact_output",
     "cache_store", "save_memory",
 }
 
@@ -4459,6 +4688,7 @@ _NODE_NAMES = {
 # scoped per-node so the SSE stream stays small.
 _NODE_END_FIELDS = {
     "budget_check": ["budget_action", "budget_consumed", "budget_remaining"],
+    "input_validation": ["input_validation_action", "input_validation_details"],
     "safety_input": ["safety_input_verdict", "safety_categories", "safety_action"],
     "cache_lookup": ["cache_hit", "cache_similarity"],
     "load_memory": ["memory_turn_count"],

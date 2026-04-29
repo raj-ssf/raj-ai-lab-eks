@@ -173,6 +173,20 @@ spec:
             - name: BUDGET_FAIL_MODE
               value: open
 
+            # --- Phase #20: content-based input validation -------------
+            # Defense layer for attack classes Llama Guard isn't
+            # trained on: homoglyph (Cyrillic 'е' → Latin 'e' via
+            # NFKC), zero-width smuggling, length-based context
+            # exhaustion, control char injection, whitespace padding.
+            #
+            # Default disabled. Enable via VALIDATE_INPUT_ENABLED=true.
+            # Tune VALIDATE_INPUT_MAX_LENGTH if your use case needs
+            # longer prompts (e.g. legitimate large-document Q&A).
+            - name: VALIDATE_INPUT_ENABLED
+              value: "false"
+            - name: VALIDATE_INPUT_MAX_LENGTH
+              value: "16384"
+
             # --- Phase #6: conversational memory + query rewriting -----
             # Both default to false so existing /invoke behavior is
             # unchanged on this commit. Flip to "true" once chat-ui
