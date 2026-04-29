@@ -774,6 +774,18 @@ spec:
       labels:
         app: vllm-bge-reranker
         vllm-model: bge-reranker-v2-m3
+      annotations:
+        # Exclude HTTPS (HF Hub egress) from Istio sidecar interception.
+        # TEI's Rust reqwest client failed downloading the model from
+        # huggingface.co with `Error: Could not download model artifacts:
+        # relative URL without a base` — the sidecar's outbound TLS
+        # handling appears to truncate one of HF's redirect chains.
+        # Other vllm-* pods don't hit this because they sync model
+        # weights from in-region S3 at startup (no HF Hub egress at
+        # runtime). For the small reranker we'd add S3 pre-staging too,
+        # but excluding outbound 443 is a one-line fix that keeps the
+        # direct-HF-download path simpler. Inbound mTLS still applies.
+        traffic.sidecar.istio.io/excludeOutboundPorts: "443"
     spec:
       serviceAccountName: vllm
       enableServiceLinks: false
