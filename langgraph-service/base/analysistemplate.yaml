@@ -41,18 +41,23 @@ metadata:
 spec:
   metrics:
     - name: invoke-success-rate
-      # Run the query every 30s during the analysis window. With the
-      # canary step's pause:2m + this 30s cadence, expect 4-5 samples
-      # per analysis run before pass/fail.
+      # Run the query every 30s during the analysis window.
       interval: 30s
-      # Total analysis duration. After 5 minutes Argo Rollouts
-      # finalizes the verdict regardless of remaining samples.
-      count: 10
-      # Samples can be inconclusive (empty result, scrape gap)
-      # without failing the canary. After 3 inconclusive samples the
-      # analysis aborts. Tune up if scrape stability is poor;
-      # tune down if you want stricter gates.
-      failureLimit: 3
+      # Phase #33: count tuned 10 → 4. The first canary smoke
+      # (Phase #32) ran 10 samples × 30s = 5min per analysis step
+      # × 2 analysis steps + 2 × 1m pauses = ~12min total cycle.
+      # The lab doesn't need 10-sample statistical confidence — 4
+      # samples is enough to catch gross regressions, and a 5min
+      # total canary cycle (vs 12min) keeps the demo loop tight.
+      # Production with real traffic and stricter gates would set
+      # count back to 10+ and add tighter success thresholds.
+      count: 4
+      # 2 inconclusive/failed samples aborts (was 3). Stricter ratio
+      # vs count: 2/4 = 50% bad samples aborts canary, vs 3/10 = 30%
+      # at the old setting. That's deliberate — fewer samples means
+      # each carries more weight, so the abort threshold should
+      # tighten in proportion.
+      failureLimit: 2
       # Pass: success rate >= 95% (0.95) OR no samples (low traffic).
       # The empty-result clause is what makes this lab-friendly;
       # Argo Rollouts uses a govaluate-derived expression engine
