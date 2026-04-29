@@ -1,7 +1,7 @@
 """langgraph-service — FastAPI front-end for a LangGraph router agent.
 
-Eleven-node state machine on /invoke (budget + safety bookends + memory
-+ query rewriting + reasoning loop):
+Thirteen-node state machine on /invoke (budget + safety bookends + cache
++ memory + query rewriting + reasoning loop):
 
     START -> budget_check -> safety_input -> load_memory -> rewrite_query
                           -> classify -> retrieve -> ensure_warm
@@ -20,6 +20,11 @@ Eleven-node state machine on /invoke (budget + safety bookends + memory
   categories intersect SAFETY_BLOCK_CATEGORIES, the graph short-
   circuits to END with a refusal response. No-op when
   SAFETY_FILTER_ENABLED=false.
+- cache_lookup: embeds the prompt via vllm-bge-m3 and finds the most-
+  similar cached entry for (user, session_id). On hit (cosine ≥
+  CACHE_SIMILARITY_THRESHOLD), the cached response is returned and
+  the entire downstream pipeline is skipped. No-op when CACHE_ENABLED=
+  false. Fail-OPEN on bge-m3 or Redis errors → cache miss.
 - load_memory: reads recent conversation turns + long-term summary
   from Redis (keyed by user + session_id). No-op when
   MEMORY_ENABLED=false or no session_id. Fail-OPEN on Redis errors.
@@ -46,6 +51,10 @@ Eleven-node state machine on /invoke (budget + safety bookends + memory
   routes back to retrieve; otherwise routes to safety_output.
 - safety_output: Llama Guard 3 8B grades the model's draft. If unsafe,
   replaces `response` with the refusal message before END.
+- cache_store: persists the safety-checked response to the prompt
+  cache for future similar requests. LRU-evicts to keep cache size
+  bounded. Skips on safety-blocked, budget-blocked, or cache-hit
+  paths.
 - save_memory: appends the (prompt, response) turn to Redis memory.
   Skips on safety-blocked or budget-blocked paths. Re-summarizes
   every MEMORY_SUMMARIZE_AFTER_TURNS turns to bound recent-turns
@@ -524,6 +533,22 @@ class AgentState(TypedDict, total=False):
     memory_load_ms: int
     memory_save_ms: int
     query_rewrite_ms: int
+    # Phase #7: semantic prompt cache bookkeeping.
+    #   cache_hit: True if cache_lookup found a match above threshold.
+    #     When True, downstream graph (load_memory through safety_output)
+    #     is skipped via the conditional edge after cache_lookup.
+    #   cache_similarity: cosine similarity of the best match (range
+    #     0.0-1.0). Surfaced for observability — operators can tune
+    #     CACHE_SIMILARITY_THRESHOLD by watching this distribution.
+    #   prompt_embedding: 1024-dim bge-m3 embedding of the prompt.
+    #     Computed once in cache_lookup, reused in cache_store to
+    #     avoid a second embedding call on cache misses.
+    #   cache_lookup_ms / cache_store_ms: per-node latencies.
+    cache_hit: bool
+    cache_similarity: float
+    prompt_embedding: Optional[list[float]]
+    cache_lookup_ms: int
+    cache_store_ms: int
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -929,6 +954,241 @@ def _route_after_safety_input(state: AgentState) -> Literal["classify", "__end__
     if state.get("safety_action") == "blocked_input":
         return END
     return "classify"
+
+
+# --- Semantic prompt cache (Phase #7) --------------------------------------
+#
+# cache_lookup runs after safety_input. Cache hits skip load_memory,
+# rewrite_query, classify, retrieve, ensure_warm, execute, reflect, AND
+# safety_output (the cached response was safety-checked when stored).
+# They DO go through save_memory so the conversation history reflects
+# what the user saw.
+
+
+def node_cache_lookup(state: AgentState) -> AgentState:
+    """Embed prompt, find best match in cache, return hit if above threshold."""
+    if not CACHE_ENABLED:
+        return {
+            "cache_hit": False,
+            "cache_similarity": 0.0,
+            "cache_lookup_ms": 0,
+        }
+
+    user = state.get("user", "unknown")
+    session_id = state.get("session_id")
+    if not session_id:
+        # Cache is per-(user, session). Without session_id we can't isolate.
+        return {
+            "cache_hit": False,
+            "cache_similarity": 0.0,
+            "cache_lookup_ms": 0,
+        }
+
+    started = time.monotonic()
+
+    # Step 1: embed the prompt. If bge-m3 is unreachable, fail-open
+    # (cache miss, downstream pipeline runs normally).
+    prompt = state.get("prompt", "")
+    embedding = _embed_prompt_for_cache(prompt)
+    if embedding is None:
+        return {
+            "cache_hit": False,
+            "cache_similarity": 0.0,
+            "cache_lookup_ms": int((time.monotonic() - started) * 1000),
+        }
+
+    redis_client = _get_redis()
+    if redis_client is None:
+        return {
+            "cache_hit": False,
+            "cache_similarity": 0.0,
+            "prompt_embedding": embedding,
+            "cache_lookup_ms": int((time.monotonic() - started) * 1000),
+        }
+
+    # Step 2: fetch all entry IDs for this (user, session).
+    index_key = _cache_index_key(user, session_id)
+    try:
+        entry_ids: list[str] = redis_client.zrange(index_key, 0, -1) or []
+    except Exception as e:
+        log.warning("cache_lookup: zrange failed: %s, fail-open", e)
+        return {
+            "cache_hit": False,
+            "cache_similarity": 0.0,
+            "prompt_embedding": embedding,
+            "cache_lookup_ms": int((time.monotonic() - started) * 1000),
+        }
+
+    if not entry_ids:
+        # Empty cache — still pass embedding through so cache_store
+        # can use it without re-embedding.
+        return {
+            "cache_hit": False,
+            "cache_similarity": 0.0,
+            "prompt_embedding": embedding,
+            "cache_lookup_ms": int((time.monotonic() - started) * 1000),
+        }
+
+    # Step 3: pipeline-fetch each entry's embedding + response, score
+    # cosine similarity in Python. Capped at 20 entries by storage so
+    # the linear scan is acceptable.
+    import json as _json
+    try:
+        pipe = redis_client.pipeline(transaction=False)
+        for eid in entry_ids:
+            pipe.hgetall(_cache_entry_key(user, session_id, eid))
+        entries = pipe.execute()
+    except Exception as e:
+        log.warning("cache_lookup: hgetall pipeline failed: %s, fail-open", e)
+        return {
+            "cache_hit": False,
+            "cache_similarity": 0.0,
+            "prompt_embedding": embedding,
+            "cache_lookup_ms": int((time.monotonic() - started) * 1000),
+        }
+
+    best_score = 0.0
+    best_response: Optional[str] = None
+    for entry in entries:
+        if not entry:
+            continue
+        emb_json = entry.get("embedding")
+        if not emb_json:
+            continue
+        try:
+            cached_emb = _json.loads(emb_json)
+        except (_json.JSONDecodeError, TypeError):
+            continue
+        score = _cosine_similarity(embedding, cached_emb)
+        if score > best_score:
+            best_score = score
+            best_response = entry.get("response", "")
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    log.info(
+        "cache_lookup user=%s session=%s entries=%d best_score=%.4f threshold=%.4f ms=%d",
+        user, session_id, len(entry_ids), best_score,
+        CACHE_SIMILARITY_THRESHOLD, elapsed_ms,
+    )
+
+    if best_score >= CACHE_SIMILARITY_THRESHOLD and best_response is not None:
+        # Cache HIT. Pre-populate response + skip-route fields so the
+        # conditional edge after this node routes to save_memory and
+        # the user sees the cached answer.
+        return {
+            "cache_hit": True,
+            "cache_similarity": best_score,
+            "prompt_embedding": embedding,
+            "cache_lookup_ms": elapsed_ms,
+            "response": best_response,
+            # Skip-route bookkeeping so chat-ui can render a clean
+            # "served from cache" badge — classify didn't run, retrieve
+            # didn't run, etc.
+            "route": "trivial",
+            "classifier_raw": "(cache-hit)",
+        }
+
+    # Cache MISS — pass embedding through so cache_store can reuse it.
+    return {
+        "cache_hit": False,
+        "cache_similarity": best_score,
+        "prompt_embedding": embedding,
+        "cache_lookup_ms": elapsed_ms,
+    }
+
+
+def _route_after_cache_lookup(state: AgentState) -> Literal["load_memory", "save_memory"]:
+    """Conditional edge: cache HIT → save_memory (skip pipeline). MISS → continue."""
+    if state.get("cache_hit"):
+        return "save_memory"
+    return "load_memory"
+
+
+def node_cache_store(state: AgentState) -> AgentState:
+    """Store the response in cache for future hits.
+
+    Runs after safety_output, before save_memory. Skips on:
+      - CACHE_ENABLED false
+      - this WAS a cache hit (don't re-store the same entry)
+      - safety blocked (don't cache refusals — would short-circuit
+        future legitimate similar prompts to refusals)
+      - budget blocked (no real response to cache)
+      - missing session_id, missing embedding (no key to write under)
+    """
+    if not CACHE_ENABLED:
+        return {"cache_store_ms": 0}
+    if state.get("cache_hit"):
+        return {"cache_store_ms": 0}
+    if state.get("safety_action") in ("blocked_input", "blocked_output"):
+        return {"cache_store_ms": 0}
+    if state.get("budget_action") in ("exceeded", "fail_closed"):
+        return {"cache_store_ms": 0}
+
+    user = state.get("user", "unknown")
+    session_id = state.get("session_id")
+    if not session_id:
+        return {"cache_store_ms": 0}
+
+    embedding = state.get("prompt_embedding")
+    if not embedding:
+        # cache_lookup didn't compute one (likely bge-m3 was down).
+        # Skip rather than re-embed — if it was down at lookup it's
+        # probably down now too.
+        return {"cache_store_ms": 0}
+
+    response = state.get("response") or ""
+    if not response:
+        return {"cache_store_ms": 0}
+
+    started = time.monotonic()
+    redis_client = _get_redis()
+    if redis_client is None:
+        return {"cache_store_ms": int((time.monotonic() - started) * 1000)}
+
+    import json as _json
+    import uuid as _uuid
+
+    entry_id = _uuid.uuid4().hex[:12]
+    entry_key = _cache_entry_key(user, session_id, entry_id)
+    index_key = _cache_index_key(user, session_id)
+    ts = time.time()
+    prompt = state.get("original_prompt") or state.get("prompt") or ""
+
+    try:
+        # Pipeline: HSET entry, ZADD index, ZREMRANGEBYRANK to keep
+        # only N most-recent entries (LRU eviction), then EXPIRE both.
+        pipe = redis_client.pipeline(transaction=False)
+        pipe.hset(entry_key, mapping={
+            "prompt": prompt,
+            "embedding": _json.dumps(embedding),
+            "response": response,
+            "ts": str(ts),
+        })
+        pipe.expire(entry_key, CACHE_TTL_SECONDS)
+        pipe.zadd(index_key, {entry_id: ts})
+        # Keep only the most recent CACHE_MAX_ENTRIES_PER_SESSION.
+        # ZREMRANGEBYRANK 0 to -(N+1) removes everything except the
+        # last N (highest scores = newest).
+        pipe.zremrangebyrank(index_key, 0, -(CACHE_MAX_ENTRIES_PER_SESSION + 1))
+        pipe.expire(index_key, CACHE_TTL_SECONDS)
+        pipe.execute()
+    except Exception as e:
+        log.warning("cache_store: redis op failed: %s", e)
+        return {"cache_store_ms": int((time.monotonic() - started) * 1000)}
+
+    # Note: this leaves orphaned entry HASH keys in Redis after
+    # ZREMRANGEBYRANK evicts their index entries. Their TTL cleans
+    # them up after CACHE_TTL_SECONDS. A perfect implementation would
+    # ZRANGEBYSCORE the evicted IDs and DEL their HASH keys atomically,
+    # but the orphan window (24h) is bounded and the storage cost is
+    # capped at MAX_ENTRIES * average size ≈ 200KB per session.
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    log.info(
+        "cache_store user=%s session=%s entry=%s ms=%d",
+        user, session_id, entry_id, elapsed_ms,
+    )
+    return {"cache_store_ms": elapsed_ms}
 
 
 # --- Memory + query rewriting (Phase #6) -----------------------------------
@@ -1725,6 +1985,115 @@ def _memory_turns_key(user: str, session_id: str) -> str:
 def _memory_summary_key(user: str, session_id: str) -> str:
     return f"mem:{user}:{session_id}:summary"
 
+
+# --- Phase #7: semantic prompt cache --------------------------------------
+#
+# Embedding-similarity-based prompt cache. On a hit, the entire downstream
+# pipeline (load_memory, rewrite_query, classify, retrieve, ensure_warm,
+# execute, reflect, safety_output) is skipped and the cached response is
+# returned. Halves cost on workloads with repetitive queries (typical chat
+# workload sees 30-50% repetition rate).
+#
+# Position in graph: AFTER safety_input (so unsafe prompts don't bypass
+# safety even if cached), BEFORE load_memory (so we save load+rewrite cost
+# on hits). Trade-off worth knowing: the cache key is the RAW prompt
+# embedding, not the rewritten one — meaning two semantically-equivalent
+# follow-up questions with different pronouns ("how does it work?" vs
+# "how does Pod Identity work?") may NOT cache-hit each other. Future
+# v2 could move cache_lookup AFTER rewrite_query for better hit rate at
+# the cost of always paying the rewrite latency.
+#
+# Storage layout in langgraph-redis:
+#   cache:<user>:<session>:index    Redis SORTED SET. entry_id → ts.
+#                                   ZREMRANGEBYRANK at write time keeps
+#                                   only CACHE_MAX_ENTRIES_PER_SESSION
+#                                   most-recent entries (LRU eviction).
+#   cache:<user>:<session>:<id>     Redis HASH with fields:
+#                                     prompt (str), embedding (json
+#                                     array of 1024 floats), response
+#                                     (str), ts (float).
+#
+# Both keys carry CACHE_TTL_SECONDS (default 24h) — cache loses freshness
+# faster than memory because retrieval results may have changed (new
+# documents uploaded, etc.). Active sessions refresh TTL on every store.
+#
+# Failure modes (all fail-OPEN — the request still completes the full
+# pipeline if cache infrastructure is degraded):
+#   - vllm-bge-m3 unreachable → no embedding → cache miss
+#   - Redis unreachable → cache miss
+#   - Embedding malformed → cache miss
+#
+# Default disabled. Activation requires vllm-bge-m3 to be Ready (the
+# embedding model used to compute similarity).
+
+CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+CACHE_EMBEDDINGS_URL = os.environ.get(
+    "CACHE_EMBEDDINGS_URL", "http://vllm-bge-m3.llm.svc.cluster.local:8000/v1"
+)
+CACHE_EMBEDDINGS_MODEL = os.environ.get("CACHE_EMBEDDINGS_MODEL", "bge-m3")
+# Cosine similarity threshold for a hit. 0.95 is "very similar but not
+# identical" — typical for paraphrased questions about the same topic.
+# Tighten (e.g. 0.98) if the cache returns false-positive answers from
+# different-but-related prompts; loosen (e.g. 0.90) if you want broader
+# hits at the cost of occasional unrelated cached responses.
+CACHE_SIMILARITY_THRESHOLD = float(
+    os.environ.get("CACHE_SIMILARITY_THRESHOLD", "0.95")
+)
+# Per-(user, session) entry cap. 20 entries × ~10KB per entry (prompt +
+# 1024 floats as JSON + response + metadata) = ~200KB per session in
+# Redis. Negligible at lab scale, manageable at production scale.
+CACHE_MAX_ENTRIES_PER_SESSION = int(
+    os.environ.get("CACHE_MAX_ENTRIES_PER_SESSION", "20")
+)
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", str(24 * 3600)))
+CACHE_TIMEOUT_SECONDS = float(os.environ.get("CACHE_TIMEOUT_SECONDS", "5"))
+
+
+def _cache_index_key(user: str, session_id: str) -> str:
+    return f"cache:{user}:{session_id}:index"
+
+
+def _cache_entry_key(user: str, session_id: str, entry_id: str) -> str:
+    return f"cache:{user}:{session_id}:{entry_id}"
+
+
+def _embed_prompt_for_cache(prompt: str) -> Optional[list[float]]:
+    """Call vllm-bge-m3 /v1/embeddings. Returns None on failure (fail-open)."""
+    try:
+        with httpx.Client(timeout=CACHE_TIMEOUT_SECONDS) as client:
+            resp = client.post(
+                f"{CACHE_EMBEDDINGS_URL}/embeddings",
+                json={"model": CACHE_EMBEDDINGS_MODEL, "input": prompt},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            return body["data"][0]["embedding"]
+    except Exception as e:
+        log.warning("cache: embedding failed: %s, fail-open", e)
+        return None
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Plain Python cosine similarity. Avoids numpy as a hard dep —
+    1024-dim × 20 entries is ~60K multiplies per cache lookup, ~6ms at
+    Python speeds. Acceptable for the cache hot path."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / ((na ** 0.5) * (nb ** 0.5))
+
 # Lazy-initialized at first use. Reused across requests via the same
 # connection-pooled client. redis-py is thread-safe for this usage.
 _REDIS_CLIENT: Optional["redis.Redis"] = None  # type: ignore[name-defined]
@@ -2274,6 +2643,7 @@ def build_graph() -> StateGraph:
     g: StateGraph = StateGraph(AgentState)
     g.add_node("budget_check", node_budget_check)
     g.add_node("safety_input", node_safety_input)
+    g.add_node("cache_lookup", node_cache_lookup)
     g.add_node("load_memory", node_load_memory)
     g.add_node("rewrite_query", node_rewrite_query)
     g.add_node("classify", node_classify)
@@ -2282,6 +2652,7 @@ def build_graph() -> StateGraph:
     g.add_node("execute", node_execute)
     g.add_node("reflect", node_reflect)
     g.add_node("safety_output", node_safety_output)
+    g.add_node("cache_store", node_cache_store)
     g.add_node("save_memory", node_save_memory)
     g.add_edge(START, "budget_check")
     g.add_conditional_edges(
@@ -2292,9 +2663,16 @@ def build_graph() -> StateGraph:
     g.add_conditional_edges(
         "safety_input",
         _route_after_safety_input,
-        # Now routes to load_memory rather than directly to classify so
-        # the rewrite_query node has conversation context to work with.
-        {"classify": "load_memory", END: END},
+        # Routes to cache_lookup first; on cache miss the lookup node
+        # routes onward to load_memory.
+        {"classify": "cache_lookup", END: END},
+    )
+    g.add_conditional_edges(
+        "cache_lookup",
+        _route_after_cache_lookup,
+        # HIT → save_memory (response is already in state, skip pipeline).
+        # MISS → load_memory (full pipeline).
+        {"load_memory": "load_memory", "save_memory": "save_memory"},
     )
     g.add_edge("load_memory", "rewrite_query")
     g.add_edge("rewrite_query", "classify")
@@ -2307,11 +2685,12 @@ def build_graph() -> StateGraph:
         _route_after_reflect,
         {"retrieve": "retrieve", END: "safety_output"},
     )
-    # safety_output → save_memory → END so the persisted turn is the
-    # text the user actually saw (refusal text on block, real answer
-    # otherwise). save_memory itself short-circuits on safety-blocked
-    # or budget-blocked paths so failed attempts don't pollute history.
-    g.add_edge("safety_output", "save_memory")
+    # safety_output → cache_store → save_memory → END. cache_store
+    # persists the now-safety-checked response for future hits;
+    # save_memory persists the conversation turn. Both short-circuit
+    # on safety-blocked or budget-blocked paths.
+    g.add_edge("safety_output", "cache_store")
+    g.add_edge("cache_store", "save_memory")
     g.add_edge("save_memory", END)
     return g.compile()
 
@@ -2408,6 +2787,14 @@ class InvokeResponse(BaseModel):
     memory_turn_count: int = 0
     memory_load_ms: int = 0
     memory_save_ms: int = 0
+    # Phase #7: semantic prompt cache telemetry. cache_hit drives the
+    # chat-ui "served from cache" badge; cache_similarity helps tune
+    # CACHE_SIMILARITY_THRESHOLD (watch the distribution to see how
+    # close hits cluster around the boundary).
+    cache_hit: bool = False
+    cache_similarity: float = 0.0
+    cache_lookup_ms: int = 0
+    cache_store_ms: int = 0
 
 
 # --- Routes ----------------------------------------------------------------
@@ -2515,4 +2902,8 @@ def invoke(
         memory_turn_count=len(final_state.get("memory_recent_turns") or []),
         memory_load_ms=final_state.get("memory_load_ms", 0),
         memory_save_ms=final_state.get("memory_save_ms", 0),
+        cache_hit=final_state.get("cache_hit", False),
+        cache_similarity=final_state.get("cache_similarity", 0.0),
+        cache_lookup_ms=final_state.get("cache_lookup_ms", 0),
+        cache_store_ms=final_state.get("cache_store_ms", 0),
     )

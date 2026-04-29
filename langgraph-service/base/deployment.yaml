@@ -202,6 +202,38 @@ spec:
             - name: QUERY_REWRITE_ENABLED
               value: "false"
 
+            # --- Phase #7: semantic prompt cache -----------------------
+            # Embedding-similarity cache. On hit, the entire downstream
+            # graph is skipped — classify, retrieve, ensure_warm,
+            # execute, reflect, safety_output don't run. Halves cost on
+            # repetitive workloads.
+            #
+            # Default disabled. Activation requires vllm-bge-m3 to be
+            # Ready (it computes the embeddings used for similarity).
+            # When bge-m3 is at 0 replicas, the cache fails open
+            # gracefully (lookup returns miss, the request runs the
+            # full pipeline).
+            - name: CACHE_ENABLED
+              value: "false"
+            - name: CACHE_EMBEDDINGS_URL
+              value: http://vllm-bge-m3.llm.svc.cluster.local:8000/v1
+            - name: CACHE_EMBEDDINGS_MODEL
+              value: bge-m3
+            # 0.95 = "very similar but not identical." Tighten if cache
+            # returns wrong answers from related-but-different prompts;
+            # loosen if you want broader hits at the cost of occasional
+            # off-target cached responses.
+            - name: CACHE_SIMILARITY_THRESHOLD
+              value: "0.95"
+            # 20 entries × ~10KB per entry = ~200KB per session in
+            # Redis. Negligible for this lab.
+            - name: CACHE_MAX_ENTRIES_PER_SESSION
+              value: "20"
+            # 24h TTL. Cache loses freshness faster than memory
+            # because retrieval results may have changed.
+            - name: CACHE_TTL_SECONDS
+              value: "86400"
+
           envFrom:
             # Langfuse keys live in a Secret created by
             # raj-ai-lab-eks-infra/langgraph.tf, mirroring the
