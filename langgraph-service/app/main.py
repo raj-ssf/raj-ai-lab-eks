@@ -428,7 +428,11 @@ def node_classify(state: AgentState) -> AgentState:
             route = candidate  # type: ignore[assignment]
             break
 
-    log.info("classified", extra={"route": route, "classifier_raw": raw[:80]})
+    # Inline the route + raw output in the message itself: the existing
+    # formatter doesn't surface log-record `extra` fields, so the previous
+    # `extra={...}` form left these values invisible in pod logs. Inline
+    # makes them grep-able for routing diagnostics.
+    log.info("classified route=%s classifier_raw=%r", route, raw[:80])
     return {"route": route, "classifier_raw": raw}
 
 
