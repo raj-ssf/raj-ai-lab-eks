@@ -75,6 +75,7 @@ from typing import Annotated, Literal, Optional, TypedDict
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from kubernetes import client as k8s_client
@@ -2279,12 +2280,18 @@ def node_execute(state: AgentState) -> AgentState:
     if not cfg.get("supports_tools"):
         # Path B — legacy single-shot. Same code as before tool calling
         # was added; preserves behavior for 70B/DeepSeek tiers.
+        # streaming=True (Phase #8): /invoke/stream's astream_events
+        # picks up token-level events from this LLM call. /invoke (sync)
+        # invoke() still works — LangChain collects the streamed chunks
+        # and returns the full response as before. No behavior change
+        # for non-streaming callers.
         client = ChatOpenAI(
             model=cfg["model_name"],
             base_url=cfg["url"],
             api_key="not-required",
             max_tokens=state.get("max_tokens", 512),
             timeout=EXECUTE_TIMEOUT_SECONDS,
+            streaming=True,
         )
         response = client.invoke([HumanMessage(content=final_prompt)])
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -2301,12 +2308,18 @@ def node_execute(state: AgentState) -> AgentState:
     # output into structured response.tool_calls. The bound client is
     # the SAME ChatOpenAI but with .bind_tools() applied — LangChain
     # plumbs the schema into the request.
+    # streaming=True (Phase #8) enables token-level events for
+    # /invoke/stream. Tool-calling + streaming compose: the model
+    # streams tokens, and on a tool-call turn the streamed deltas
+    # build up into a structured tool_calls field that LangChain
+    # surfaces only when the turn finishes.
     client = ChatOpenAI(
         model=cfg["model_name"],
         base_url=cfg["url"],
         api_key="not-required",
         max_tokens=state.get("max_tokens", 512),
         timeout=EXECUTE_TIMEOUT_SECONDS,
+        streaming=True,
     ).bind_tools(TOOLS)
 
     # System prompt — sets the agent persona + reminds the model that
@@ -2392,6 +2405,7 @@ def node_execute(state: AgentState) -> AgentState:
                 api_key="not-required",
                 max_tokens=state.get("max_tokens", 512),
                 timeout=EXECUTE_TIMEOUT_SECONDS,
+                streaming=True,
             )
             final = no_tools_client.invoke(
                 messages
@@ -2799,6 +2813,57 @@ class InvokeResponse(BaseModel):
 
 # --- Routes ----------------------------------------------------------------
 
+def _build_invoke_response_dict(
+    final_state: dict,
+    user: str,
+    trace_id: Optional[str],
+) -> dict:
+    """Shape final graph state into the InvokeResponse field set, as a dict.
+
+    Shared by /invoke (sync, returns InvokeResponse) and /invoke/stream
+    (SSE done event, JSON-serialized via json.dumps). Keeping ONE source
+    of truth for the response shape avoids drift when new fields land.
+    """
+    return {
+        "response": final_state.get("response", ""),
+        "route": final_state.get("route", "trivial"),
+        "cold_start": final_state.get("cold_start", False),
+        "warm_wait_seconds": final_state.get("warm_wait_seconds", 0.0),
+        "execute_latency_ms": final_state.get("execute_latency_ms", 0),
+        "classifier_raw": final_state.get("classifier_raw", ""),
+        "user": user,
+        "retrieve_count": final_state.get("retrieve_count", 0),
+        "retrieve_ms": final_state.get("retrieve_ms", 0),
+        "retrieved_chunks": final_state.get("retrieved_chunks", []),
+        "langfuse_trace_id": trace_id,
+        "tool_iterations": final_state.get("tool_iterations", 0),
+        "tool_calls_log": final_state.get("tool_calls_log", []),
+        "reasoning_cycles": final_state.get("cycles", 0),
+        "reflection_log": final_state.get("reflection_log", []),
+        "safety_action": final_state.get("safety_action", "passed"),
+        "safety_input_verdict": final_state.get("safety_input_verdict", "skipped"),
+        "safety_output_verdict": final_state.get("safety_output_verdict", "skipped"),
+        "safety_categories": final_state.get("safety_categories", []),
+        "safety_input_ms": final_state.get("safety_input_ms", 0),
+        "safety_output_ms": final_state.get("safety_output_ms", 0),
+        "budget_action": final_state.get("budget_action", "disabled"),
+        "budget_consumed": final_state.get("budget_consumed", 0),
+        "budget_remaining": final_state.get("budget_remaining", 0),
+        "query_rewritten": (
+            final_state.get("refined_query", "") or ""
+            if final_state.get("query_rewritten") else ""
+        ),
+        "query_rewrite_ms": final_state.get("query_rewrite_ms", 0),
+        "memory_turn_count": len(final_state.get("memory_recent_turns") or []),
+        "memory_load_ms": final_state.get("memory_load_ms", 0),
+        "memory_save_ms": final_state.get("memory_save_ms", 0),
+        "cache_hit": final_state.get("cache_hit", False),
+        "cache_similarity": final_state.get("cache_similarity", 0.0),
+        "cache_lookup_ms": final_state.get("cache_lookup_ms", 0),
+        "cache_store_ms": final_state.get("cache_store_ms", 0),
+    }
+
+
 @app.get("/healthz", include_in_schema=False)
 def healthz() -> dict:
     return {"ok": True, "service": "langgraph-service", "version": app.version}
@@ -2867,43 +2932,212 @@ def invoke(
             detail=str(e),
         ) from e
 
-    return InvokeResponse(
-        response=final_state.get("response", ""),
-        route=final_state.get("route", "trivial"),
-        cold_start=final_state.get("cold_start", False),
-        warm_wait_seconds=final_state.get("warm_wait_seconds", 0.0),
-        execute_latency_ms=final_state.get("execute_latency_ms", 0),
-        classifier_raw=final_state.get("classifier_raw", ""),
-        user=user,
-        retrieve_count=final_state.get("retrieve_count", 0),
-        retrieve_ms=final_state.get("retrieve_ms", 0),
-        retrieved_chunks=[
-            RetrievedChunkOut(**c) for c in final_state.get("retrieved_chunks", [])
-        ],
-        langfuse_trace_id=trace_id,
-        tool_iterations=final_state.get("tool_iterations", 0),
-        tool_calls_log=final_state.get("tool_calls_log", []),
-        reasoning_cycles=final_state.get("cycles", 0),
-        reflection_log=final_state.get("reflection_log", []),
-        safety_action=final_state.get("safety_action", "passed"),
-        safety_input_verdict=final_state.get("safety_input_verdict", "skipped"),
-        safety_output_verdict=final_state.get("safety_output_verdict", "skipped"),
-        safety_categories=final_state.get("safety_categories", []),
-        safety_input_ms=final_state.get("safety_input_ms", 0),
-        safety_output_ms=final_state.get("safety_output_ms", 0),
-        budget_action=final_state.get("budget_action", "disabled"),
-        budget_consumed=final_state.get("budget_consumed", 0),
-        budget_remaining=final_state.get("budget_remaining", 0),
-        query_rewritten=(
-            final_state.get("refined_query", "") or ""
-            if final_state.get("query_rewritten") else ""
-        ),
-        query_rewrite_ms=final_state.get("query_rewrite_ms", 0),
-        memory_turn_count=len(final_state.get("memory_recent_turns") or []),
-        memory_load_ms=final_state.get("memory_load_ms", 0),
-        memory_save_ms=final_state.get("memory_save_ms", 0),
-        cache_hit=final_state.get("cache_hit", False),
-        cache_similarity=final_state.get("cache_similarity", 0.0),
-        cache_lookup_ms=final_state.get("cache_lookup_ms", 0),
-        cache_store_ms=final_state.get("cache_store_ms", 0),
+    # Shape via the shared helper (also used by /invoke/stream's done
+    # event), then wrap retrieved_chunks dicts in the typed model. The
+    # rest expand straight into InvokeResponse via **.
+    payload = _build_invoke_response_dict(final_state, user, trace_id)
+    payload["retrieved_chunks"] = [
+        RetrievedChunkOut(**c) for c in payload["retrieved_chunks"]
+    ]
+    return InvokeResponse(**payload)
+
+
+# --- /invoke/stream — SSE endpoint (Phase #8) -----------------------------
+#
+# Same input shape as /invoke. Different output: text/event-stream with
+# the following SSE event types:
+#
+#   event: node_start
+#   data: {"node": "<name>"}
+#       Emitted when a graph node begins executing. Useful for
+#       chat-ui progress indicators ("Loading memory...", "Routing...",
+#       "Retrieving documents...").
+#
+#   event: node_end
+#   data: {"node": "<name>", "<selected fields>": ...}
+#       Emitted when a graph node finishes. Carries a small selected
+#       subset of state fields per node (e.g. classify → route,
+#       cache_lookup → cache_hit/cache_similarity, retrieve →
+#       retrieve_count). Cherry-picked rather than dumping the whole
+#       state because state can be large (retrieved_chunks alone may
+#       be ~50 KB).
+#
+#   event: token
+#   data: {"content": "<delta>"}
+#       Emitted for each token chunk produced by an LLM streaming
+#       call inside node_execute. Filtered to ONLY the user-facing
+#       response — internal LLM calls (rewrite_query, classify,
+#       summarize_memory, llama_guard_*, reflect) don't emit token
+#       events because their outputs aren't user-facing.
+#
+#   event: done
+#   data: <full InvokeResponse JSON>
+#       Final event, sent once the graph completes. Same shape as the
+#       sync /invoke response. Lets the UI render final telemetry
+#       (latency breakdown, tool calls log, citation chunks, etc.)
+#       without re-fetching.
+#
+#   event: error
+#   data: {"detail": "<msg>", "status": <code>}
+#       Sent on graph exception or auth failure (sets the SSE stream's
+#       last event to error rather than done; client must check).
+#
+# Implementation note: streaming=True on the ChatOpenAI clients in
+# node_execute (Phase #8a) is what makes on_chat_model_stream events
+# fire. The OTHER ChatOpenAI clients (rewrite_query, classify, etc.)
+# do NOT have streaming=True, so they don't emit token events — by
+# design.
+
+
+_NODE_NAMES = {
+    "budget_check", "safety_input", "cache_lookup",
+    "load_memory", "rewrite_query", "classify", "retrieve",
+    "ensure_warm", "execute", "reflect", "safety_output",
+    "cache_store", "save_memory",
+}
+
+# Per-node selection of which state fields are interesting enough to
+# include in the node_end event. Matches the InvokeResponse shape but
+# scoped per-node so the SSE stream stays small.
+_NODE_END_FIELDS = {
+    "budget_check": ["budget_action", "budget_consumed", "budget_remaining"],
+    "safety_input": ["safety_input_verdict", "safety_categories", "safety_action"],
+    "cache_lookup": ["cache_hit", "cache_similarity"],
+    "load_memory": ["memory_turn_count"],
+    "rewrite_query": ["query_rewritten"],
+    "classify": ["route", "classifier_raw"],
+    "retrieve": ["retrieve_count", "retrieve_ms"],
+    "ensure_warm": ["cold_start", "warm_wait_seconds"],
+    "execute": ["execute_latency_ms", "tool_iterations", "tool_calls_log"],
+    "reflect": ["cycles", "needs_more_context"],
+    "safety_output": ["safety_output_verdict", "safety_action"],
+    "cache_store": [],
+    "save_memory": [],
+}
+
+
+def _sse(event: str, data: dict) -> str:
+    """Format a Server-Sent Events frame.
+
+    SSE wire format: lines, blank-line terminator. `event:` field
+    sets the event type the browser dispatches; `data:` carries the
+    payload (here, JSON-encoded). Multi-line data is allowed by
+    repeating `data:` lines, but our payloads are single-line JSON.
+    """
+    import json as _json
+    return f"event: {event}\ndata: {_json.dumps(data)}\n\n"
+
+
+@app.post("/invoke/stream")
+async def invoke_stream(
+    req: InvokeRequest,
+    claims: Annotated[dict, Depends(require_jwt)],
+    creds: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer)],
+) -> StreamingResponse:
+    """SSE variant of /invoke.
+
+    Same auth, same input shape, same graph. Streams progress events
+    as the graph executes plus token-level deltas as the model
+    generates. Sends a final `done` event with the full InvokeResponse
+    shape so the UI can render telemetry on completion.
+    """
+    user = claims.get("preferred_username") or claims.get("sub") or "unknown"
+    log.info(
+        "invoke_stream",
+        extra={
+            "user": user,
+            "prompt_len": len(req.prompt),
+            "session_id": req.session_id or "",
+        },
+    )
+    auth_token = creds.credentials if creds else None
+
+    initial: AgentState = {
+        "prompt": req.prompt,
+        "max_tokens": req.max_tokens,
+        "image_url": req.image_url,
+        "user": user,
+        "session_id": req.session_id,
+        "top_k": req.top_k,
+        "auth_token": auth_token,
+    }
+    config: dict = {}
+    trace_id: Optional[str] = None
+    if _LANGFUSE_CB is not None:
+        import uuid as _uuid
+        trace_id = _uuid.uuid4().hex
+        config = {
+            "callbacks": [_LANGFUSE_CB],
+            "metadata": {
+                "langfuse_user_id": user,
+                "langfuse_tags": ["langgraph-service", "stream"],
+                "langfuse_trace_id": trace_id,
+            },
+        }
+
+    async def event_stream():
+        # Accumulate per-node return dicts so we can build the final
+        # InvokeResponse-shaped done event. astream_events fires an
+        # on_chain_end per node with the partial state that node
+        # returned; we merge them in arrival order, which matches
+        # graph topology.
+        accumulated: dict = dict(initial)
+        try:
+            async for event in GRAPH.astream_events(
+                initial, config=config, version="v2"
+            ):
+                ev_type = event.get("event")
+                name = event.get("name", "")
+
+                if ev_type == "on_chain_start" and name in _NODE_NAMES:
+                    yield _sse("node_start", {"node": name})
+
+                elif ev_type == "on_chain_end" and name in _NODE_NAMES:
+                    out = event.get("data", {}).get("output") or {}
+                    if isinstance(out, dict):
+                        accumulated.update(out)
+                    payload = {"node": name}
+                    for field in _NODE_END_FIELDS.get(name, []):
+                        if field in out:
+                            payload[field] = out[field]
+                    yield _sse("node_end", payload)
+
+                elif ev_type == "on_chat_model_stream":
+                    # Filter token events to ONLY those from node_execute.
+                    # The metadata's langgraph_node tells us which graph
+                    # node this LLM call is running inside.
+                    md = event.get("metadata", {}) or {}
+                    if md.get("langgraph_node") != "execute":
+                        continue
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk is None:
+                        continue
+                    content = getattr(chunk, "content", None) or ""
+                    if content:
+                        yield _sse("token", {"content": content})
+
+            # Final event: full response shape so the UI gets all
+            # the telemetry without a follow-up call.
+            payload = _build_invoke_response_dict(accumulated, user, trace_id)
+            yield _sse("done", payload)
+        except RuntimeError as e:
+            # ensure_warm failure path — same as /invoke's 502 mapping
+            log.error("invoke_stream graph runtime error: %s", e)
+            yield _sse("error", {"status": 502, "detail": str(e)[:300]})
+        except Exception as e:
+            log.exception("invoke_stream unexpected error")
+            yield _sse("error", {"status": 500, "detail": str(e)[:300]})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            # Prevent intermediate proxies (NGINX, Istio) from buffering
+            # — buffering kills the streaming UX. X-Accel-Buffering=no
+            # is NGINX-specific; no harm on other proxies. Cache-Control
+            # disables CDN caching of an SSE stream.
+            "Cache-Control": "no-cache, no-store, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
