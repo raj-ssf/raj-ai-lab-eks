@@ -1,0 +1,44 @@
+# Phase #31: stable Service for the Argo Rollouts Istio trafficRouting
+# integration. Sibling of service-canary.yaml.
+#
+# How this is used:
+#   - The Rollout's strategy.canary.stableService field references
+#     this Service by name. At runtime, argo-rollouts INJECTS the
+#     `rollouts-pod-template-hash` label into spec.selector so this
+#     Service selects ONLY pods owned by the stable ReplicaSet (not
+#     the canary one).
+#   - The VirtualService (virtualservice.yaml) lists this Service as
+#     one of two weighted destinations. argo-rollouts mutates the
+#     weight at each canary step.
+#
+# The original `langgraph-service` Service in service.yaml still
+# exists and still selects all langgraph-service pods (stable +
+# canary, since both have app=langgraph-service). That Service is
+# what the north-south HTTPRoute backendRefs point to. The east-west
+# in-mesh traffic from chat-ui hits the VirtualService (scoped to
+# gateways: [mesh]) which redirects to -stable/-canary.
+#
+# selector intentionally has only `app: langgraph-service`. Don't
+# add rollouts-pod-template-hash here — argo-rollouts will set it
+# itself. Pre-setting it would either fight the controller or pin
+# the Service to a stale hash on first deploy.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: langgraph-service-stable
+  labels:
+    app: langgraph-service
+    # role label is for human eyes / kubectl get -l role=stable
+    # filtering. argo-rollouts uses spec.selector, not labels, to
+    # decide pod membership.
+    role: stable
+spec:
+  type: ClusterIP
+  selector:
+    app: langgraph-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

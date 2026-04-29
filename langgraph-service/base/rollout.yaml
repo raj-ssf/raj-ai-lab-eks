@@ -51,33 +51,48 @@ spec:
       app: langgraph-service
   strategy:
     canary:
-      # No trafficRouting block — replica-percentage canary. Traffic
-      # to canary pods is implicit via the existing Service selector
-      # matching both stable + canary ReplicaSets. Phase #31 swaps
-      # this for an Istio trafficRouting block.
+      # Phase #31: Istio trafficRouting. Traffic distribution is now
+      # decoupled from pod count — setWeight values write into the
+      # VirtualService's weights field, not into pod-count
+      # proportions. The two helper Services below each get a
+      # rollouts-pod-template-hash injected into their selectors at
+      # runtime so they target only their respective ReplicaSet.
+      canaryService: langgraph-service-canary
+      stableService: langgraph-service-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: langgraph-service-canary-vs
+            # Route name in the VS — see virtualservice.yaml.
+            routes:
+              - primary
       steps:
-        - setWeight: 50
-        # Brief pause lets at least one /invoke call land on each
-        # ReplicaSet before analysis runs. Without this, analysis
-        # may run against zero canary samples → inconclusive →
-        # block promotion.
+        # Early canary: 10% of mesh traffic to the new ReplicaSet.
+        # Catches gross regressions (panics, deserialization errors,
+        # config-shape changes) without exposing >10% of users.
+        - setWeight: 10
         - pause:
-            duration: 2m
+            duration: 1m
         - analysis:
             templates:
               - templateName: langgraph-canary-checks
-        # Auto-promotes to 100% after the analysis step passes.
-      # Allow analysis to be inconclusive 3 times before aborting.
-      # In a low-traffic lab, queries can return empty for a window
-      # — failureLimit on the AnalysisTemplate metric handles the
-      # "actually bad" case.
-      analysis: {}
+        # Mid canary: half traffic to canary. Surfaces issues that
+        # only appear at non-trivial concurrency (lock contention,
+        # connection-pool exhaustion in the LLM client).
+        - setWeight: 50
+        - pause:
+            duration: 1m
+        - analysis:
+            templates:
+              - templateName: langgraph-canary-checks
+        # No final setWeight — Argo Rollouts auto-promotes to 100%
+        # after the last analysis step passes.
       maxSurge: 1
       maxUnavailable: 0
-      # Abort the rollout immediately on analysis failure (skip
-      # remaining retries). The AnalysisTemplate's failureLimit (3)
-      # gives the metric some grace; abortScaleDownDelaySeconds
-      # ensures the bad ReplicaSet is torn down promptly.
+      # Abort the rollout immediately on analysis failure. The
+      # AnalysisTemplate's failureLimit (3) gives the metric some
+      # grace; abortScaleDownDelaySeconds ensures the bad
+      # ReplicaSet is torn down promptly.
       abortScaleDownDelaySeconds: 30
   # On rollback, retain history so we can revert to the previous
   # ReplicaSet. 5 is the chart default.

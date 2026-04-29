@@ -1,0 +1,62 @@
+# Phase #31: VirtualService that argo-rollouts mutates to shift
+# traffic between langgraph-service-stable and langgraph-service-
+# canary during canary steps.
+#
+# Scope: gateways: [mesh] limits this VS to in-mesh sidecar traffic
+# (chat-ui → langgraph-service). The north-south path
+# (langgraph.${domain} → Istio Gateway → HTTPRoute → langgraph-
+# service Service) is NOT affected — that path keeps routing to the
+# original `langgraph-service` Service which selects all langgraph
+# pods (both stable + canary). For a lab where the primary /invoke
+# traffic is chat-ui → langgraph-service east-west, this is enough.
+# Extending traffic-shift to north-south is a future phase: either
+# (a) add the gateway to the VS gateways list, or (b) use the
+# argo-rollouts Gateway API integration to mutate the HTTPRoute
+# directly.
+#
+# Host: the FQDN. In-mesh callers in any namespace (chat-ui in
+# `chat`, evals in `eval`, etc.) resolving langgraph-service.
+# langgraph.svc.cluster.local hit this VS. Short forms (e.g. just
+# `langgraph-service` from a langgraph-namespace caller) also match
+# because Istio expands them at the sidecar.
+#
+# Routes: a single HTTP route with two weighted destinations.
+# argo-rollouts mutates the weights at each step:
+#   step setWeight 0     → stable=100, canary=0    (initial / promoted)
+#   step setWeight 10    → stable=90,  canary=10   (early canary)
+#   step setWeight 50    → stable=50,  canary=50   (mid canary)
+# Initial weights below (100/0) are the steady-state. argo-rollouts
+# also updates them at each canary step in real time. ArgoCD's
+# Application has a matching ignoreDifferences entry on the weight
+# JSON pointers so selfHeal doesn't fight the controller — see
+# raj-ai-lab-eks-infra/argocd-apps.tf.
+#
+# Route name "primary" is referenced by the Rollout's
+# trafficRouting.istio.virtualService.routes field. If you rename
+# this here, update the Rollout in lockstep.
+
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: langgraph-service-canary-vs
+  labels:
+    app: langgraph-service
+spec:
+  hosts:
+    - langgraph-service.langgraph.svc.cluster.local
+  gateways:
+    # mesh-only — does not affect the shared-gateway HTTPRoute path.
+    - mesh
+  http:
+    - name: primary
+      route:
+        - destination:
+            host: langgraph-service-stable
+            port:
+              number: 80
+          weight: 100
+        - destination:
+            host: langgraph-service-canary
+            port:
+              number: 80
+          weight: 0

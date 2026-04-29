@@ -1,0 +1,26 @@
+# Phase #31: canary Service for the Argo Rollouts Istio trafficRouting
+# integration. Sibling of service-stable.yaml — see comments there
+# for the architecture; this file is the mirror image.
+#
+# When NO canary is in progress (steady-state), this Service has zero
+# pods backing it because the controller hasn't injected a canary
+# pod-template-hash. The VirtualService routes 100% to -stable.
+# That's expected; harmless empty Service in steady-state is the
+# cost of this trafficRouting pattern.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: langgraph-service-canary
+  labels:
+    app: langgraph-service
+    role: canary
+spec:
+  type: ClusterIP
+  selector:
+    app: langgraph-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

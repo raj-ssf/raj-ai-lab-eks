@@ -13,6 +13,17 @@ resources:
   # the canary at the checkpoint.
   - analysistemplate.yaml
   - service.yaml
+  # Phase #31: stable + canary Services for argo-rollouts Istio
+  # trafficRouting. argo-rollouts injects rollouts-pod-template-hash
+  # into their selectors at runtime so each Service targets only
+  # its respective ReplicaSet's pods.
+  - service-stable.yaml
+  - service-canary.yaml
+  # Phase #31: VirtualService routing east-west traffic (gateways:
+  # [mesh]) from langgraph-service.svc to weighted -stable/-canary.
+  # argo-rollouts mutates spec.http[0].route[*].weight in real time
+  # at each canary step.
+  - virtualservice.yaml
   - httproute.yaml
   - servicemonitor.yaml
   # Phase #5: dedicated Redis for the cost-guardrails token bucket.
