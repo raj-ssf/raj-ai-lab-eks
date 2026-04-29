@@ -254,6 +254,20 @@ spec:
             - name: HALLUCINATION_CONFIDENCE_THRESHOLD
               value: "0.6"
 
+            # --- Phase #10: user feedback loop -------------------------
+            # /feedback endpoints are unconditionally available — no
+            # master switch. They depend on langgraph-redis being up
+            # (where feedback persists) and Langfuse being reachable
+            # for score emission (best-effort, request still succeeds
+            # if Langfuse is down).
+            - name: FEEDBACK_TTL_SECONDS
+              value: "7776000"  # 90 days
+            # Per-user index cap. Older feedback hash entries persist
+            # until their own TTL expires; the index just stops
+            # tracking them after this count.
+            - name: FEEDBACK_INDEX_MAX_ENTRIES
+              value: "500"
+
           envFrom:
             # Langfuse keys live in a Secret created by
             # raj-ai-lab-eks-infra/langgraph.tf, mirroring the

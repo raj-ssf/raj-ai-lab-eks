@@ -2338,6 +2338,79 @@ HALLUCINATION_DISCLAIMER = os.environ.get(
 )
 
 
+# --- Phase #10: user feedback loop -----------------------------------------
+#
+# Companion to /invoke + /invoke/stream: a separate POST /feedback endpoint
+# where chat-ui (or any client) submits per-response ratings. This is the
+# foundation for the data flywheel — without user signal, you can't do
+# online eval, A/B testing, RLHF data collection, or continuous fine-tune.
+# Builds the cheapest piece first (capture); analytics/feedback-driven
+# training are downstream concerns.
+#
+# Storage: dual-write to Redis (operational) + Langfuse score API
+# (visibility in the trace UI).
+#   Redis: hash keyed feedback:<user>:<trace_id> with rating + comment +
+#     categories + ts. TTL = FEEDBACK_TTL_SECONDS (default 90d). Indexed
+#     by a per-user list feedback:<user>:list for O(1) recent-feedback
+#     lookups.
+#   Langfuse: a `score` is an attribute attached to a trace by ID. The
+#     Langfuse UI then shows feedback inline with each conversation,
+#     and aggregate scoring is queryable via the SDK or web UI.
+#
+# Auth: same Keycloak JWT as /invoke. The feedback is keyed by
+# (user, trace_id) so users can only submit feedback on their own
+# requests — checked by binding the username at submission time.
+#
+# Failure modes:
+#   - Redis unreachable → 503 with detail. No silent failure; feedback
+#     loss is a quality-bar regression and operators should know.
+#   - Langfuse unreachable → log + continue. Redis is the persistent
+#     store; Langfuse is the dashboard view, so failing partly is
+#     acceptable.
+
+FEEDBACK_TTL_SECONDS = int(os.environ.get("FEEDBACK_TTL_SECONDS", str(90 * 86400)))
+# Cap on per-user feedback list — keeps the index ZRANGE cheap.
+# Older entries are still in their hash keys (TTL'd separately) but
+# the index only points at the most-recent N.
+FEEDBACK_INDEX_MAX_ENTRIES = int(
+    os.environ.get("FEEDBACK_INDEX_MAX_ENTRIES", "500")
+)
+
+
+def _feedback_key(user: str, trace_id: str) -> str:
+    return f"feedback:{user}:{trace_id}"
+
+
+def _feedback_index_key(user: str) -> str:
+    return f"feedback:{user}:list"
+
+
+# Lazy-initialized Langfuse client for the programmatic score API.
+# Distinct from _LANGFUSE_CB which is a LangChain callback handler;
+# the score API is a separate SDK surface. None when LANGFUSE_*
+# env vars are unset (lab without trace export).
+_LANGFUSE_CLIENT = None
+
+
+def _get_langfuse_client():
+    """Return a Langfuse SDK client instance, or None if not configured."""
+    global _LANGFUSE_CLIENT
+    if _LANGFUSE_CLIENT is not None:
+        return _LANGFUSE_CLIENT
+    if not (
+        os.environ.get("LANGFUSE_PUBLIC_KEY")
+        and os.environ.get("LANGFUSE_SECRET_KEY")
+    ):
+        return None
+    try:
+        from langfuse import Langfuse as _Langfuse
+        _LANGFUSE_CLIENT = _Langfuse()
+        return _LANGFUSE_CLIENT
+    except Exception as e:
+        log.warning("langfuse client init failed: %s", e)
+        return None
+
+
 def _cache_index_key(user: str, session_id: str) -> str:
     return f"cache:{user}:{session_id}:index"
 
@@ -3002,6 +3075,53 @@ GRAPH = build_graph()
 
 # --- Models ----------------------------------------------------------------
 
+class FeedbackRequest(BaseModel):
+    """User feedback on a specific /invoke response.
+
+    The trace_id is the langfuse_trace_id returned in the InvokeResponse
+    (also surfaced in /invoke/stream's done event). Bind feedback to the
+    specific response, not just the session, so analytics can cleanly
+    correlate cause (specific prompt + retrieved chunks + tool calls +
+    safety/cache verdicts) with effect (user rating).
+    """
+    trace_id: str = Field(..., description="langfuse_trace_id from the InvokeResponse")
+    # Two rating styles supported. Most chat UIs use thumbs (binary);
+    # advanced UIs surface 1-5 scales for granularity. Accept both,
+    # normalize on read for stats.
+    rating: Literal["up", "down"] = Field(..., description="Thumbs-up/down rating")
+    # Optional 1-5 scale, used in addition to rating for nuanced surveys.
+    score: Optional[int] = Field(default=None, ge=1, le=5)
+    comment: Optional[str] = Field(default=None, max_length=2000)
+    # Free-form tags useful in product (e.g. ["accuracy", "tone",
+    # "missing_citation", "hallucinated"]). Indexed in the future for
+    # category-specific aggregates.
+    categories: list[str] = Field(default_factory=list)
+
+
+class FeedbackResponse(BaseModel):
+    ok: bool
+    trace_id: str
+    user: str
+    persisted_at: float
+    langfuse_recorded: bool
+
+
+class FeedbackStatsResponse(BaseModel):
+    """Aggregate feedback stats — operator-facing.
+
+    Per-user OR per-session (caller chooses via query param). Returns
+    the most recent N feedback entries plus thumbs-up/down counts.
+    Bigger analytics (time-series, category breakdowns) belong in
+    Grafana on top of Langfuse traces; this endpoint is just for
+    quick health checks.
+    """
+    user: str
+    total: int
+    up: int
+    down: int
+    recent: list[dict]
+
+
 class InvokeRequest(BaseModel):
     prompt: str = Field(..., description="The user's natural-language prompt.")
     max_tokens: int = Field(default=512, ge=1, le=8192)
@@ -3442,4 +3562,190 @@ async def invoke_stream(
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
+    )
+
+
+# --- /feedback endpoints (Phase #10) ---------------------------------------
+
+
+@app.post("/feedback", response_model=FeedbackResponse)
+def feedback(
+    req: FeedbackRequest,
+    claims: Annotated[dict, Depends(require_jwt)],
+) -> FeedbackResponse:
+    """Submit feedback for a specific /invoke response.
+
+    Dual-write: Redis (operational store, queryable via /feedback/stats)
+    + Langfuse score (visible in trace UI alongside the original
+    request). Redis is authoritative; Langfuse is the dashboard view.
+
+    Auth binds (user, trace_id): only the user who made the original
+    request can submit feedback for it. Trace_id ownership isn't
+    server-validated against the original /invoke caller (would
+    require persisting trace→user mapping); instead, the per-user
+    Redis key prefix means a user's feedback can only land under
+    their own namespace, regardless of which trace_id they submit.
+    """
+    user = claims.get("preferred_username") or claims.get("sub") or "unknown"
+
+    redis_client = _get_redis()
+    if redis_client is None:
+        # Feedback loss is a quality-bar regression — surface as 503
+        # rather than swallow.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="feedback store unavailable",
+        )
+
+    import json as _json
+    ts = time.time()
+    record = {
+        "trace_id": req.trace_id,
+        "rating": req.rating,
+        "score": req.score if req.score is not None else "",
+        "comment": (req.comment or "")[:2000],
+        "categories": _json.dumps(req.categories or []),
+        "user": user,
+        "ts": str(ts),
+    }
+    feedback_key = _feedback_key(user, req.trace_id)
+    index_key = _feedback_index_key(user)
+
+    try:
+        # Pipelined: hash write + index zadd + LRU trim + TTLs
+        pipe = redis_client.pipeline(transaction=False)
+        pipe.hset(feedback_key, mapping=record)
+        pipe.expire(feedback_key, FEEDBACK_TTL_SECONDS)
+        pipe.zadd(index_key, {req.trace_id: ts})
+        # Keep only the most recent FEEDBACK_INDEX_MAX_ENTRIES in the
+        # per-user index. Older entries are still in their hash keys
+        # (each with its own TTL), but the index list stays bounded.
+        pipe.zremrangebyrank(index_key, 0, -(FEEDBACK_INDEX_MAX_ENTRIES + 1))
+        pipe.expire(index_key, FEEDBACK_TTL_SECONDS)
+        pipe.execute()
+    except Exception as e:
+        log.error("feedback: redis op failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="feedback persist failed",
+        )
+
+    # Best-effort Langfuse score. Failure here doesn't fail the request
+    # — Redis is authoritative, Langfuse is observability sugar.
+    langfuse_recorded = False
+    lf_client = _get_langfuse_client()
+    if lf_client is not None:
+        try:
+            # Numeric score: 1.0 for thumbs-up, 0.0 for thumbs-down.
+            # Plus the 1-5 score on a separate name if provided.
+            lf_client.create_score(
+                trace_id=req.trace_id,
+                name="user_feedback",
+                value=1.0 if req.rating == "up" else 0.0,
+                comment=req.comment or None,
+            )
+            if req.score is not None:
+                lf_client.create_score(
+                    trace_id=req.trace_id,
+                    name="user_feedback_1to5",
+                    value=float(req.score),
+                )
+            langfuse_recorded = True
+        except Exception as e:
+            log.warning("feedback: langfuse score emit failed: %s", e)
+
+    log.info(
+        "feedback user=%s trace=%s rating=%s score=%s langfuse=%s",
+        user, req.trace_id, req.rating, req.score, langfuse_recorded,
+    )
+
+    return FeedbackResponse(
+        ok=True,
+        trace_id=req.trace_id,
+        user=user,
+        persisted_at=ts,
+        langfuse_recorded=langfuse_recorded,
+    )
+
+
+@app.get("/feedback/stats", response_model=FeedbackStatsResponse)
+def feedback_stats(
+    claims: Annotated[dict, Depends(require_jwt)],
+    limit: int = 25,
+) -> FeedbackStatsResponse:
+    """Operator-facing feedback summary for the calling user.
+
+    Returns total count, thumbs-up/down split, and the most recent N
+    feedback entries (default 25). Per-user only — no admin path
+    surfaces other users' feedback (would need its own auth scope).
+
+    For richer analytics (time-series, category breakdowns, regression
+    correlation) use Langfuse's UI — every score submitted via
+    /feedback is also there.
+    """
+    user = claims.get("preferred_username") or claims.get("sub") or "unknown"
+    limit = max(1, min(limit, FEEDBACK_INDEX_MAX_ENTRIES))
+
+    redis_client = _get_redis()
+    if redis_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="feedback store unavailable",
+        )
+
+    index_key = _feedback_index_key(user)
+    import json as _json
+
+    try:
+        # ZREVRANGE for newest-first ordering
+        trace_ids: list[str] = redis_client.zrevrange(index_key, 0, limit - 1) or []
+        if not trace_ids:
+            return FeedbackStatsResponse(
+                user=user, total=0, up=0, down=0, recent=[]
+            )
+        # Pipeline: hgetall for each entry + zcard for total
+        pipe = redis_client.pipeline(transaction=False)
+        for tid in trace_ids:
+            pipe.hgetall(_feedback_key(user, tid))
+        pipe.zcard(index_key)
+        results = pipe.execute()
+    except Exception as e:
+        log.error("feedback_stats: redis op failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="feedback query failed",
+        )
+
+    entries = results[:-1]
+    total = int(results[-1])
+    recent: list[dict] = []
+    up = 0
+    down = 0
+    for e in entries:
+        if not e:
+            continue
+        rec = {
+            "trace_id": e.get("trace_id", ""),
+            "rating": e.get("rating", ""),
+            "score": e.get("score") or None,
+            "comment": e.get("comment") or "",
+            "ts": float(e.get("ts", "0") or 0),
+        }
+        try:
+            rec["categories"] = _json.loads(e.get("categories") or "[]")
+        except (_json.JSONDecodeError, TypeError):
+            rec["categories"] = []
+        if rec["rating"] == "up":
+            up += 1
+        elif rec["rating"] == "down":
+            down += 1
+        recent.append(rec)
+
+    # NOTE: up/down counts here only reflect the most-recent `limit`
+    # entries, not the full history. For accurate global counts the
+    # operator should aggregate via Langfuse score export. Document
+    # in the response shape if/when this becomes confusing.
+
+    return FeedbackStatsResponse(
+        user=user, total=total, up=up, down=down, recent=recent
     )
