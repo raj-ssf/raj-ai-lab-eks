@@ -15,3 +15,9 @@ resources:
   - service-stable.yaml
   - service-canary.yaml
   - virtualservice.yaml
+  # Phase #43: Prometheus ServiceMonitor. With the Instrumentator
+  # now wired up in app/main.py, http_request_duration_seconds /
+  # http_requests_total are scraped, enabling a future Phase #43b
+  # AnalysisTemplate to convert the Phase #39 indefinite-pause
+  # canary to automated.
+  - servicemonitor.yaml

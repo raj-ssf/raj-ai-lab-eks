@@ -1,0 +1,25 @@
+# Phase #43: ServiceMonitor for kube-prometheus-stack to scrape
+# /metrics. Same shape as rag-service/base/servicemonitor.yaml +
+# langgraph-service/base/servicemonitor.yaml.
+#
+# Picked up automatically because prometheus-stack.tf sets
+# serviceMonitorSelectorNilUsesHelmValues=false, so any ServiceMonitor
+# cluster-wide is scraped regardless of release labels. The
+# release: kube-prometheus-stack label is kept anyway for
+# future-proofing, matching the langgraph-service convention.
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ingestion-service
+  labels:
+    app: ingestion-service
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: ingestion-service
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

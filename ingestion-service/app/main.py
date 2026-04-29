@@ -37,6 +37,7 @@ from fastapi import (
 )
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient, models as qmodels
@@ -189,6 +190,19 @@ HTTPXClientInstrumentor().instrument()
 
 app = FastAPI(title="ingestion-service", version="0.1.0")
 FastAPIInstrumentor.instrument_app(app)
+
+# Phase #43: Prometheus instrumentation. Same shape as Phase #14a's
+# langgraph-service + Phase #24's rag-service: prometheus_fastapi_
+# instrumentator wraps the app and exposes /metrics for the
+# kube-prometheus-stack ServiceMonitor (Phase #43 ServiceMonitor in
+# base/servicemonitor.yaml). Series emitted by default:
+#   http_requests_total{method,handler,status}
+#   http_request_duration_seconds_bucket{method,handler,le}
+#   http_request_size_bytes / http_response_size_bytes
+# These let a future Phase wire an AnalysisTemplate gating the
+# Phase #39 ingestion-service canary on /upload success rate, in
+# place of today's indefinite-pause-and-manual-promote pattern.
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 bearer = HTTPBearer(auto_error=False)
 

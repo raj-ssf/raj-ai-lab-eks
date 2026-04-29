@@ -12,6 +12,10 @@ httpx==0.27.2
 
 pydantic==2.9.2
 
+# Phase #43: Prometheus instrumentation. Same version pinned for
+# rag-service + langgraph-service so observability stays consistent.
+prometheus-fastapi-instrumentator==7.0.0
+
 # OTel — same versions as langgraph-service post-langfuse-v3 bump so
 # the API trio stays aligned across services. Range-pinned until first
 # successful build resolves an exact version.
