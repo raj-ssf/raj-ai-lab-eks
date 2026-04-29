@@ -4545,7 +4545,110 @@ def _build_invoke_response_dict(
 
 @app.get("/healthz", include_in_schema=False)
 def healthz() -> dict:
+    """Shallow liveness probe — process is up + answering. Used by
+    livenessProbe; doesn't check dependencies (a Redis outage shouldn't
+    restart the langgraph-service pod, just degrade its serving)."""
     return {"ok": True, "service": "langgraph-service", "version": app.version}
+
+
+@app.get("/readyz", include_in_schema=False)
+def readyz() -> dict:
+    """Deep readiness probe — confirms required deps are reachable.
+
+    Required (failure → 503, pulls pod out of Service rotation):
+      - langgraph-redis (budget, cache, memory, feedback all need it)
+      - Keycloak JWKs endpoint (every /invoke does JWT validation)
+
+    Soft (logged in the response, but not gated):
+      - vllm-llama-8b — JIT-scaled, may legitimately be at 0 replicas;
+        a single /invoke that routes to trivial would scale it up.
+        Soft check so cold-tier state doesn't pull pods out of rotation.
+      - vllm-llama-guard-3-8b — same scale-to-zero pattern when safety
+        filter isn't active. Soft.
+      - vllm-bge-m3 — same pattern when cache isn't active. Soft.
+      - ingestion-service — same pattern; not critical for /invoke
+        flows that don't /upload.
+
+    Returns:
+      200 with {"ready": true, "checks": {...}} when all required deps
+            pass. Soft check failures are visible in the body.
+      503 with {"ready": false, "checks": {...}} when any required dep
+            fails. K8s pulls the pod out of the Service.
+    """
+    checks: dict = {}
+    overall_ok = True
+
+    # --- Required: Redis (budget/cache/memory/feedback all depend) ---
+    redis_client = _get_redis()
+    if redis_client is None:
+        checks["redis"] = {"required": True, "ok": False, "detail": "client not initialized"}
+        overall_ok = False
+    else:
+        try:
+            redis_client.ping()
+            checks["redis"] = {"required": True, "ok": True}
+        except Exception as e:
+            checks["redis"] = {
+                "required": True, "ok": False, "detail": str(e)[:120]
+            }
+            overall_ok = False
+
+    # --- Required: Keycloak JWKs (every /invoke validates JWT) ---
+    try:
+        keys = _fetch_jwks()
+        checks["keycloak_jwks"] = {
+            "required": True,
+            "ok": bool(keys),
+            "key_count": len(keys),
+        }
+        if not keys:
+            overall_ok = False
+    except Exception as e:
+        checks["keycloak_jwks"] = {
+            "required": True, "ok": False, "detail": str(e)[:120]
+        }
+        overall_ok = False
+
+    # --- Soft: in-cluster model endpoints. Each is allowed to be cold. ---
+    soft_endpoints = {
+        "vllm_llama_8b": f"{ROUTE_REGISTRY['trivial']['url'].rsplit('/v1', 1)[0]}/health",
+        "vllm_llama_guard": f"{SAFETY_LLAMA_GUARD_URL.rsplit('/v1', 1)[0]}/health",
+        "vllm_bge_m3": f"{CACHE_EMBEDDINGS_URL.rsplit('/v1', 1)[0]}/health",
+        "rag_service": f"{RAG_SERVICE_URL}/healthz",
+    }
+    for name, url in soft_endpoints.items():
+        try:
+            with httpx.Client(timeout=2.0) as client:
+                resp = client.get(url)
+                checks[name] = {
+                    "required": False,
+                    "ok": resp.status_code < 500,
+                    "status": resp.status_code,
+                }
+        except Exception as e:
+            # Soft — failure is expected when the model is at
+            # replicas=0. Record but don't gate on it.
+            checks[name] = {
+                "required": False,
+                "ok": False,
+                "detail": str(e)[:80],
+            }
+
+    payload = {
+        "ready": overall_ok,
+        "service": "langgraph-service",
+        "version": app.version,
+        "checks": checks,
+    }
+    if not overall_ok:
+        # Return body in detail so kubectl describe shows what's wrong
+        # in the event log when readiness fails. JSON-encode here
+        # because HTTPException's detail can be a dict.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=payload,
+        )
+    return payload
 
 
 @app.post("/invoke", response_model=InvokeResponse)

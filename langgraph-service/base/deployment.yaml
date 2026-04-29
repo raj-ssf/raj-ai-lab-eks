@@ -378,8 +378,12 @@ spec:
               cpu: "1"
               memory: "1Gi"
 
-          # /healthz is auth-bypassed in the FastAPI app exactly to
-          # support these probes — kubelet doesn't carry a JWT.
+          # /healthz (shallow — process responds) for startup +
+          # liveness. /readyz (Phase #23 — deep deps check) for
+          # readiness so a Redis or Keycloak JWKs outage pulls the
+          # pod out of the Service rotation without restarting it.
+          # Both endpoints are auth-bypassed in the FastAPI app
+          # exactly so kubelet probes don't need a JWT.
           startupProbe:
             httpGet:
               path: /healthz
@@ -389,10 +393,14 @@ spec:
             failureThreshold: 24
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
-            periodSeconds: 10
+            # Deep probe is more expensive (~50ms — Redis ping +
+            # Keycloak JWKs cache hit + soft endpoint pings). Run
+            # less often than the shallow liveness probe.
+            periodSeconds: 15
             failureThreshold: 3
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /healthz
