@@ -89,7 +89,20 @@ spec:
           command: ["/bin/sh", "-euxc"]
           args:
             - |
-              aws s3 sync "$S3_URI" "$ADAPTER_PATH" --no-progress
+              # Exclude the tokenizer/special-tokens/config files Axolotl
+              # saves alongside the adapter. The LoRA inherits the base
+              # model's tokenizer (Llama 3.1 8B Instruct's tokenizer
+              # includes a chat_template; Axolotl's saved tokenizer_config
+              # does not). If the adapter dir contains a tokenizer_config,
+              # vLLM uses IT for /v1/chat/completions calls and fails with
+              # 'default chat template is no longer allowed' (transformers
+              # v4.44+ requirement). Sync only the adapter weights so vLLM
+              # falls back to the base tokenizer.
+              aws s3 sync "$S3_URI" "$ADAPTER_PATH" --no-progress \
+                --exclude "tokenizer*" \
+                --exclude "special_tokens_map.json" \
+                --exclude "config.json" \
+                --exclude "README.md"
               ls -la "$ADAPTER_PATH"
           resources:
             requests: { cpu: "500m", memory: "256Mi" }
