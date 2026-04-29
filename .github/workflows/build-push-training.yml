@@ -8,14 +8,22 @@ name: Build and push training
 #     after envsubst-ing TRAINING_IMAGE to a specific sha tag. Putting
 #     training under continuous deployment doesn't make sense; you don't
 #     want every commit to silently retrain a model.
-#   - Path filter is training/** (Dockerfile + configs/) — configs are
-#     baked into the image so they need to invalidate the build cache.
+#   - Path filter narrowed to the bits that actually feed the image
+#     build (Dockerfile + configs baked in). training/runs/** are
+#     operator-applied Job manifests (e.g. llama-guard-3-8b-stage.yaml,
+#     llama-3.1-8b-alpaca-lora.yaml) — applied directly, not packaged
+#     into the image. training/pvcs/** are PVC YAMLs, likewise applied
+#     directly. Neither belongs in the build context. Earlier this
+#     workflow watched all of training/** which pointlessly fired
+#     image rebuilds on operational artifact edits — same anti-pattern
+#     I narrowed on build-push-eval.yml when eval/ragas/ landed.
 
 on:
   push:
     branches: [main]
     paths:
-      - "training/**"
+      - "training/Dockerfile"
+      - "training/configs/**"
       - ".github/workflows/build-push-training.yml"
   workflow_dispatch:
 
