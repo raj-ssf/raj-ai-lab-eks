@@ -1,0 +1,148 @@
+# Phase #40: chat-ui converted to Argo Rollouts blueGreen, NOT
+# canary. Different strategy than langgraph (#30+#31), rag (#35),
+# and ingestion (#39) — and the strategy choice is forced by
+# Chainlit's session model.
+#
+# WHY blueGreen, NOT canary:
+#   Chainlit uses WebSockets for token-by-token streaming of /invoke
+#   responses. A weighted-traffic canary (Phase #31 pattern) would
+#   randomly route the WebSocket-upgrade request between stable and
+#   canary RS based on VS weights — but mid-conversation HTTP polls,
+#   feedback POSTs, and reconnects would not necessarily land on
+#   the same RS that holds the session state. Result: corrupted
+#   conversations, lost stream tokens, broken feedback.
+#
+#   blueGreen sidesteps this entirely:
+#     1. New version deploys as "preview" (separate Service)
+#     2. activeService keeps serving production traffic on stable
+#     3. Operator inspects preview by pointing at chat-ui-preview
+#        directly (port-forward or curl with cookie)
+#     4. `kubectl argo rollouts promote chat-ui -n chat` flips the
+#        activeService selector to the preview RS atomically
+#     5. WebSocket sessions on the old RS disconnect (Chainlit's
+#        client-side reconnect kicks in, lands on the new RS)
+#     6. Old RS scales to 0 after scaleDownDelaySeconds (60s)
+#
+#   The atomic flip means no mid-stream bouncing — every individual
+#   session is fully on stable or fully on preview, never split.
+#
+# WebSocket disconnect-on-flip caveat:
+#   At promote time, all in-flight WebSockets are killed. Chainlit's
+#   client reconnects automatically and rebuilds session state from
+#   the langgraph-redis store (Phase #6 conversation memory + Phase
+#   #22 session export both persist server-side), so users see a
+#   brief stutter rather than data loss. Best operational practice:
+#   promote during quiet windows.
+#
+# NO ANALYSIS:
+#   Same reason as ingestion-service (Phase #39) — chat-ui has no
+#   prometheus_fastapi_instrumentator wired up and no ServiceMonitor.
+#   Operator-driven promotion via the plugin is the gate. Phase #37
+#   RolloutPausedTooLong fires at 30m if a preview is forgotten.
+#
+# Migration notes:
+#   - replicas stays at 1 (Chainlit's session affinity expectation
+#     means scaling up needs sticky sessions, which is a separate
+#     Phase. blueGreen works fine at replicas=1: 1 stable pod +
+#     1 preview pod simultaneously during a deploy.
+#   - Pod template byte-identical to deployment.yaml.
+#   - First-deploy of a Rollout skips the blueGreen pause (no prior
+#     version to preview against).
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: chat-ui
+  labels:
+    app: chat-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chat-ui
+  strategy:
+    blueGreen:
+      # The Service users actually hit (existing chat-ui Service —
+      # the HTTPRoute backendRefs to it). argo-rollouts injects
+      # rollouts-pod-template-hash into spec.selector to pin it
+      # to whichever RS is currently "active".
+      activeService: chat-ui
+      # Separate Service that selects the "preview" (about-to-be-
+      # promoted) RS. Operators inspect this Service directly during
+      # the pause window. Created as chat-ui-preview.yaml.
+      previewService: chat-ui-preview
+      # Manual promote required. This is the safety mechanism since
+      # there's no analysis to gate on. Set to true to auto-promote
+      # after preview is healthy (skip the manual review window).
+      autoPromotionEnabled: false
+      # After promotion, keep the old stable RS up for 60s in case
+      # a fast rollback is needed. Then scale to 0.
+      scaleDownDelaySeconds: 60
+  revisionHistoryLimit: 5
+  template:
+    metadata:
+      labels:
+        app: chat-ui
+    spec:
+      serviceAccountName: chat-ui
+      containers:
+        - name: chat-ui
+          image: chat-ui:placeholder
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: domain
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: keycloak_realm
+            - name: LANGGRAPH_URL
+              value: http://langgraph-service.langgraph.svc.cluster.local
+            - name: STREAM_ENABLED
+              value: "true"
+            - name: INGESTION_URL
+              value: http://ingestion-service.ingestion.svc.cluster.local
+            - name: LANGFUSE_HOST
+              value: https://langfuse.$(DOMAIN)
+            - name: OAUTH_KEYCLOAK_BASE_URL
+              value: https://keycloak.$(DOMAIN)
+            - name: OAUTH_KEYCLOAK_REALM
+              value: $(KEYCLOAK_REALM)
+            - name: CHAINLIT_URL
+              value: https://chat.$(DOMAIN)
+          envFrom:
+            - secretRef:
+                name: chat-ui-oidc
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3

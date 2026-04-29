@@ -3,6 +3,13 @@ kind: Kustomization
 
 resources:
   - serviceaccount.yaml
-  - deployment.yaml
+  # Phase #40: deployment.yaml replaced by rollout.yaml using
+  # blueGreen strategy (NOT canary). Chainlit WebSocket streaming
+  # makes traffic-weighted canary unsafe — see rollout.yaml header.
+  - rollout.yaml
   - service.yaml
+  # Phase #40: preview Service for the blueGreen strategy.
+  # argo-rollouts pins its selector to the preview RS; operator
+  # inspects via port-forward during the pause window.
+  - service-preview.yaml
   - httproute.yaml
