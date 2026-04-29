@@ -314,6 +314,25 @@ spec:
             # - name: CANARY_TRIVIAL_FRACTION
             #   value: "0.1"
 
+            # --- Phase #19: per-tool rate limiting ---------------------
+            # Per-(tool, user) sliding-window rate limits, separate
+            # from the per-user request budget (Phase #5). Catches
+            # tool-specific abuse — particularly http_fetch, which
+            # is a documented scrape/SSRF abuse vector.
+            #
+            # Defaults (calls/window) hardcoded in main.py:
+            #   calculator           60/min
+            #   get_current_time     60/min
+            #   http_fetch           10/min  (tightest — egress + scrape risk)
+            #   search_session_docs  30/min  (embedding cost + Qdrant load)
+            # Override per tool via TOOL_RATE_<TOOL>_LIMIT and
+            # TOOL_RATE_<TOOL>_WINDOW_SECONDS.
+            #
+            # Default disabled — flip after smoking the limits feel
+            # right for your traffic pattern.
+            - name: TOOL_RATE_LIMIT_ENABLED
+              value: "false"
+
             # /feedback endpoints are unconditionally available — no
             # master switch. They depend on langgraph-redis being up
             # (where feedback persists) and Langfuse being reachable

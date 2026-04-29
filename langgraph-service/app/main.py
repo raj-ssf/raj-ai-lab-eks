@@ -520,6 +520,14 @@ LG_TOOL_CALLS_TOTAL = Counter(
     "Tool invocations from the agentic execute loop, by tool name.",
     ["tool"],
 )
+# Phase #19: per-tool rate-limit denials. Spikes here indicate either
+# legitimate overuse (raise the limit) or actual abuse (investigate
+# the user). Operators can alert on this rate.
+LG_TOOL_RATE_LIMITED_TOTAL = Counter(
+    "langgraph_tool_rate_limited_total",
+    "Per-tool rate-limit denials, by tool name.",
+    ["tool"],
+)
 LG_REASONING_CYCLES = Histogram(
     "langgraph_reasoning_cycles",
     "Graph-level reasoning loop cycles per request (Phase T2).",
@@ -849,6 +857,11 @@ class AgentState(TypedDict, total=False):
     #     ratings, latencies, etc. by variant.
     variant_name: str
     variant_label: Literal["stable", "canary"]
+    # Phase #19: per-tool rate-limit log. Names of tools the agent
+    # tried to call but were rate-limited (per-(tool, user) sliding
+    # window). Surfaced for chat-ui to render "your http_fetch usage
+    # exceeded the limit" messages.
+    tool_rate_limited_log: list[str]
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -3225,6 +3238,114 @@ TOOLS = [calculator, get_current_time, http_fetch, search_session_docs]
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 
 
+# --- Phase #19: per-tool rate limiting -------------------------------------
+#
+# Per-(tool, user) sliding-window rate limit. The Phase #5 budget caps
+# total /invoke requests per user per day. Per-tool limits cap how many
+# times each user can invoke each specific tool in a sliding window.
+#
+# Why both: the per-user budget catches blanket abuse ("user is asking
+# 10K questions"). Per-tool limits catch tool-specific abuse ("user is
+# asking benign questions but each one tool-calls http_fetch 50 times,
+# scraping the web through us"). Different threat models, different
+# mitigations.
+#
+# Default per-tool limits (calls/window):
+#   calculator              60/min  (cheap, abuse-resistant — pure math)
+#   get_current_time        60/min  (cheap, no side-effects)
+#   http_fetch              10/min  (network egress; scrape risk; SSRF
+#                                   risk if URL allowlist were ever
+#                                   loosened beyond https-only)
+#   search_session_docs     30/min  (embedding cost + Qdrant load)
+#
+# Override via env: TOOL_RATE_<TOOL_NAME_UPPER>_LIMIT and
+# TOOL_RATE_<TOOL_NAME_UPPER>_WINDOW_SECONDS.
+#
+# Behavior on rate-limit hit: the dispatched call returns a synthetic
+# ToolMessage with text "tool <name> rate-limited; retry in <X>s" —
+# the agent loop sees it like any other tool error and can decide to
+# retry, fall back to a different tool, or give up gracefully. Better
+# UX than a hard request failure.
+#
+# Failure mode (Redis unreachable): fail-OPEN. The whole feature is
+# enrichment, not a security boundary; if Redis is down the request
+# proceeds normally. Same posture as Phase #5 budget when configured
+# fail_open.
+
+TOOL_RATE_LIMIT_ENABLED = os.environ.get(
+    "TOOL_RATE_LIMIT_ENABLED", "false"
+).lower() in ("1", "true", "yes")
+
+# Defaults populated at module load. Env can override per-tool via
+# TOOL_RATE_<TOOL>_LIMIT / TOOL_RATE_<TOOL>_WINDOW_SECONDS.
+TOOL_RATE_DEFAULTS: dict[str, dict] = {
+    "calculator":          {"limit": 60, "window_seconds": 60},
+    "get_current_time":    {"limit": 60, "window_seconds": 60},
+    "http_fetch":          {"limit": 10, "window_seconds": 60},
+    "search_session_docs": {"limit": 30, "window_seconds": 60},
+}
+
+TOOL_RATE_CONFIG: dict[str, dict] = {}
+for _tool_name, _default in TOOL_RATE_DEFAULTS.items():
+    _env_prefix = f"TOOL_RATE_{_tool_name.upper()}"
+    _limit_raw = os.environ.get(f"{_env_prefix}_LIMIT", "").strip()
+    _window_raw = os.environ.get(f"{_env_prefix}_WINDOW_SECONDS", "").strip()
+    try:
+        _limit = int(_limit_raw) if _limit_raw else _default["limit"]
+    except ValueError:
+        _limit = _default["limit"]
+    try:
+        _window = int(_window_raw) if _window_raw else _default["window_seconds"]
+    except ValueError:
+        _window = _default["window_seconds"]
+    TOOL_RATE_CONFIG[_tool_name] = {
+        "limit": max(1, _limit),
+        "window_seconds": max(1, _window),
+    }
+
+
+def _check_tool_rate_limit(tool_name: str, user: str) -> tuple[bool, int]:
+    """Return (allowed, remaining). remaining=-1 when feature disabled
+    or fail-open.
+
+    Sliding-window via Redis: bucket key includes
+    `int(time.time()) // window_seconds` so each window gets its own
+    counter that auto-expires. Same INCR + EXPIRE pattern as Phase #5
+    budget.
+    """
+    if not TOOL_RATE_LIMIT_ENABLED:
+        return (True, -1)
+    cfg = TOOL_RATE_CONFIG.get(tool_name)
+    if not cfg:
+        # Tool isn't in the registry — let it through. Adding new
+        # tools to TOOLS without a matching TOOL_RATE_DEFAULTS entry
+        # falls open rather than randomly denying.
+        return (True, -1)
+
+    redis_client = _get_redis()
+    if redis_client is None:
+        return (True, -1)
+
+    window_id = int(time.time()) // cfg["window_seconds"]
+    key = f"toolrate:{tool_name}:{user}:{window_id}"
+    try:
+        pipe = redis_client.pipeline(transaction=False)
+        pipe.incr(key, 1)
+        # 2x window to be safe against clock skew between this pod
+        # and Redis on a window boundary
+        pipe.expire(key, cfg["window_seconds"] * 2)
+        results = pipe.execute()
+        consumed = int(results[0])
+    except Exception as e:
+        log.warning("tool_rate_limit: redis op failed: %s, fail-open", e)
+        return (True, -1)
+
+    remaining = cfg["limit"] - consumed
+    if consumed > cfg["limit"]:
+        return (False, 0)
+    return (True, max(0, remaining))
+
+
 # --- Planner (Phase #13) ---------------------------------------------------
 
 
@@ -3427,6 +3548,7 @@ def node_execute(state: AgentState) -> AgentState:
             "execute_latency_ms": elapsed_ms,
             "tool_iterations": 0,
             "tool_calls_log": [],
+            "tool_rate_limited_log": [],
             "variant_name": variant_name,
             "variant_label": variant_label,
         }
@@ -3489,6 +3611,7 @@ def node_execute(state: AgentState) -> AgentState:
     auth_token_token = _AGENT_AUTH_TOKEN.set(state.get("auth_token"))
 
     tool_calls_log: list[str] = []
+    tool_rate_limited_log: list[str] = []  # Phase #19
     iterations = 0
     final_response = ""
     try:
@@ -3520,13 +3643,34 @@ def node_execute(state: AgentState) -> AgentState:
                 if t is None:
                     result = f"unknown tool '{name}'"
                 else:
-                    try:
-                        result = t.invoke(args)
-                    except Exception as e:
-                        # Surface tool errors to the model rather than
-                        # failing the whole graph — the model can decide
-                        # to retry, fall back, or apologize gracefully.
-                        result = f"tool {name} failed: {e}"
+                    # Phase #19: per-(tool, user) rate-limit check.
+                    # Denied tools return a synthetic ToolMessage so
+                    # the agent loop sees it like any other tool error
+                    # — model can decide to retry, fall back, or
+                    # apologize. Better than hard-failing the request.
+                    rl_user = state.get("user", "unknown")
+                    rl_allowed, rl_remaining = _check_tool_rate_limit(name, rl_user)
+                    if not rl_allowed:
+                        cfg = TOOL_RATE_CONFIG.get(name, {})
+                        window = cfg.get("window_seconds", 60)
+                        result = (
+                            f"tool {name} rate-limited (per-user); "
+                            f"try again in <{window}s"
+                        )
+                        tool_rate_limited_log.append(name)
+                        LG_TOOL_RATE_LIMITED_TOTAL.labels(tool=name).inc()
+                        log.info(
+                            "tool_rate_limited tool=%s user=%s window=%ds",
+                            name, rl_user, window,
+                        )
+                    else:
+                        try:
+                            result = t.invoke(args)
+                        except Exception as e:
+                            # Surface tool errors to the model rather than
+                            # failing the whole graph — the model can decide
+                            # to retry, fall back, or apologize gracefully.
+                            result = f"tool {name} failed: {e}"
                 messages.append(
                     ToolMessage(
                         content=str(result),
@@ -3571,6 +3715,7 @@ def node_execute(state: AgentState) -> AgentState:
         "execute_latency_ms": elapsed_ms,
         "tool_iterations": iterations,
         "tool_calls_log": tool_calls_log,
+        "tool_rate_limited_log": tool_rate_limited_log,
         "variant_name": variant_name,
         "variant_label": variant_label,
     }
@@ -4093,6 +4238,11 @@ class InvokeResponse(BaseModel):
     # alongside ratings to enable per-variant satisfaction analysis.
     variant_name: str = ""
     variant_label: str = "stable"
+    # Phase #19: per-tool rate-limit telemetry. Names of tools the agent
+    # tried to invoke but got blocked by per-(tool, user) rate limits.
+    # chat-ui can render "your http_fetch usage hit the per-minute cap"
+    # alongside the response.
+    tool_rate_limited_log: list[str] = Field(default_factory=list)
 
 
 # --- Routes ----------------------------------------------------------------
@@ -4161,6 +4311,7 @@ def _build_invoke_response_dict(
         "plan_ms": final_state.get("plan_ms", 0),
         "variant_name": final_state.get("variant_name", ""),
         "variant_label": final_state.get("variant_label", "stable"),
+        "tool_rate_limited_log": final_state.get("tool_rate_limited_log") or [],
     }
 
 
