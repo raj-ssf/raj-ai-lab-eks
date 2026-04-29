@@ -110,6 +110,7 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langfuse.langchain import CallbackHandler as LangfuseCallback
 from langgraph.graph import END, START, StateGraph
+from prometheus_client import Counter, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 
@@ -394,6 +395,150 @@ _LANGFUSE_CB: Optional[LangfuseCallback] = (
 app = FastAPI(title="langgraph-service", version="0.2.0")
 FastAPIInstrumentor.instrument_app(app)
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+
+
+# --- Phase #14: custom Prometheus metrics ----------------------------------
+#
+# The Instrumentator above auto-instruments HTTP-level metrics (request
+# count + duration histogram by path/status). These additional Counter
+# and Histogram metrics expose the per-node telemetry the graph
+# accumulates — safety blocks, cache hits, hallucination verdicts, etc.
+# — so Grafana dashboards can plot them.
+#
+# Naming: langgraph_<concern>_<unit> is the convention. Counters end in
+# _total per Prometheus best practice; Histograms in _<unit>.
+#
+# Emission point: a single _emit_request_metrics(final_state) helper
+# reads the terminal state at the end of /invoke and /invoke/stream
+# and increments/observes the relevant series. Keeping the metric
+# emission centralized — rather than scattered across every node —
+# means the metrics surface is reviewable in one place and stays in
+# sync with the InvokeResponse shape.
+
+LG_REQUEST_TOTAL = Counter(
+    "langgraph_requests_total",
+    "Total /invoke requests by routed-to tier.",
+    ["route"],
+)
+LG_SAFETY_ACTION_TOTAL = Counter(
+    "langgraph_safety_action_total",
+    "Terminal safety_action disposition per request.",
+    ["action"],
+)
+LG_CACHE_ACTION_TOTAL = Counter(
+    "langgraph_cache_action_total",
+    "Cache outcome — hit, miss, or disabled.",
+    ["action"],
+)
+LG_BUDGET_ACTION_TOTAL = Counter(
+    "langgraph_budget_action_total",
+    "Per-user budget gate disposition.",
+    ["action"],
+)
+LG_HALLUCINATION_ACTION_TOTAL = Counter(
+    "langgraph_hallucination_action_total",
+    "Hallucination check outcome.",
+    ["verdict"],
+)
+LG_PLANNER_ACTION_TOTAL = Counter(
+    "langgraph_planner_action_total",
+    "Planner outcome — planned, skipped, fail_open.",
+    ["action"],
+)
+LG_PII_REDACT_ACTION_TOTAL = Counter(
+    "langgraph_pii_redact_action_total",
+    "PII redaction outcome.",
+    ["action"],
+)
+LG_TOOL_CALLS_TOTAL = Counter(
+    "langgraph_tool_calls_total",
+    "Tool invocations from the agentic execute loop, by tool name.",
+    ["tool"],
+)
+LG_REASONING_CYCLES = Histogram(
+    "langgraph_reasoning_cycles",
+    "Graph-level reasoning loop cycles per request (Phase T2).",
+    buckets=(0, 1, 2, 3, 4, 5),
+)
+# Per-node duration histogram. One series per node label keeps the
+# cardinality bounded (16 nodes × 8 buckets = 128 distinct series),
+# which Prometheus handles fine.
+LG_NODE_DURATION_SECONDS = Histogram(
+    "langgraph_node_duration_seconds",
+    "Per-node graph execution duration in seconds.",
+    ["node"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+)
+
+# State-field → metric-label-friendly node name mapping.
+_NODE_MS_FIELDS: dict[str, str] = {
+    "safety_input": "safety_input_ms",
+    "safety_output": "safety_output_ms",
+    "cache_lookup": "cache_lookup_ms",
+    "cache_store": "cache_store_ms",
+    "memory_load": "memory_load_ms",
+    "memory_save": "memory_save_ms",
+    "query_rewrite": "query_rewrite_ms",
+    "hallucination_check": "hallucination_check_ms",
+    "pii_redact_output": "pii_redact_ms",
+    "plan": "plan_ms",
+    "execute": "execute_latency_ms",
+    "retrieve": "retrieve_ms",
+}
+
+
+def _emit_request_metrics(final_state: dict) -> None:
+    """Increment Counters + observe Histograms from a terminal graph state.
+
+    Called from /invoke (sync) at the end of the handler and from
+    /invoke/stream's done-event branch. Best-effort — exceptions in
+    metric emission are caught + logged so a buggy metric doesn't
+    fail the request.
+    """
+    try:
+        LG_REQUEST_TOTAL.labels(route=final_state.get("route", "unknown")).inc()
+        LG_SAFETY_ACTION_TOTAL.labels(
+            action=final_state.get("safety_action", "passed")
+        ).inc()
+
+        # Cache: derive a 3-way action (hit/miss/disabled) — the state
+        # only carries cache_hit (bool) + cache_lookup_ms (0 if disabled).
+        if final_state.get("cache_hit"):
+            cache_label = "hit"
+        elif final_state.get("cache_lookup_ms", 0) == 0:
+            cache_label = "disabled"
+        else:
+            cache_label = "miss"
+        LG_CACHE_ACTION_TOTAL.labels(action=cache_label).inc()
+
+        LG_BUDGET_ACTION_TOTAL.labels(
+            action=final_state.get("budget_action", "disabled")
+        ).inc()
+        LG_HALLUCINATION_ACTION_TOTAL.labels(
+            verdict=final_state.get("hallucination_verdict", "skipped")
+        ).inc()
+        LG_PLANNER_ACTION_TOTAL.labels(
+            action=final_state.get("planner_action", "skipped")
+        ).inc()
+        LG_PII_REDACT_ACTION_TOTAL.labels(
+            action=final_state.get("pii_redact_action", "skipped")
+        ).inc()
+
+        for tool in final_state.get("tool_calls_log") or []:
+            LG_TOOL_CALLS_TOTAL.labels(tool=tool).inc()
+
+        cycles = final_state.get("cycles", 0) or 0
+        LG_REASONING_CYCLES.observe(cycles)
+
+        # Per-node durations
+        for node_label, ms_field in _NODE_MS_FIELDS.items():
+            ms = final_state.get(ms_field, 0) or 0
+            if ms > 0:
+                LG_NODE_DURATION_SECONDS.labels(
+                    node=node_label
+                ).observe(ms / 1000.0)
+    except Exception as e:
+        log.warning("metric emission failed: %s", e)
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -3813,6 +3958,12 @@ def invoke(
             detail=str(e),
         ) from e
 
+    # Phase #14: Prometheus metric emission. Best-effort; failures
+    # logged but don't fail the request. Mirrored in /invoke/stream's
+    # done branch so both endpoints contribute the same Counters +
+    # Histograms.
+    _emit_request_metrics(dict(final_state))
+
     # Shape via the shared helper (also used by /invoke/stream's done
     # event), then wrap retrieved_chunks dicts in the typed model. The
     # rest expand straight into InvokeResponse via **.
@@ -4002,6 +4153,10 @@ async def invoke_stream(
                     content = getattr(chunk, "content", None) or ""
                     if content:
                         yield _sse("token", {"content": content})
+
+            # Phase #14: emit metrics from the accumulated terminal
+            # state — same call as the sync /invoke handler does.
+            _emit_request_metrics(accumulated)
 
             # Final event: full response shape so the UI gets all
             # the telemetry without a follow-up call.
