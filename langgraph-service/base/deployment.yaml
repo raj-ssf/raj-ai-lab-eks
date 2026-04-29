@@ -234,6 +234,26 @@ spec:
             - name: CACHE_TTL_SECONDS
               value: "86400"
 
+            # --- Phase #9: runtime hallucination detection -------------
+            # Llama 8B grades whether the response's claims are
+            # grounded in the retrieved chunks. Action on
+            # ungrounded/partial verdict depends on HALLUCINATION_ACTION:
+            #   "flag"  → record verdict, response unchanged
+            #   "block" → prepend a confidence disclaimer
+            # Default disabled; enable once you've smoked it on real
+            # RAG queries and tuned HALLUCINATION_CONFIDENCE_THRESHOLD.
+            - name: HALLUCINATION_CHECK_ENABLED
+              value: "false"
+            - name: HALLUCINATION_ACTION
+              value: flag
+            # 0.6 = "model is more confident than not it's grounded."
+            # Below this threshold, "grounded" gets demoted to "partial"
+            # so the action policy treats low-confidence-grounded the
+            # same as partially-grounded. Tune by watching the
+            # confidence distribution in Langfuse traces.
+            - name: HALLUCINATION_CONFIDENCE_THRESHOLD
+              value: "0.6"
+
           envFrom:
             # Langfuse keys live in a Secret created by
             # raj-ai-lab-eks-infra/langgraph.tf, mirroring the

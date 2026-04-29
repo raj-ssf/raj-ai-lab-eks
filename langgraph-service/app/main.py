@@ -1,7 +1,7 @@
 """langgraph-service — FastAPI front-end for a LangGraph router agent.
 
-Thirteen-node state machine on /invoke (budget + safety bookends + cache
-+ memory + query rewriting + reasoning loop):
+Fourteen-node state machine on /invoke (budget + safety bookends + cache
++ memory + query rewriting + reasoning loop + hallucination check):
 
     START -> budget_check -> safety_input -> load_memory -> rewrite_query
                           -> classify -> retrieve -> ensure_warm
@@ -51,6 +51,12 @@ Thirteen-node state machine on /invoke (budget + safety bookends + cache
   routes back to retrieve; otherwise routes to safety_output.
 - safety_output: Llama Guard 3 8B grades the model's draft. If unsafe,
   replaces `response` with the refusal message before END.
+- hallucination_check: Llama 8B grades whether the response is
+  grounded in the retrieved chunks. Verdicts: grounded, partial,
+  ungrounded. Action depends on HALLUCINATION_ACTION (flag = record
+  only; block = prepend a confidence disclaimer). Skips on cache hit,
+  no chunks, safety blocked. No-op when HALLUCINATION_CHECK_ENABLED=
+  false.
 - cache_store: persists the safety-checked response to the prompt
   cache for future similar requests. LRU-evicts to keep cache size
   bounded. Skips on safety-blocked, budget-blocked, or cache-hit
@@ -550,6 +556,18 @@ class AgentState(TypedDict, total=False):
     prompt_embedding: Optional[list[float]]
     cache_lookup_ms: int
     cache_store_ms: int
+    # Phase #9: runtime hallucination detection bookkeeping.
+    #   hallucination_verdict: "grounded" | "partial" | "ungrounded" |
+    #     "skipped" | "fail_open"
+    #   hallucination_confidence: 0.0–1.0 from the grader's self-reported
+    #     confidence in its verdict
+    #   hallucination_action: terminal disposition — "passed" |
+    #     "flagged" | "blocked" | "disabled"
+    #   hallucination_check_ms: per-node latency
+    hallucination_verdict: Literal["grounded", "partial", "ungrounded", "skipped", "fail_open"]
+    hallucination_confidence: float
+    hallucination_action: Literal["passed", "flagged", "blocked", "disabled"]
+    hallucination_check_ms: int
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -1124,6 +1142,12 @@ def node_cache_store(state: AgentState) -> AgentState:
         return {"cache_store_ms": 0}
     if state.get("budget_action") in ("exceeded", "fail_closed"):
         return {"cache_store_ms": 0}
+    # Phase #9: don't cache responses flagged or blocked as ungrounded
+    # — caching a hallucination short-circuits future similar requests
+    # to the same wrong answer. "fail_open" passes through (the grader
+    # itself failed, not the response).
+    if state.get("hallucination_action") in ("flagged", "blocked"):
+        return {"cache_store_ms": 0}
 
     user = state.get("user", "unknown")
     session_id = state.get("session_id")
@@ -1190,6 +1214,201 @@ def node_cache_store(state: AgentState) -> AgentState:
         user, session_id, entry_id, elapsed_ms,
     )
     return {"cache_store_ms": elapsed_ms}
+
+
+# --- Runtime hallucination detection (Phase #9) ----------------------------
+
+
+_HALLUCINATION_SYSTEM_PROMPT = """You grade whether an assistant's answer is grounded in the retrieved context.
+
+You will receive:
+- Retrieved context chunks (numbered [1], [2], etc.)
+- The assistant's answer
+
+Output exactly ONE LINE of valid JSON:
+  {"verdict": "grounded" | "partial" | "ungrounded", "confidence": <0.0-1.0>}
+
+Rules:
+- "grounded"   → every substantive claim in the answer is directly supported by at least one chunk, OR is a reasonable inference from one or more chunks.
+- "partial"    → some claims supported, others extrapolated beyond what the chunks say.
+- "ungrounded" → the answer's substantive claims are NOT in any chunk; the assistant fabricated or used its own training data.
+
+Ignore boilerplate like "I'd be happy to help" or "Let me explain" when grading. Focus on factual claims.
+
+confidence reflects how sure YOU are of YOUR verdict, not the answer's certainty. 0.95 = very sure. 0.5 = could go either way.
+
+Output ONLY the JSON line. No prose, no code fences, no explanation."""
+
+
+def _hallucination_grade(
+    response: str,
+    chunks: list[dict],
+) -> tuple[str, float, int]:
+    """Call Llama 8B to grade whether response is grounded in chunks.
+
+    Returns (verdict, confidence, latency_ms). Verdict is one of
+    "grounded" | "partial" | "ungrounded" | "fail_open" (LLM error or
+    parse failure → fail-open verdict treated as passed by caller).
+    """
+    started = time.monotonic()
+
+    # Format the chunks the same shape node_execute already uses,
+    # so the grader sees citation indexes consistent with what the
+    # original answer was generated against.
+    context_text = "\n\n".join(
+        "[{n}] (source: {src}, chunk {ci})\n{text}".format(
+            n=i + 1,
+            src=c.get("source", "unknown") or "unknown",
+            ci=c.get("chunk_index", 0),
+            text=(c.get("text", "") or "")[:1500],  # cap each chunk
+        )
+        for i, c in enumerate(chunks[:5])  # cap at 5 chunks for prompt budget
+    )
+
+    user_msg = f"Retrieved context:\n{context_text}\n\nAssistant answer:\n{response}\n\nVerdict JSON:"
+
+    cfg_trivial = ROUTE_REGISTRY["trivial"]
+    client = ChatOpenAI(
+        model=cfg_trivial["model_name"],
+        base_url=cfg_trivial["url"],
+        api_key="not-required",
+        temperature=0.0,
+        max_tokens=HALLUCINATION_MAX_TOKENS,
+        timeout=HALLUCINATION_TIMEOUT_SECONDS,
+    )
+    try:
+        resp = client.invoke([
+            SystemMessage(content=_HALLUCINATION_SYSTEM_PROMPT),
+            HumanMessage(content=user_msg),
+        ])
+        raw = (resp.content or "").strip()
+    except Exception as e:
+        log.warning("hallucination_grade: LLM call failed: %s, fail-open", e)
+        return ("fail_open", 0.0, int((time.monotonic() - started) * 1000))
+
+    # Parse the first JSON object from the response. Llama 8B
+    # occasionally wraps in code fences or adds trailing whitespace.
+    import json as _json
+    import re as _re
+    m = _re.search(r"\{[^{}]*\}", raw, _re.DOTALL)
+    if not m:
+        log.warning("hallucination_grade: no JSON in output=%r", raw[:120])
+        return ("fail_open", 0.0, int((time.monotonic() - started) * 1000))
+    try:
+        decision = _json.loads(m.group(0))
+    except _json.JSONDecodeError:
+        log.warning("hallucination_grade: malformed JSON=%r", m.group(0)[:120])
+        return ("fail_open", 0.0, int((time.monotonic() - started) * 1000))
+
+    verdict = (decision.get("verdict") or "").lower().strip()
+    if verdict not in ("grounded", "partial", "ungrounded"):
+        log.warning("hallucination_grade: unknown verdict=%r", verdict)
+        return ("fail_open", 0.0, int((time.monotonic() - started) * 1000))
+
+    try:
+        confidence = float(decision.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    # Apply the confidence threshold: a "grounded" verdict with low
+    # confidence gets demoted to "partial" so HALLUCINATION_ACTION can
+    # treat low-confidence-grounded the same as partial.
+    if verdict == "grounded" and confidence < HALLUCINATION_CONFIDENCE_THRESHOLD:
+        log.info(
+            "hallucination_grade: low-confidence grounded (%.2f < %.2f), demoting to partial",
+            confidence, HALLUCINATION_CONFIDENCE_THRESHOLD,
+        )
+        verdict = "partial"
+
+    return (verdict, confidence, elapsed_ms)
+
+
+def node_hallucination_check(state: AgentState) -> AgentState:
+    """Grade response groundedness; flag or block per HALLUCINATION_ACTION."""
+    if not HALLUCINATION_CHECK_ENABLED:
+        return {
+            "hallucination_verdict": "skipped",
+            "hallucination_confidence": 0.0,
+            "hallucination_action": "disabled",
+            "hallucination_check_ms": 0,
+        }
+
+    # Skip on cache hit — already-checked content from cache_store.
+    if state.get("cache_hit"):
+        return {
+            "hallucination_verdict": "skipped",
+            "hallucination_confidence": 0.0,
+            "hallucination_action": "passed",
+            "hallucination_check_ms": 0,
+        }
+
+    # Skip if safety blocked — response IS the refusal text, not
+    # subject to grounding check.
+    if state.get("safety_action") in ("blocked_input", "blocked_output"):
+        return {
+            "hallucination_verdict": "skipped",
+            "hallucination_confidence": 0.0,
+            "hallucination_action": "passed",
+            "hallucination_check_ms": 0,
+        }
+
+    chunks = state.get("retrieved_chunks") or []
+    if not chunks:
+        # No retrieval context — model used its own knowledge, no
+        # grounding check applies. Pass through.
+        return {
+            "hallucination_verdict": "skipped",
+            "hallucination_confidence": 0.0,
+            "hallucination_action": "passed",
+            "hallucination_check_ms": 0,
+        }
+
+    response = state.get("response", "") or ""
+    if not response:
+        return {
+            "hallucination_verdict": "skipped",
+            "hallucination_confidence": 0.0,
+            "hallucination_action": "passed",
+            "hallucination_check_ms": 0,
+        }
+
+    verdict, confidence, ms = _hallucination_grade(response, chunks)
+    log.info(
+        "hallucination_check verdict=%s confidence=%.2f ms=%d action_mode=%s",
+        verdict, confidence, ms, HALLUCINATION_ACTION,
+    )
+
+    # fail_open is treated as "passed" — the check failed, but we
+    # don't want a flaky LLM call to disable the feature. Surfaces
+    # in telemetry so operators can audit how often it fires.
+    if verdict in ("grounded", "fail_open"):
+        return {
+            "hallucination_verdict": verdict,
+            "hallucination_confidence": confidence,
+            "hallucination_action": "passed",
+            "hallucination_check_ms": ms,
+        }
+
+    # verdict in ("partial", "ungrounded") — apply HALLUCINATION_ACTION
+    if HALLUCINATION_ACTION == "block":
+        new_response = HALLUCINATION_DISCLAIMER + response
+        return {
+            "hallucination_verdict": verdict,
+            "hallucination_confidence": confidence,
+            "hallucination_action": "blocked",
+            "hallucination_check_ms": ms,
+            "response": new_response,
+        }
+    # default: "flag" — record verdict, leave response alone
+    return {
+        "hallucination_verdict": verdict,
+        "hallucination_confidence": confidence,
+        "hallucination_action": "flagged",
+        "hallucination_check_ms": ms,
+    }
 
 
 # --- Memory + query rewriting (Phase #6) -----------------------------------
@@ -2054,6 +2273,71 @@ CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", str(24 * 3600)))
 CACHE_TIMEOUT_SECONDS = float(os.environ.get("CACHE_TIMEOUT_SECONDS", "5"))
 
 
+# --- Phase #9: runtime hallucination detection ----------------------------
+#
+# After the model produces its draft answer, ask Llama 8B to grade
+# whether the answer is grounded in the retrieved chunks. Three outcomes:
+#
+#   "grounded"    answer's claims appear in (or are reasonable inferences
+#                 from) the retrieved chunks. Pass through unchanged.
+#   "partial"     some claims grounded, others extrapolated. Flag in
+#                 telemetry; behavior depends on HALLUCINATION_ACTION.
+#   "ungrounded"  answer's claims aren't in the retrieved chunks at all
+#                 (model fell back to its training data, or fabricated).
+#                 Action depends on HALLUCINATION_ACTION:
+#                   "flag"  — record verdict, return response unchanged
+#                   "block" — prepend a disclaimer like "I'm not
+#                             confident in this answer because the
+#                             retrieved sources didn't support it."
+#
+# Position: AFTER safety_output (so we don't grade refusal text against
+# retrieved chunks — refusals aren't trying to be grounded), BEFORE
+# cache_store (so we don't cache responses we flagged as ungrounded —
+# would short-circuit future similar requests to the same hallucinated
+# answer).
+#
+# Skip cases:
+#   - HALLUCINATION_CHECK_ENABLED=false
+#   - cache_hit (cached response was checked when stored)
+#   - safety blocked (response IS the refusal text, not subject to
+#     grounding check)
+#   - no retrieved chunks (the model legitimately used its own
+#     knowledge — there's no context to ground against)
+#
+# Cost: one Llama 8B call per request. ~3000-token input (chunks +
+# response), ~50-token output, ~500ms-1s warm. Adds noticeable latency
+# vs the no-check path. Production would consider running the check
+# async (return response now, surface verdict in a follow-up event)
+# but for the lab a synchronous check keeps the API simple.
+
+HALLUCINATION_CHECK_ENABLED = os.environ.get("HALLUCINATION_CHECK_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# "flag" or "block". flag = record verdict, leave response alone. block =
+# prepend a confidence disclaimer to the response on ungrounded verdict.
+HALLUCINATION_ACTION = os.environ.get("HALLUCINATION_ACTION", "flag").lower()
+HALLUCINATION_TIMEOUT_SECONDS = float(
+    os.environ.get("HALLUCINATION_TIMEOUT_SECONDS", "20")
+)
+HALLUCINATION_MAX_TOKENS = int(os.environ.get("HALLUCINATION_MAX_TOKENS", "128"))
+# Confidence threshold below which a "grounded" verdict is treated as
+# "partial." Llama 8B at temp=0 still has variance in its confidence
+# language; thresholding lets operators dial sensitivity. 0.6 = "the
+# model is more confident than not it's grounded."
+HALLUCINATION_CONFIDENCE_THRESHOLD = float(
+    os.environ.get("HALLUCINATION_CONFIDENCE_THRESHOLD", "0.6")
+)
+# Disclaimer text prepended to the response when verdict is ungrounded
+# AND HALLUCINATION_ACTION=block. Phrased as a hedging note rather than
+# a refusal so users still see the model's draft and can judge it.
+HALLUCINATION_DISCLAIMER = os.environ.get(
+    "HALLUCINATION_DISCLAIMER",
+    "[Note: my answer below may not be fully supported by the retrieved sources. Please verify.]\n\n",
+)
+
+
 def _cache_index_key(user: str, session_id: str) -> str:
     return f"cache:{user}:{session_id}:index"
 
@@ -2666,6 +2950,7 @@ def build_graph() -> StateGraph:
     g.add_node("execute", node_execute)
     g.add_node("reflect", node_reflect)
     g.add_node("safety_output", node_safety_output)
+    g.add_node("hallucination_check", node_hallucination_check)
     g.add_node("cache_store", node_cache_store)
     g.add_node("save_memory", node_save_memory)
     g.add_edge(START, "budget_check")
@@ -2699,11 +2984,14 @@ def build_graph() -> StateGraph:
         _route_after_reflect,
         {"retrieve": "retrieve", END: "safety_output"},
     )
-    # safety_output → cache_store → save_memory → END. cache_store
-    # persists the now-safety-checked response for future hits;
-    # save_memory persists the conversation turn. Both short-circuit
-    # on safety-blocked or budget-blocked paths.
-    g.add_edge("safety_output", "cache_store")
+    # safety_output → hallucination_check → cache_store → save_memory → END.
+    # hallucination_check grades whether the response is grounded in
+    # the retrieved chunks; cache_store persists the now-safety-and-
+    # grounding-checked response; save_memory persists the conversation
+    # turn. cache_store skips storing responses flagged as ungrounded
+    # (would short-circuit future similar requests to a hallucination).
+    g.add_edge("safety_output", "hallucination_check")
+    g.add_edge("hallucination_check", "cache_store")
     g.add_edge("cache_store", "save_memory")
     g.add_edge("save_memory", END)
     return g.compile()
@@ -2809,6 +3097,13 @@ class InvokeResponse(BaseModel):
     cache_similarity: float = 0.0
     cache_lookup_ms: int = 0
     cache_store_ms: int = 0
+    # Phase #9: hallucination-detection telemetry. action is the
+    # terminal disposition for the caller; verdict + confidence are
+    # the raw grader output for observability.
+    hallucination_action: str = "disabled"
+    hallucination_verdict: str = "skipped"
+    hallucination_confidence: float = 0.0
+    hallucination_check_ms: int = 0
 
 
 # --- Routes ----------------------------------------------------------------
@@ -2861,6 +3156,10 @@ def _build_invoke_response_dict(
         "cache_similarity": final_state.get("cache_similarity", 0.0),
         "cache_lookup_ms": final_state.get("cache_lookup_ms", 0),
         "cache_store_ms": final_state.get("cache_store_ms", 0),
+        "hallucination_action": final_state.get("hallucination_action", "disabled"),
+        "hallucination_verdict": final_state.get("hallucination_verdict", "skipped"),
+        "hallucination_confidence": final_state.get("hallucination_confidence", 0.0),
+        "hallucination_check_ms": final_state.get("hallucination_check_ms", 0),
     }
 
 
@@ -2993,7 +3292,7 @@ _NODE_NAMES = {
     "budget_check", "safety_input", "cache_lookup",
     "load_memory", "rewrite_query", "classify", "retrieve",
     "ensure_warm", "execute", "reflect", "safety_output",
-    "cache_store", "save_memory",
+    "hallucination_check", "cache_store", "save_memory",
 }
 
 # Per-node selection of which state fields are interesting enough to
@@ -3011,6 +3310,9 @@ _NODE_END_FIELDS = {
     "execute": ["execute_latency_ms", "tool_iterations", "tool_calls_log"],
     "reflect": ["cycles", "needs_more_context"],
     "safety_output": ["safety_output_verdict", "safety_action"],
+    "hallucination_check": [
+        "hallucination_action", "hallucination_verdict", "hallucination_confidence",
+    ],
     "cache_store": [],
     "save_memory": [],
 }
