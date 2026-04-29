@@ -254,6 +254,21 @@ spec:
             - name: HALLUCINATION_CONFIDENCE_THRESHOLD
               value: "0.6"
 
+            # --- Phase #11: PII redaction at output -------------------
+            # Regex-based detection of email, phone_us, ssn,
+            # credit_card, ipv4, aws_access_key in the response.
+            # Matched spans replaced with <redacted_TYPE>. Default
+            # disabled; enable once you've decided on entity scope.
+            #
+            # Narrowing entity types: set PII_REDACT_ENTITY_TYPES to
+            # a comma-separated subset (e.g. "ipv4,aws_access_key" if
+            # natural emails in responses are expected and shouldn't
+            # be masked).
+            - name: PII_REDACT_OUTPUT_ENABLED
+              value: "false"
+            - name: PII_REDACT_ENTITY_TYPES
+              value: email,phone_us,ssn,credit_card,ipv4,aws_access_key
+
             # --- Phase #10: user feedback loop -------------------------
             # /feedback endpoints are unconditionally available — no
             # master switch. They depend on langgraph-redis being up

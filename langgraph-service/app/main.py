@@ -1,7 +1,8 @@
 """langgraph-service — FastAPI front-end for a LangGraph router agent.
 
-Fourteen-node state machine on /invoke (budget + safety bookends + cache
-+ memory + query rewriting + reasoning loop + hallucination check):
+Fifteen-node state machine on /invoke (budget + safety bookends + cache
++ memory + query rewriting + reasoning loop + hallucination check + PII
+redaction):
 
     START -> budget_check -> safety_input -> load_memory -> rewrite_query
                           -> classify -> retrieve -> ensure_warm
@@ -57,6 +58,11 @@ Fourteen-node state machine on /invoke (budget + safety bookends + cache
   only; block = prepend a confidence disclaimer). Skips on cache hit,
   no chunks, safety blocked. No-op when HALLUCINATION_CHECK_ENABLED=
   false.
+- pii_redact_output: regex-based PII detection (email, phone, SSN,
+  credit card, IPv4, AWS access key) over the response, replacing
+  matched spans with <redacted_TYPE>. Telemetry surfaces counts by
+  entity type — never the original values. No-op when
+  PII_REDACT_OUTPUT_ENABLED=false.
 - cache_store: persists the safety-checked response to the prompt
   cache for future similar requests. LRU-evicts to keep cache size
   bounded. Skips on safety-blocked, budget-blocked, or cache-hit
@@ -568,6 +574,17 @@ class AgentState(TypedDict, total=False):
     hallucination_confidence: float
     hallucination_action: Literal["passed", "flagged", "blocked", "disabled"]
     hallucination_check_ms: int
+    # Phase #11: PII redaction telemetry.
+    #   pii_redact_action: terminal disposition — "redacted" |
+    #     "passed" (no PII found) | "skipped" (filter disabled / cache
+    #     hit / safety blocked).
+    #   pii_entities_found: dict mapping entity_type -> count. NEVER
+    #     contains the original PII values themselves — that would
+    #     defeat the redaction by leaking via API.
+    #   pii_redact_ms: per-node latency.
+    pii_redact_action: Literal["redacted", "passed", "skipped"]
+    pii_entities_found: dict
+    pii_redact_ms: int
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -1408,6 +1425,72 @@ def node_hallucination_check(state: AgentState) -> AgentState:
         "hallucination_confidence": confidence,
         "hallucination_action": "flagged",
         "hallucination_check_ms": ms,
+    }
+
+
+# --- PII redaction at output (Phase #11) -----------------------------------
+
+
+def node_pii_redact_output(state: AgentState) -> AgentState:
+    """Scan response for PII and replace with <redacted_TYPE> placeholders."""
+    if not PII_REDACT_OUTPUT_ENABLED:
+        return {
+            "pii_redact_action": "skipped",
+            "pii_entities_found": {},
+            "pii_redact_ms": 0,
+        }
+
+    # Skip on cache hit — already-redacted from cache_store.
+    if state.get("cache_hit"):
+        return {
+            "pii_redact_action": "skipped",
+            "pii_entities_found": {},
+            "pii_redact_ms": 0,
+        }
+
+    # Skip if safety blocked — response is the refusal text, not subject
+    # to redaction (and shouldn't contain PII anyway).
+    if state.get("safety_action") in ("blocked_input", "blocked_output"):
+        return {
+            "pii_redact_action": "skipped",
+            "pii_entities_found": {},
+            "pii_redact_ms": 0,
+        }
+
+    response = state.get("response", "") or ""
+    if not response:
+        return {
+            "pii_redact_action": "skipped",
+            "pii_entities_found": {},
+            "pii_redact_ms": 0,
+        }
+
+    started = time.monotonic()
+    spans = _detect_pii(response)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    if not spans:
+        return {
+            "pii_redact_action": "passed",
+            "pii_entities_found": {},
+            "pii_redact_ms": elapsed_ms,
+        }
+
+    # Count by entity type — NEVER expose the original values.
+    counts: dict[str, int] = {}
+    for entity_type, _, _ in spans:
+        counts[entity_type] = counts.get(entity_type, 0) + 1
+
+    redacted = _redact_pii(response, spans)
+    log.info(
+        "pii_redact_output entities=%s ms=%d",
+        counts, elapsed_ms,
+    )
+    return {
+        "pii_redact_action": "redacted",
+        "pii_entities_found": counts,
+        "pii_redact_ms": elapsed_ms,
+        "response": redacted,
     }
 
 
@@ -2411,6 +2494,127 @@ def _get_langfuse_client():
         return None
 
 
+# --- Phase #11: PII redaction at output ------------------------------------
+#
+# Scan the model's response for common PII patterns and mask them before
+# the response leaves the graph. Catches the failure mode "model
+# regurgitated PII from training data or retrieved chunks" — both are
+# real risks in RAG systems where the corpus might contain customer
+# data, AWS credentials, internal IPs, etc.
+#
+# Position: AFTER hallucination_check (the grader needs the unredacted
+# response to compare claims against chunks; redaction would lose info),
+# BEFORE cache_store (don't cache PII-containing responses) and BEFORE
+# save_memory (don't store PII in conversation history).
+#
+# Detection: regex-based. Six entity types supported in v1:
+#   email, phone_us, ssn, credit_card, ipv4, aws_access_key
+# Lightweight, no new dependency. For higher-fidelity detection
+# (Microsoft Presidio + spaCy NER for names, addresses, organizations),
+# swap in a future Phase #11.5 — same node interface.
+#
+# Replacement: matched spans replaced with <redacted_<TYPE>> in-place
+# (e.g. "email me at <redacted_email>"). Preserves the surrounding
+# sentence structure so the response remains readable.
+#
+# Telemetry: surfaces COUNTS by entity type in InvokeResponse — never
+# the original values (would defeat the redaction by leaking via API).
+#
+# Future work this enables (NOT in this commit):
+#   - Input-side redaction (don't put PII in retrieval queries, cache
+#     keys, or memory). Requires refactoring cache_lookup/save_memory
+#     to use a redacted_prompt field. Larger scope.
+#   - PII-aware policy: if too many PII entities found, refuse to
+#     answer (treat similar to a safety block).
+
+PII_REDACT_OUTPUT_ENABLED = os.environ.get(
+    "PII_REDACT_OUTPUT_ENABLED", "false"
+).lower() in ("1", "true", "yes")
+
+# Entity types to redact, comma-separated. Default = all six. Operators
+# can narrow (e.g. "ipv4,aws_access_key") for a use case where natural
+# PII like emails is expected and shouldn't be masked.
+PII_REDACT_ENTITY_TYPES = set(
+    s.strip().lower()
+    for s in os.environ.get(
+        "PII_REDACT_ENTITY_TYPES",
+        "email,phone_us,ssn,credit_card,ipv4,aws_access_key",
+    ).split(",")
+    if s.strip()
+)
+
+
+# Regex patterns for each entity type. Compiled once at module load
+# for hot-path performance — node_pii_redact_output runs per request,
+# and re-compiling on every call wastes CPU. Patterns are deliberately
+# conservative (favor false negatives over false positives) since
+# over-aggressive redaction of an unrelated string would corrupt
+# legitimate responses.
+import re as _re
+
+_PII_PATTERNS: dict[str, "_re.Pattern"] = {
+    # Standard email format. \b boundaries prevent matching inside
+    # longer alphanumeric runs.
+    "email": _re.compile(
+        r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
+    ),
+    # US-style phone numbers in common formats: 555-555-5555,
+    # (555) 555-5555, +1 555 555 5555, 555.555.5555. Doesn't match
+    # bare 10-digit numbers (too prone to matching ZIP+phone codes
+    # or any 10-digit identifier).
+    "phone_us": _re.compile(
+        r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"
+    ),
+    # US SSN format: ddd-dd-dddd. Excludes 000-, 666-, and 9xx- per
+    # SSA invalid prefix rules to slightly reduce false positives,
+    # but still matches the canonical shape.
+    "ssn": _re.compile(r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"),
+    # Credit card: 13-19 digits with optional dashes/spaces in 4-digit
+    # groups. NO Luhn check in v1 — would catch more cases at small
+    # additional cost. Future enhancement.
+    "credit_card": _re.compile(
+        r"\b(?:\d{4}[-\s]?){3}\d{4}\b|\b\d{13,19}\b"
+    ),
+    # IPv4 dotted quad. Doesn't validate octet ranges (matches
+    # 999.999.999.999) — false positives cost less than missing
+    # internal IPs leaking in responses.
+    "ipv4": _re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    # AWS access key ID. Distinct AKIA/ASIA/AGPA prefix + exactly 16
+    # uppercase alphanumerics. Very specific shape; near-zero false
+    # positive rate. Secret access keys aren't matched (too generic
+    # — high-entropy 40-char base64 strings are too prone to false
+    # positives in normal text).
+    "aws_access_key": _re.compile(r"\b(?:AKIA|ASIA|AGPA|AROA)[0-9A-Z]{16}\b"),
+}
+
+
+def _detect_pii(text: str) -> list[tuple[str, int, int]]:
+    """Find PII spans in text. Returns [(entity_type, start, end), ...]
+    sorted by end-position descending so callers can replace right-to-left
+    without breaking earlier offsets."""
+    if not text:
+        return []
+    spans: list[tuple[str, int, int]] = []
+    for entity_type, pattern in _PII_PATTERNS.items():
+        if entity_type not in PII_REDACT_ENTITY_TYPES:
+            continue
+        for match in pattern.finditer(text):
+            spans.append((entity_type, match.start(), match.end()))
+    # Right-to-left so .replace by offset doesn't shift later spans
+    spans.sort(key=lambda s: s[1], reverse=True)
+    return spans
+
+
+def _redact_pii(text: str, spans: list[tuple[str, int, int]]) -> str:
+    """Replace each span with <redacted_TYPE>. Spans must be in
+    right-to-left order (as returned by _detect_pii) so offsets stay
+    valid as we modify the string."""
+    out = text
+    for entity_type, start, end in spans:
+        out = out[:start] + f"<redacted_{entity_type}>" + out[end:]
+    return out
+
+
 def _cache_index_key(user: str, session_id: str) -> str:
     return f"cache:{user}:{session_id}:index"
 
@@ -3024,6 +3228,7 @@ def build_graph() -> StateGraph:
     g.add_node("reflect", node_reflect)
     g.add_node("safety_output", node_safety_output)
     g.add_node("hallucination_check", node_hallucination_check)
+    g.add_node("pii_redact_output", node_pii_redact_output)
     g.add_node("cache_store", node_cache_store)
     g.add_node("save_memory", node_save_memory)
     g.add_edge(START, "budget_check")
@@ -3057,14 +3262,17 @@ def build_graph() -> StateGraph:
         _route_after_reflect,
         {"retrieve": "retrieve", END: "safety_output"},
     )
-    # safety_output → hallucination_check → cache_store → save_memory → END.
-    # hallucination_check grades whether the response is grounded in
-    # the retrieved chunks; cache_store persists the now-safety-and-
-    # grounding-checked response; save_memory persists the conversation
-    # turn. cache_store skips storing responses flagged as ungrounded
-    # (would short-circuit future similar requests to a hallucination).
+    # safety_output → hallucination_check → pii_redact_output →
+    # cache_store → save_memory → END.
+    #
+    # Order rationale: hallucination_check needs the unredacted
+    # response to compare claims against retrieved chunks (redaction
+    # would lose info). pii_redact_output runs AFTER, then cache_store
+    # and save_memory persist the redacted version — preventing PII
+    # from being cached or memorized.
     g.add_edge("safety_output", "hallucination_check")
-    g.add_edge("hallucination_check", "cache_store")
+    g.add_edge("hallucination_check", "pii_redact_output")
+    g.add_edge("pii_redact_output", "cache_store")
     g.add_edge("cache_store", "save_memory")
     g.add_edge("save_memory", END)
     return g.compile()
@@ -3224,6 +3432,13 @@ class InvokeResponse(BaseModel):
     hallucination_verdict: str = "skipped"
     hallucination_confidence: float = 0.0
     hallucination_check_ms: int = 0
+    # Phase #11: PII redaction telemetry. entities_found is a dict of
+    # entity_type → count (e.g. {"email": 1, "ipv4": 2}). Original
+    # values are NEVER returned — only the counts and types — to
+    # avoid defeating the redaction by leaking via the API response.
+    pii_redact_action: str = "skipped"
+    pii_entities_found: dict = Field(default_factory=dict)
+    pii_redact_ms: int = 0
 
 
 # --- Routes ----------------------------------------------------------------
@@ -3280,6 +3495,9 @@ def _build_invoke_response_dict(
         "hallucination_verdict": final_state.get("hallucination_verdict", "skipped"),
         "hallucination_confidence": final_state.get("hallucination_confidence", 0.0),
         "hallucination_check_ms": final_state.get("hallucination_check_ms", 0),
+        "pii_redact_action": final_state.get("pii_redact_action", "skipped"),
+        "pii_entities_found": final_state.get("pii_entities_found") or {},
+        "pii_redact_ms": final_state.get("pii_redact_ms", 0),
     }
 
 
@@ -3412,7 +3630,8 @@ _NODE_NAMES = {
     "budget_check", "safety_input", "cache_lookup",
     "load_memory", "rewrite_query", "classify", "retrieve",
     "ensure_warm", "execute", "reflect", "safety_output",
-    "hallucination_check", "cache_store", "save_memory",
+    "hallucination_check", "pii_redact_output",
+    "cache_store", "save_memory",
 }
 
 # Per-node selection of which state fields are interesting enough to
@@ -3433,6 +3652,7 @@ _NODE_END_FIELDS = {
     "hallucination_check": [
         "hallucination_action", "hallucination_verdict", "hallucination_confidence",
     ],
+    "pii_redact_output": ["pii_redact_action", "pii_entities_found"],
     "cache_store": [],
     "save_memory": [],
 }
