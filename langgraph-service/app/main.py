@@ -1,14 +1,27 @@
 """langgraph-service — FastAPI front-end for a LangGraph router agent.
 
-Three-node state machine on /invoke:
+Five-node state machine on /invoke (with a graph-level reasoning loop):
 
-    START -> classify -> ensure_warm -> execute -> END
+    START -> classify -> retrieve -> ensure_warm -> execute -> reflect -> END
+                          ^                                     |
+                          |_____________________________________|
+                                  loop (capped at MAX_REASONING_CYCLES)
 
 - classify: always-on Llama 3.1 8B answers a JSON-schema classification
-  prompt categorizing the user's input as `trivial` / `reasoning` / `hard`.
+  prompt categorizing the user's input as `trivial` / `tuned-lora` /
+  `reasoning` / `hard`.
+- retrieve: per-session RAG retrieval against rag-service. On loop
+  re-entry, uses `refined_query` (set by reflect) instead of the
+  original prompt and accumulates chunks (deduped) across cycles.
 - ensure_warm: if the routed-to variant is at replicas=0, scale to 1 and
-  wait for Ready. Iteration 2c content; currently a passthrough.
+  wait for Ready.
 - execute: HTTP POST to the chosen variant's vLLM OpenAI-compat endpoint.
+  For tool-capable tiers, runs an agentic tool-call loop bounded by
+  AGENT_MAX_ITERATIONS (per-execute, distinct from the graph-level cap).
+- reflect: gates whether to loop. Asks the cheap Llama 8B to decide if
+  another retrieval cycle (with a new query) would meaningfully improve
+  the draft answer. If yes AND we haven't hit MAX_REASONING_CYCLES,
+  routes back to retrieve; otherwise terminates.
 
 Every node emits a Langfuse span via the LangChain callback handler. The
 whole flow is also instrumented for OTel so traces appear in Tempo.
@@ -420,6 +433,18 @@ class AgentState(TypedDict, total=False):
     # trace correlation.
     tool_iterations: int
     tool_calls_log: list[str]
+    # Phase T2: graph-level reasoning loop bookkeeping. cycles counts
+    # full retrieve→execute→reflect passes (capped at MAX_REASONING_CYCLES).
+    # refined_query, when set by node_reflect, is consumed by node_retrieve
+    # as the search string for the next pass — replaces the original prompt
+    # for retrieval ONLY (the user's prompt itself stays the question the
+    # final answer addresses). needs_more_context drives the conditional
+    # edge after reflect. reflection_log keeps a per-cycle audit trail
+    # surfaced in the API response for debugging + Langfuse correlation.
+    cycles: int
+    refined_query: Optional[str]
+    needs_more_context: bool
+    reflection_log: list[str]
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -485,13 +510,24 @@ def node_classify(state: AgentState) -> AgentState:
 
 
 def node_retrieve(state: AgentState) -> AgentState:
-    """Phase 4: per-session RAG retrieval.
+    """Phase 4 + T2: per-session RAG retrieval, cycle-aware.
 
     Calls rag-service POST /retrieve with the user's prompt + session_id.
     rag-service embeds via vllm-bge-m3 and queries the `documents`
     Qdrant collection filtered by (session_id AND user-from-JWT). The
     returned chunks land in state and are prepended to the prompt by
     node_execute as RAG context.
+
+    Cycle-aware behavior (T2):
+      - First pass: query = state["prompt"], chunks list starts empty.
+      - Re-entry from reflect node: query = state["refined_query"]
+        (set by node_reflect's decision JSON). New chunks are deduped
+        against the chunks already in state and APPENDED — context
+        accumulates across cycles rather than getting overwritten.
+        Dedupe key is (source, chunk_index): the same Qdrant point
+        returned by two queries should not be re-injected.
+      - refined_query is reset to None on the way out so the NEXT
+        reflect call starts fresh.
 
     Skips when:
       - session_id is None or empty (no chat session — chat-ui upload
@@ -501,23 +537,43 @@ def node_retrieve(state: AgentState) -> AgentState:
     """
     session_id = state.get("session_id")
     if not session_id:
-        return {"retrieved_chunks": [], "retrieve_count": 0, "retrieve_ms": 0}
+        return {
+            "retrieved_chunks": state.get("retrieved_chunks", []) or [],
+            "retrieve_count": state.get("retrieve_count", 0),
+            "retrieve_ms": 0,
+            "refined_query": None,
+        }
 
     auth_token = state.get("auth_token")
     if not auth_token:
         # Should never happen — /invoke handler always sets it when
         # session_id is set. Defensive log + skip rather than 500.
         log.warning("retrieve: session_id set but auth_token missing; skipping")
-        return {"retrieved_chunks": [], "retrieve_count": 0, "retrieve_ms": 0}
+        return {
+            "retrieved_chunks": state.get("retrieved_chunks", []) or [],
+            "retrieve_count": state.get("retrieve_count", 0),
+            "retrieve_ms": 0,
+            "refined_query": None,
+        }
+
+    # T2: prefer the refined query the reflect node emitted on the previous
+    # cycle. On the first pass, refined_query is None and we use the
+    # original prompt. After this consumes it, we reset it to None so the
+    # next reflect call doesn't see stale data.
+    query_for_retrieval = state.get("refined_query") or state["prompt"]
+    existing_chunks = list(state.get("retrieved_chunks") or [])
+    existing_keys = {
+        (c.get("source", ""), c.get("chunk_index", 0)) for c in existing_chunks
+    }
 
     started = time.monotonic()
-    chunks: list[dict] = []
+    new_chunks: list[dict] = []
     try:
         with httpx.Client(timeout=RAG_RETRIEVE_TIMEOUT_SECONDS) as client:
             resp = client.post(
                 f"{RAG_SERVICE_URL}/retrieve",
                 json={
-                    "query": state["prompt"],
+                    "query": query_for_retrieval,
                     "session_id": session_id,
                     "top_k": state.get("top_k", RAG_TOP_K_DEFAULT),
                 },
@@ -525,25 +581,38 @@ def node_retrieve(state: AgentState) -> AgentState:
             )
             resp.raise_for_status()
             body = resp.json()
-            chunks = body.get("chunks", [])
+            fetched = body.get("chunks", []) or []
+            # Dedupe: skip any chunk we already have. Same Qdrant point
+            # would resurface if the refined query is similar to the
+            # original; injecting it twice wastes context budget.
+            for c in fetched:
+                key = (c.get("source", ""), c.get("chunk_index", 0))
+                if key in existing_keys:
+                    continue
+                existing_keys.add(key)
+                new_chunks.append(c)
     except httpx.HTTPError as e:
         # Don't fail the request — RAG is enrichment, not the critical
         # path. Log + return empty so execute proceeds without context.
         log.warning("retrieve failed (continuing without context): %s", e)
 
+    combined = existing_chunks + new_chunks
     elapsed_ms = int((time.monotonic() - started) * 1000)
     log.info(
         "retrieve",
         extra={
             "session_id": session_id,
-            "chunks": len(chunks),
+            "query": query_for_retrieval[:80],
+            "new_chunks": len(new_chunks),
+            "total_chunks": len(combined),
             "retrieve_ms": elapsed_ms,
         },
     )
     return {
-        "retrieved_chunks": chunks,
-        "retrieve_count": len(chunks),
+        "retrieved_chunks": combined,
+        "retrieve_count": len(combined),
         "retrieve_ms": elapsed_ms,
+        "refined_query": None,
     }
 
 
@@ -691,6 +760,19 @@ def _build_rag_prompt(prompt: str, chunks: list[dict]) -> str:
 # final text response). After cap, we force a final-answer call
 # without tools bound.
 AGENT_MAX_ITERATIONS = int(os.environ.get("AGENT_MAX_ITERATIONS", "5"))
+
+# Phase T2: graph-level reasoning loop cap. Distinct from
+# AGENT_MAX_ITERATIONS — that one bounds the per-execute tool-call
+# loop inside ONE LLM exchange. This one bounds the count of full
+# retrieve→execute→reflect cycles. The reflect node reads the draft
+# answer and decides whether a NEW retrieval (with a refined query)
+# would improve things; if so, the graph loops back to retrieve.
+# 3 is enough to model "draft → realize gap → re-retrieve → final"
+# without thrashing. Cap exists to bound worst-case latency + cost.
+MAX_REASONING_CYCLES = int(os.environ.get("MAX_REASONING_CYCLES", "3"))
+REFLECT_MAX_TOKENS = 96
+REFLECT_TEMPERATURE = 0.0
+REFLECT_TIMEOUT_SECONDS = 15
 
 # Bound on http_fetch result size. Larger than 50 KB starts straining
 # the model's 8K context (roughly 32 KB of text at most).
@@ -972,24 +1054,234 @@ def node_execute(state: AgentState) -> AgentState:
     }
 
 
-def build_graph() -> StateGraph:
-    """Compile the four-node graph. Done once at import time, reused.
+# --- Reflection (Phase T2) -------------------------------------------------
+#
+# After node_execute drafts an answer, node_reflect asks the cheap
+# always-on Llama 8B whether running ANOTHER retrieval (with a refined
+# query) would meaningfully improve the answer. If yes, the conditional
+# edge after this node loops back to retrieve → ensure_warm → execute →
+# reflect, capped at MAX_REASONING_CYCLES total cycles.
+#
+# Why a *separate* reflection model call instead of reading the agent's
+# tool-call output? Two reasons:
+#   1. The agent's tool calls inside node_execute happen during a single
+#      LLM exchange — once the agent commits to a final-text answer in
+#      that exchange, it's done. Graph-level reflection lets us SECOND-
+#      GUESS the final answer with a fresh perspective.
+#   2. Some routes (reasoning, hard) don't support tools at all. The
+#      reflect node only fires for tool-capable tiers (gated below) so
+#      DeepSeek-R1 / 70B don't get a free reflection budget they didn't
+#      sign up for.
 
-    Order: classify → retrieve → ensure_warm → execute → END.
-    retrieve sits before ensure_warm so RAG context lookup overlaps
-    with cold-start time on cold paths (bge-m3 is always-warm; the
-    heavy generator is the one that may need to scale up).
+REFLECT_SYSTEM_PROMPT = """You decide whether a draft answer needs more research.
+
+Read the question, the draft answer, and the list of sources already searched. Decide if running ONE MORE document search (with a different query) would meaningfully improve the answer.
+
+Output exactly one line of valid JSON, no prose:
+  {"needs_more": true, "query": "<a NEW search query different from prior ones>"}
+  {"needs_more": false}
+
+Choose `needs_more: true` ONLY when:
+  - the draft answer admits it doesn't know something the user asked
+  - the draft answer references a concept the sources didn't cover
+  - the question has multiple parts and the draft only addressed some
+
+Choose `needs_more: false` when:
+  - the draft answer is already a complete response
+  - more searching wouldn't help (e.g. it's a math/logic answer, or the missing info isn't in any docs)
+
+Output ONLY the JSON. No code fences, no explanation."""
+
+
+def node_reflect(state: AgentState) -> AgentState:
+    """T2: graph-level reasoning loop decision node.
+
+    Increments the cycle counter, then calls Llama 8B to decide whether
+    a follow-up retrieval cycle would help. Output drives the conditional
+    edge (`_route_after_reflect`) — either back to `retrieve` for another
+    pass, or terminate the graph.
+
+    Skips reflection (immediately decides "no") when:
+      - The route doesn't support tools — non-tool tiers don't
+        participate in graph-level reasoning loops.
+      - Cycle cap reached.
+      - No session_id — without a session there's nothing to re-retrieve.
+      - The reflection model returns malformed JSON or the call fails.
+        Fail-safe: assume the answer is complete (don't loop).
+    """
+    cycles = state.get("cycles", 0) + 1
+    reflection_log = list(state.get("reflection_log", []) or [])
+
+    cfg = ROUTE_REGISTRY[state["route"]]
+    if not cfg.get("supports_tools"):
+        reflection_log.append(f"cycle {cycles}: route={state['route']} doesn't support tools, skipping reflection")
+        return {
+            "cycles": cycles,
+            "needs_more_context": False,
+            "reflection_log": reflection_log,
+        }
+
+    if cycles >= MAX_REASONING_CYCLES:
+        reflection_log.append(f"cycle {cycles}: cap reached (MAX_REASONING_CYCLES={MAX_REASONING_CYCLES})")
+        return {
+            "cycles": cycles,
+            "needs_more_context": False,
+            "reflection_log": reflection_log,
+        }
+
+    if not state.get("session_id"):
+        reflection_log.append(f"cycle {cycles}: no session_id, nothing to re-retrieve")
+        return {
+            "cycles": cycles,
+            "needs_more_context": False,
+            "reflection_log": reflection_log,
+        }
+
+    cfg_trivial = ROUTE_REGISTRY["trivial"]
+    client = ChatOpenAI(
+        model=cfg_trivial["model_name"],
+        base_url=cfg_trivial["url"],
+        api_key="not-required",
+        temperature=REFLECT_TEMPERATURE,
+        max_tokens=REFLECT_MAX_TOKENS,
+        timeout=REFLECT_TIMEOUT_SECONDS,
+    )
+
+    chunks = state.get("retrieved_chunks") or []
+    sources_summary = (
+        ", ".join(
+            f"[{i + 1}] {c.get('source', 'unknown')} (chunk {c.get('chunk_index', 0)})"
+            for i, c in enumerate(chunks)
+        )
+        or "none"
+    )
+    # Cap the draft snippet — Llama 8B's context budget for the
+    # reflection step is tight (32 max_tokens output, ~2k input). The
+    # first 1000 chars of the draft is enough to judge completeness.
+    draft = (state.get("response", "") or "")[:1000]
+
+    user_msg = (
+        f"Original question:\n{state['prompt']}\n\n"
+        f"Sources already searched:\n{sources_summary}\n\n"
+        f"Draft answer:\n{draft}"
+    )
+
+    try:
+        resp = client.invoke(
+            [
+                SystemMessage(content=REFLECT_SYSTEM_PROMPT),
+                HumanMessage(content=user_msg),
+            ]
+        )
+        raw = (resp.content or "").strip()
+    except Exception as e:
+        # Fail-safe: don't loop on reflection errors. Better to return
+        # the current draft than 502 the whole request.
+        log.warning("reflect: model call failed (treating as complete): %s", e)
+        reflection_log.append(f"cycle {cycles}: reflect call failed: {e}")
+        return {
+            "cycles": cycles,
+            "needs_more_context": False,
+            "reflection_log": reflection_log,
+        }
+
+    # Parse the first JSON object from the response. Llama 8B sometimes
+    # wraps the JSON in code fences or trailing newlines; the regex
+    # finds the first {...} block regardless.
+    import json as _json
+    import re as _re
+
+    match = _re.search(r"\{[^{}]*\}", raw, _re.DOTALL)
+    if not match:
+        reflection_log.append(f"cycle {cycles}: no JSON in reflect output={raw[:120]!r}")
+        return {
+            "cycles": cycles,
+            "needs_more_context": False,
+            "reflection_log": reflection_log,
+        }
+
+    try:
+        decision = _json.loads(match.group(0))
+    except _json.JSONDecodeError:
+        reflection_log.append(f"cycle {cycles}: malformed JSON={match.group(0)[:120]!r}")
+        return {
+            "cycles": cycles,
+            "needs_more_context": False,
+            "reflection_log": reflection_log,
+        }
+
+    needs = bool(decision.get("needs_more"))
+    refined = (decision.get("query") or "").strip()
+
+    if not needs:
+        reflection_log.append(f"cycle {cycles}: answer complete")
+        return {
+            "cycles": cycles,
+            "needs_more_context": False,
+            "reflection_log": reflection_log,
+        }
+
+    if not refined:
+        # Model said yes but didn't give a query. Treat as no — looping
+        # to retrieve with the original query would just find the same
+        # chunks (which we already have).
+        reflection_log.append(f"cycle {cycles}: needs_more=true but no query supplied; stopping")
+        return {
+            "cycles": cycles,
+            "needs_more_context": False,
+            "reflection_log": reflection_log,
+        }
+
+    reflection_log.append(f"cycle {cycles}: looping back to retrieve, refined_query={refined!r}")
+    log.info("reflect: cycle=%d looping with refined_query=%r", cycles, refined[:80])
+    return {
+        "cycles": cycles,
+        "needs_more_context": True,
+        "refined_query": refined,
+        "reflection_log": reflection_log,
+    }
+
+
+def _route_after_reflect(state: AgentState) -> Literal["retrieve", "__end__"]:
+    """Conditional edge function for the reflect node.
+
+    Returns the name of the next node. LangGraph maps this to the
+    `path_map` arg of add_conditional_edges. The cycle cap check is
+    duplicated here (also enforced inside node_reflect) so a buggy
+    reflect node can never produce an infinite loop — the conditional
+    edge enforces the bound regardless.
+    """
+    if state.get("needs_more_context") and state.get("cycles", 0) < MAX_REASONING_CYCLES:
+        return "retrieve"
+    return END
+
+
+def build_graph() -> StateGraph:
+    """Compile the five-node graph with a graph-level reasoning loop.
+
+    Linear path: START → classify → retrieve → ensure_warm → execute → reflect.
+    Conditional: reflect → retrieve (loop) OR reflect → END.
+
+    The retrieve node is cycle-aware: on first entry, query = prompt;
+    on re-entry from reflect, query = refined_query (set by reflect).
+    Chunks accumulate (deduped) across cycles. Cap is MAX_REASONING_CYCLES.
     """
     g: StateGraph = StateGraph(AgentState)
     g.add_node("classify", node_classify)
     g.add_node("retrieve", node_retrieve)
     g.add_node("ensure_warm", node_ensure_warm)
     g.add_node("execute", node_execute)
+    g.add_node("reflect", node_reflect)
     g.add_edge(START, "classify")
     g.add_edge("classify", "retrieve")
     g.add_edge("retrieve", "ensure_warm")
     g.add_edge("ensure_warm", "execute")
-    g.add_edge("execute", END)
+    g.add_edge("execute", "reflect")
+    g.add_conditional_edges(
+        "reflect",
+        _route_after_reflect,
+        {"retrieve": "retrieve", END: END},
+    )
     return g.compile()
 
 
@@ -1046,6 +1338,15 @@ class InvokeResponse(BaseModel):
     # http_fetch" alongside the response.
     tool_iterations: int = 0
     tool_calls_log: list[str] = []
+    # Phase T2: graph-level reasoning loop telemetry.
+    # reasoning_cycles is the count of full retrieve→execute→reflect
+    # passes the graph completed (1 for non-loop runs, up to
+    # MAX_REASONING_CYCLES for tool-capable tiers that re-retrieved).
+    # reflection_log is one human-readable line per cycle describing
+    # the reflect decision — useful for debugging "why did the agent
+    # loop?" questions and for Langfuse correlation.
+    reasoning_cycles: int = 0
+    reflection_log: list[str] = []
 
 
 # --- Routes ----------------------------------------------------------------
@@ -1134,4 +1435,6 @@ def invoke(
         langfuse_trace_id=trace_id,
         tool_iterations=final_state.get("tool_iterations", 0),
         tool_calls_log=final_state.get("tool_calls_log", []),
+        reasoning_cycles=final_state.get("cycles", 0),
+        reflection_log=final_state.get("reflection_log", []),
     )
