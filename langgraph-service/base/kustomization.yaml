@@ -12,6 +12,10 @@ resources:
   # step. Queries Prometheus for /invoke success rate and pass/fails
   # the canary at the checkpoint.
   - analysistemplate.yaml
+  # Phase #34: background AnalysisTemplate. Runs continuously
+  # throughout the canary lifecycle (not at checkpoints) as a
+  # watchdog for sustained error-rate spikes between gated checks.
+  - analysistemplate-bg.yaml
   - service.yaml
   # Phase #31: stable + canary Services for argo-rollouts Istio
   # trafficRouting. argo-rollouts injects rollouts-pod-template-hash

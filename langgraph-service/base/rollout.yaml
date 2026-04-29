@@ -87,12 +87,28 @@ spec:
               - templateName: langgraph-canary-checks
         # No final setWeight — Argo Rollouts auto-promotes to 100%
         # after the last analysis step passes.
+      # Phase #34: background AnalysisRun. Runs continuously
+      # throughout the canary lifecycle, in parallel with the
+      # step-gated analyses inside `steps:` above. Step-gated
+      # checks "advance to next step?" at each checkpoint;
+      # background watches for explicit failure between
+      # checkpoints. Different template (langgraph-canary-error-
+      # watch-bg) with different semantics — see
+      # analysistemplate-bg.yaml header for the design rationale.
+      analysis:
+        templates:
+          - templateName: langgraph-canary-error-watch-bg
+        # Skip background analysis until step 1 (after the initial
+        # setWeight 10) — there's no canary RS pod to evaluate
+        # before then, so spawning background earlier would just
+        # generate empty-result samples.
+        startingStep: 1
       maxSurge: 1
       maxUnavailable: 0
-      # Abort the rollout immediately on analysis failure. The
-      # AnalysisTemplate's failureLimit (3) gives the metric some
-      # grace; abortScaleDownDelaySeconds ensures the bad
-      # ReplicaSet is torn down promptly.
+      # Abort the rollout immediately on analysis failure (gated OR
+      # background). The AnalysisTemplate's failureLimit gives the
+      # metric some grace; abortScaleDownDelaySeconds ensures the
+      # bad ReplicaSet is torn down promptly.
       abortScaleDownDelaySeconds: 30
   # On rollback, retain history so we can revert to the previous
   # ReplicaSet. 5 is the chart default.

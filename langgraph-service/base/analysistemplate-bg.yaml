@@ -1,0 +1,83 @@
+# Phase #34: Background AnalysisTemplate.
+#
+# Companion to analysistemplate.yaml. Where that one is the step-
+# gated check (runs at canary checkpoints to decide pass/fail before
+# advancing), THIS template runs continuously throughout the canary
+# lifecycle as a watchdog — catches regressions that surface BETWEEN
+# checkpoints (e.g., a memory leak that panics the canary pod 3
+# minutes after setWeight 50, when the next gated analysis is still
+# pending).
+#
+# Pattern: instead of "is success rate good?", this asks "is error
+# rate spiking?". The two are complements:
+#   step-gated (analysistemplate.yaml):
+#       successCondition: success_rate >= 0.95 || empty
+#       semantics: "must prove healthy to advance"
+#       cadence: every 30s × 4 samples at each checkpoint
+#   background (this file):
+#       failureCondition: error_rate > 0.10 (sustained)
+#       semantics: "abort if explicitly bad"
+#       cadence: every 1m, runs continuously
+#
+# The asymmetry is deliberate. Step-gated uses successCondition
+# because the empty-result clause lets sparse traffic windows pass
+# the gate. Background uses failureCondition because we want it
+# silent under sparse traffic (no false-aborts) and only loud when
+# something genuinely breaks. Empty result with failureCondition
+# stays as "no data → no failure" which is the right default for
+# a watchdog.
+#
+# How it's wired into the Rollout:
+# rollout.yaml's strategy.canary.analysis (top-level, NOT inside the
+# steps array) references this template with startingStep: 1, which
+# means the background analysis spawns AFTER step 1 (the first pause
+# after setWeight 10). It runs until rollout completion (no count
+# field) and aborts the rollout immediately on failureCondition
+# match.
+#
+# Tuning the failureCondition threshold:
+#   0.10 (10% error rate) is a reasonable default for the lab. The
+#   step-gated analysis uses 0.05 implicitly (1 - successCondition
+#   threshold of 0.95). So the background is more lenient than the
+#   gate — that's intentional: gates want a clean pass, watchdog
+#   wants a clear fail. Tightening this threshold to 0.05 would
+#   make background and gate identical in stringency, which defeats
+#   their complementary roles.
+
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: langgraph-canary-error-watch-bg
+  labels:
+    app: langgraph-service
+spec:
+  metrics:
+    - name: invoke-error-rate-watch
+      # Slower cadence (1m vs 30s for gated). Background analysis
+      # runs for the lifetime of the canary so we don't need
+      # high-frequency sampling — we just need to catch sustained
+      # bad behavior, not transient spikes.
+      interval: 1m
+      # No `count` field → runs forever (until rollout terminates,
+      # which auto-stops the AnalysisRun). This is the "watchdog"
+      # mode of background analysis.
+      # 2 consecutive failures abort the canary. With interval=1m,
+      # that's ~2 minutes of sustained bad metric values before
+      # action — enough to ride out a single bad sample without
+      # over-reacting.
+      failureLimit: 2
+      # Fail if error rate exceeds 10% sustained. Empty result
+      # (no traffic) is implicitly "no failure" because the len()
+      # clause requires data before evaluating the comparison.
+      failureCondition: len(result) > 0 && result[0] > 0.10
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          # 5xx rate / total rate over 5m window. handler="/invoke"
+          # filter for the same reason as the gated template — we
+          # don't want /healthz/metrics/readyz 200s diluting the
+          # signal.
+          query: |
+            sum(rate(http_requests_total{job="langgraph-service",handler="/invoke",status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total{job="langgraph-service",handler="/invoke"}[5m])), 1e-9)
