@@ -260,6 +260,16 @@ spec:
             - name: FEEDBACK_INDEX_MAX_ENTRIES
               value: "500"
 
+            # Phase #31 smoke marker — forces a pod-template-hash
+            # bump so argo-rollouts spawns a canary ReplicaSet and
+            # exercises the full traffic-shifting + AnalysisRun
+            # path. Datestamp value is intentional: future bumps
+            # of the canary pipeline can just update the date,
+            # creating a new template hash without functional
+            # change. Read by nothing in main.py.
+            - name: CANARY_SMOKE_MARKER
+              value: "2026-04-29"
+
           envFrom:
             - secretRef:
                 name: langgraph-service-langfuse
