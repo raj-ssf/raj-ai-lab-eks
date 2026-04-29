@@ -1,0 +1,298 @@
+# RAGAS golden dataset — RAG pipeline regression gate.
+#
+# Each entry has:
+#   question              — what we POST to /invoke
+#   ground_truth_answer   — the canonical answer we score against
+#   ground_truth_contexts — list of strings the retrieved chunks
+#                           SHOULD overlap with semantically
+#                           (used by context_precision)
+#   source_doc            — content the eval setup phase ingests into
+#                           the eval session BEFORE the question runs.
+#                           Each entry's filename should be unique so
+#                           the deduper key (source, chunk_index) is
+#                           stable across reruns.
+#   tags                  — optional; helps slice metrics by topic in
+#                           the score report
+#
+# Sizing:
+#   Five entries is a deliberate floor — enough variance to catch most
+#   regressions, small enough that one full eval (5 prompts × 3 RAGAS
+#   metrics × judge LLM call) takes <2 minutes wall time on the
+#   in-cluster Llama 8B. Add entries by appending to this file; CI
+#   re-runs against all of them.
+#
+# Updating:
+#   Edits to this file trigger the ragas-eval workflow. The workflow
+#   re-scores the FULL dataset and compares to baselines.json — any
+#   metric drop >RAGAS_REGRESSION_THRESHOLD_PP fails the build. To
+#   adopt a new baseline, run the workflow with workflow_dispatch +
+#   `update_baseline=true`, which writes scores.json over
+#   baselines.json and opens a PR.
+
+session_id: ragas-eval-baseline
+
+entries:
+  - id: pod-identity-vs-irsa
+    question: "What's the difference between EKS Pod Identity and IRSA, and which one does this lab use?"
+    ground_truth_answer: |
+      EKS Pod Identity is the newer mechanism (GA Nov 2023) where EKS exposes a per-pod
+      credential-vending agent on each node; pods authenticate to AWS by reading a
+      projected token from /var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token
+      and exchanging it via the AssumeRoleForPodIdentity API. IRSA (IAM Roles for Service
+      Accounts) is the older mechanism that uses an OIDC IdP federated with the cluster's
+      OIDC provider, with the pod assuming a role via STS AssumeRoleWithWebIdentity. Pod
+      Identity has lower latency (no STS hop), simpler trust policies (no OIDC issuer URL
+      to manage), and supports cross-account access without identity federation. This lab
+      uses Pod Identity exclusively — see EksPodIdentityAssociation resources in the
+      raj-ai-lab-eks-infra Terraform.
+    ground_truth_contexts:
+      - "Pod Identity is the newer EKS mechanism, GA in November 2023"
+      - "IRSA uses OIDC federation and STS AssumeRoleWithWebIdentity"
+      - "this lab uses Pod Identity exclusively for all workload IAM access"
+    source_doc:
+      filename: eks-iam-mechanisms.md
+      content: |
+        # EKS workload IAM mechanisms
+
+        Two ways to grant AWS API access to pods running in EKS.
+
+        ## EKS Pod Identity (newer, recommended)
+
+        Pod Identity is the newer EKS mechanism, GA in November 2023.
+        Each node runs an eks-pod-identity-agent DaemonSet that exposes
+        a credential vending endpoint at 169.254.170.23:80. Pods read
+        a projected token from
+        /var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token
+        and exchange it for AWS creds via the AssumeRoleForPodIdentity API.
+
+        Advantages over IRSA:
+          - Lower latency (no STS hop on every credential refresh)
+          - Simpler trust policies (no OIDC issuer URL to manage)
+          - Cross-account access without identity federation
+
+        Wired up via EksPodIdentityAssociation CFN/Terraform resources
+        binding (cluster, namespace, serviceaccount) -> IAM role.
+
+        ## IRSA (older)
+
+        IRSA uses OIDC federation and STS AssumeRoleWithWebIdentity.
+        The cluster runs an OIDC IdP; the pod's projected token is
+        a JWT signed by that IdP, and AWS validates it against the
+        federated OIDC provider in IAM.
+
+        Trust policy must reference the cluster's OIDC issuer URL,
+        which changes if the cluster is recreated — operationally
+        heavier than Pod Identity.
+
+        ## Which does this lab use?
+
+        This lab uses Pod Identity exclusively for all workload IAM
+        access. There are no IRSA annotations on any ServiceAccount.
+    tags: [iam, eks, infra]
+
+  - id: karpenter-nodepool-purpose
+    question: "Why does this lab define two GPU NodePools, gpu and gpu-experiments?"
+    ground_truth_answer: |
+      The split is to keep production-tier serving workloads (vLLM tiers under steady use)
+      isolated from short-lived experimental jobs (LoRA training, eval Jobs, model staging
+      Jobs). The gpu pool has consolidation policy WhenUnderutilized so it scales aggressively
+      with steady-state load; the gpu-experiments pool has WhenEmpty consolidation so a
+      Job stays on its node until the Job completes, avoiding mid-job evictions. Different
+      taints (workload=production:NoSchedule vs workload=experiments:NoSchedule) prevent
+      cross-pool scheduling.
+    ground_truth_contexts:
+      - "two NodePools split production serving from experimental Jobs"
+      - "WhenUnderutilized consolidation on the production gpu pool"
+      - "WhenEmpty consolidation on gpu-experiments to avoid mid-job eviction"
+    source_doc:
+      filename: karpenter-nodepools.md
+      content: |
+        # Karpenter NodePool topology
+
+        This lab defines two GPU NodePools to separate production serving
+        from experimental Jobs.
+
+        ## gpu (production-tier)
+
+        Used by: vllm-llama-8b, vllm-deepseek-r1-70b, vllm-llama-405b,
+        vllm-bge-m3, vllm-bge-reranker.
+
+        Consolidation policy: WhenUnderutilized. Karpenter scales the
+        pool aggressively as steady-state demand changes — pods
+        consolidate onto fewer nodes when utilization drops below the
+        threshold.
+
+        Taint: workload=production:NoSchedule. Only Pods with a matching
+        toleration land here.
+
+        ## gpu-experiments
+
+        Used by: LoRA training Jobs, lm-eval Jobs, RAGAS eval Jobs,
+        one-shot model-staging Jobs.
+
+        Consolidation policy: WhenEmpty. A Job stays on its node until
+        the Job's pod terminates — avoids mid-Job evictions that would
+        lose 30+ minutes of model load + warmup work.
+
+        Taint: workload=experiments:NoSchedule. Different from the
+        production taint, so a misconfigured serving pod can't
+        accidentally schedule onto an experiments node.
+    tags: [karpenter, gpu, infra]
+
+  - id: vllm-tool-call-parser
+    question: "Why does vllm-llama-8b need the --tool-call-parser llama3_json flag?"
+    ground_truth_answer: |
+      With --enable-auto-tool-choice, vLLM accepts a tools=[...] payload on chat completions
+      and the model can emit tool calls. But the model's raw output is text — it follows
+      Llama 3.1's native chat-template grammar (<|python_tag|>{...}<|eom_id|>). The
+      tool-call-parser flag tells vLLM how to convert that text into a structured tool_calls
+      field on the response. llama3_json is the parser specifically built for Llama 3.1's
+      grammar; without it, the agentic client (LangChain) sees plain text and has nothing
+      to dispatch.
+    ground_truth_contexts:
+      - "tool-call-parser converts the model's text grammar to structured tool_calls"
+      - "Llama 3.1 native tool-call grammar uses <|python_tag|> and <|eom_id|> markers"
+      - "llama3_json is the parser tuned for Llama 3.1's grammar specifically"
+    source_doc:
+      filename: vllm-tool-calling.md
+      content: |
+        # vLLM tool calling
+
+        Two flags work in concert to enable agentic tool use:
+
+        ## --enable-auto-tool-choice
+
+        Tells vLLM to accept a `tools=[...]` array on chat completion
+        requests. The model sees the tool schemas in its prompt
+        (rendered into the chat template) and can decide to emit a
+        tool call.
+
+        ## --tool-call-parser
+
+        The model's raw output is text — it follows the chat
+        template's native tool-call grammar. For Llama 3.1, that
+        grammar uses <|python_tag|>{json}<|eom_id|> markers around
+        a JSON object naming the tool and its arguments.
+
+        The tool-call-parser converts that text into the structured
+        tool_calls field on the response (the OpenAI tool-calling
+        spec shape). Without it, agentic clients like LangChain
+        receive plain text and have no structured tool_calls to
+        dispatch.
+
+        llama3_json is the parser tuned for Llama 3.1's grammar
+        specifically. Other parsers exist for other model families
+        (mistral, hermes-3, etc.) — each handles a different
+        token-level convention.
+    tags: [vllm, agents]
+
+  - id: lora-tool-call-degradation
+    question: "Why is supports_tools set to False for the tuned-lora tier in this lab?"
+    ground_truth_answer: |
+      The Alpaca-trained LoRA was fine-tuned on instruction-response text only. It never
+      saw Llama 3.1's native tool-call grammar (<|python_tag|>{...}<|eom_id|>) during
+      training. After the LoRA merge, the model's distribution shifts toward Alpaca-style
+      JSON-in-text outputs and away from the chat template's tool-call markers. vLLM's
+      llama3_json parser then sees plain JSON text instead of a structured tool call,
+      tool_calls comes back empty, and the agent loop never dispatches. The fix is to
+      route around it: tool-needing prompts go to the trivial tier (base model, same pod,
+      no LoRA merge), and the tuned-lora tier takes the legacy single-shot path.
+    ground_truth_contexts:
+      - "Alpaca dataset has no tool-call examples — LoRA only learns what its training data exercises"
+      - "post-merge the model emits Alpaca-style JSON-in-text instead of native tool-call grammar"
+      - "fix: supports_tools=False on the LoRA tier; tools route to the base model path"
+    source_doc:
+      filename: lora-tool-degradation.md
+      content: |
+        # LoRA fine-tuning + tool-call grammar degradation
+
+        Empirical finding (Phase T smoke, 2026-04-29):
+
+        The Alpaca-trained LoRA produced clean instruction-style answers
+        but BROKE structured tool calling. Specifically, when called via
+        the langgraph-service /invoke endpoint with a question that
+        should trigger search_session_docs, the LoRA-merged model emitted
+        plain JSON in the response text:
+
+            {"name": "search_session_docs", "parameters": {"query": "..."}}
+
+        instead of the structured Llama 3.1 grammar:
+
+            <|python_tag|>{"name": "...", "parameters": {...}}<|eom_id|>
+
+        vLLM's llama3_json tool-call parser only recognizes the latter.
+        The former is just text from the parser's perspective, so
+        tool_calls comes back empty and the agent loop never dispatches.
+
+        Why it happened:
+
+        The Alpaca dataset has no tool-call examples — LoRA only
+        learns what its training data exercises. The LoRA's attention/
+        projection shifts pulled the model away from the chat
+        template's tool-call markers and toward "Alpaca-style JSON
+        embedded in instructional prose."
+
+        Fix in this lab:
+
+        ROUTE_REGISTRY["tuned-lora"]["supports_tools"] = False. The
+        tier still gets selected by the classifier for instruction-
+        style prompts, but node_execute takes the legacy single-shot
+        path. Tool-needing prompts must classify to trivial — same
+        vllm-llama-8b pod, no LoRA merge, native tool grammar intact.
+
+        The general principle: any structured-output capability not
+        present in a LoRA's training data will probabilistically
+        degrade after merge. Mitigation: include tool-call data
+        (e.g. ToolBench) in the next fine-tune.
+    tags: [lora, agents, fine-tuning]
+
+  - id: graph-reasoning-loop-cap
+    question: "What prevents the graph-level reasoning loop in langgraph-service from running forever?"
+    ground_truth_answer: |
+      Two things, layered as defense in depth. The reflect node enforces MAX_REASONING_CYCLES
+      (default 3) by incrementing a counter every pass and short-circuiting when it reaches
+      the cap. The conditional edge function _route_after_reflect re-checks the same cap
+      independently and routes to END regardless of what reflect returns. Even a buggy
+      reflect node that always returns needs_more_context=True can't loop past the cap
+      because the edge function is the last line of defense. The reflect node also fail-
+      safes on every error path (model error, malformed JSON, missing query) by returning
+      needs_more_context=False, so transient failures terminate cleanly.
+    ground_truth_contexts:
+      - "MAX_REASONING_CYCLES caps the number of full retrieve→execute→reflect passes"
+      - "the conditional edge function re-checks the cap independently"
+      - "every reflect error path defaults to needs_more_context=False"
+    source_doc:
+      filename: graph-reasoning-loop.md
+      content: |
+        # Graph-level reasoning loop (Phase T2)
+
+        The langgraph-service /invoke graph has a cycle from the
+        reflect node back to retrieve, capped at MAX_REASONING_CYCLES
+        (default 3 in raj-ai-lab-eks/langgraph-service/app/main.py).
+
+        ## How the cap is enforced
+
+        Defense in depth — the cap is checked in two places:
+
+        1. node_reflect itself: increments a counter on every pass.
+           When cycles >= MAX_REASONING_CYCLES, returns needs_more_context=False
+           and a reflection_log entry "cap reached".
+
+        2. The conditional edge function _route_after_reflect:
+           re-checks state.cycles < MAX_REASONING_CYCLES BEFORE routing
+           back to retrieve. Even if a buggy reflect returned
+           needs_more_context=True past the cap, the edge function
+           routes to END.
+
+        ## Other safeguards
+
+        Every reflect error path defaults to needs_more_context=False:
+          - reflect model call raises (Llama 8B unreachable)
+          - response missing JSON (Llama 8B output malformed)
+          - JSON parses but is malformed (decoder error)
+          - needs_more=true but no `query` field supplied
+
+        All of these stop the loop and let the request return whatever
+        draft is in hand rather than 502'ing. Transient infra issues
+        in reflect should NOT prevent the user from getting an answer.
+    tags: [langgraph, reasoning, safety]

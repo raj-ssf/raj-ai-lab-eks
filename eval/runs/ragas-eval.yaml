@@ -1,0 +1,132 @@
+# K8s Job: RAGAS regression-gate eval against the live RAG pipeline.
+#
+# Apply via:
+#   export RAGAS_EVAL_IMAGE=<account>.dkr.ecr.us-west-2.amazonaws.com/ragas-eval:sha-<short>
+#   envsubst < eval/runs/ragas-eval.yaml | kubectl apply -f -
+#
+# Pre-reqs:
+#   1. The serving stack must be reachable:
+#        - vllm-llama-8b   (judge LLM + langgraph trivial tier)
+#        - vllm-bge-m3     (embeddings + ingestion-service backend)
+#        - rag-service, ingestion-service, langgraph-service
+#      Scale them up before submitting:
+#        kubectl -n llm scale deploy vllm-llama-8b vllm-bge-m3 --replicas=1
+#        kubectl -n llm rollout status deploy/vllm-llama-8b deploy/vllm-bge-m3
+#   2. Secret `ragas-eval-credentials` in the llm namespace with the
+#      Keycloak demo-user password under key KEYCLOAK_PASSWORD:
+#        kubectl -n llm create secret generic ragas-eval-credentials \
+#          --from-literal=KEYCLOAK_PASSWORD="$(cd ~/git/raj-ai-lab-eks-infra && \
+#            tofu output -raw keycloak_demo_user_password)"
+#      Source: keycloak_demo_user_password Terraform output. Rotates
+#      with the random_password resource — re-create the Secret on
+#      rotation. Stored in K8s rather than Vault because this is a
+#      lab eval Job, not a production runtime path.
+#
+# Why a Job (not Deployment): one-shot, runs to completion, exits.
+# `restartPolicy: Never` because retries on transient failure would
+# double-ingest docs (ingest_doc is idempotent server-side, but the
+# /invoke calls would double-charge token budget) — surface failures
+# to the workflow and let the operator decide.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ragas-eval
+  namespace: llm
+  labels:
+    app.kubernetes.io/name: ragas-eval
+    app.kubernetes.io/component: rag-regression-gate
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ragas-eval
+        app.kubernetes.io/component: rag-regression-gate
+    spec:
+      # Reuses the eval-pod ServiceAccount established for the F4
+      # lm-eval Job — it already has S3 write to the eval-results
+      # prefix via Pod Identity. RAGAS doesn't need extra IAM beyond
+      # that.
+      serviceAccountName: eval-pod
+      restartPolicy: Never
+
+      containers:
+        - name: ragas-eval
+          image: ${RAGAS_EVAL_IMAGE}
+          imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
+
+          command: ["python", "/workspace/run_ragas.py"]
+
+          env:
+            # Service URLs — short DNS form is fine because we set the
+            # Job's namespace to llm and the cluster's CoreDNS resolves
+            # cross-namespace via the .svc.cluster.local FQDN form
+            # already baked into the runner defaults. Override here
+            # so a misconfigured cluster fails fast with a clearer
+            # error than "connection refused".
+            - name: LANGGRAPH_URL
+              value: http://langgraph-service.langgraph.svc.cluster.local
+            - name: INGESTION_URL
+              value: http://ingestion-service.ingestion.svc.cluster.local
+            - name: JUDGE_LLM_URL
+              value: http://vllm-llama-8b.llm.svc.cluster.local:8000/v1
+            - name: JUDGE_LLM_MODEL
+              value: llama-3.1-8b
+            - name: EMBEDDINGS_URL
+              value: http://vllm-bge-m3.llm.svc.cluster.local:8000/v1
+            - name: EMBEDDINGS_MODEL
+              value: bge-m3
+
+            # Keycloak — note that KEYCLOAK_TOKEN_URL hits the public
+            # ingress (keycloak.ekstest.com) rather than the internal
+            # Service. This is so the issuer claim on the minted JWT
+            # matches what langgraph-service expects (the public
+            # issuer URL). Internal token-mint would produce a JWT
+            # with iss=http://keycloak.keycloak.svc.cluster.local
+            # which fails JWT validation against the public JWKS.
+            - name: KEYCLOAK_TOKEN_URL
+              value: https://keycloak.ekstest.com/realms/raj-ai-lab-eks/protocol/openid-connect/token
+            - name: KEYCLOAK_CLIENT_ID
+              value: langgraph-service
+            - name: KEYCLOAK_USERNAME
+              value: raj
+
+            # 5pp threshold (0.05) — see run_ragas.py docstring.
+            - name: RAGAS_REGRESSION_THRESHOLD_PP
+              value: "0.05"
+
+            # UPDATE_BASELINE is intentionally absent here — the default
+            # is gating mode. The workflow_dispatch path that ADOPTS new
+            # scores as baseline overrides this with `--update_baseline=true`
+            # passed through as env via the workflow.
+
+          envFrom:
+            # Mounts KEYCLOAK_PASSWORD into the container env. Created
+            # out-of-band per the pre-reqs above.
+            - secretRef:
+                name: ragas-eval-credentials
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+          # Use the empty volume mount as a writable scratch area for
+          # the runner's scores.json output — the image's WORKDIR
+          # `/workspace` is read-only-ish (image layer); writing to a
+          # tmpfs sidecar dir keeps the eval portable to read-only
+          # rootfs hardening if we add it later.
+          volumeMounts:
+            - name: output
+              mountPath: /workspace/output
+
+      volumes:
+        - name: output
+          emptyDir:
+            sizeLimit: 64Mi

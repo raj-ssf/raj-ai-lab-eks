@@ -1,0 +1,102 @@
+name: Build and push ragas-eval
+
+# Builds the RAGAS regression-gate image used by ragas-eval.yml. Sibling
+# of build-push-eval.yml — separate ECR repo so the two evaluation
+# stacks (lm-eval academic benchmarks + RAGAS RAG-pipeline grading) can
+# version independently.
+#
+# One-time infra prerequisites (raj-ai-lab-eks-infra side; do these
+# before this workflow can succeed):
+#   1. ECR repo `ragas-eval` provisioned (see ecr.tf in the infra repo).
+#      Same scan/lifecycle policy as the existing eval repo is fine.
+#   2. The gha_eval IAM role (already in gha-oidc.tf) granted
+#      ecr:PutImage / BatchCheckLayerAvailability / etc. on the new
+#      repo. The existing role policy is repo-name-pattern based,
+#      so adding `ragas-eval` to its allow list is a small Terraform
+#      delta.
+#   3. GHA repo variable RAGAS_EVAL_ECR_REPOSITORY_URL set to the new
+#      repo URL (Settings → Secrets and variables → Actions → Variables).
+#      Format: <account>.dkr.ecr.us-west-2.amazonaws.com/ragas-eval
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "eval/ragas/**"
+      - ".github/workflows/build-push-ragas-eval.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Reuses the existing eval role — it already has push to the
+          # eval-pod-relevant ECR namespaces. Adding `ragas-eval` to
+          # the role's allow list is the only infra change needed.
+          role-to-assume: ${{ vars.EVAL_AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          # context is eval/ragas/ — the Dockerfile only references
+          # files in that subdir (requirements.txt, run_ragas.py,
+          # dataset.yaml, baselines.json), so a tighter context keeps
+          # the build context upload small.
+          context: eval/ragas
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ vars.RAGAS_EVAL_ECR_REPOSITORY_URL }}:latest
+            ${{ vars.RAGAS_EVAL_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        env:
+          IMAGE: ${{ vars.RAGAS_EVAL_ECR_REPOSITORY_URL }}@${{ steps.build.outputs.digest }}
+        run: |
+          echo "Signing $IMAGE"
+          cosign sign --yes "$IMAGE"
+
+      - name: Summary
+        run: |
+          {
+            echo "### ragas-eval image built and pushed"
+            echo ""
+            echo "**Tags:**"
+            echo "- \`${{ vars.RAGAS_EVAL_ECR_REPOSITORY_URL }}:latest\`"
+            echo "- \`${{ vars.RAGAS_EVAL_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}\`"
+            echo ""
+            echo "**Run a regression eval:**"
+            echo "\`\`\`"
+            echo "kubectl -n llm scale deploy vllm-llama-8b vllm-bge-m3 --replicas=1"
+            echo "kubectl -n llm rollout status deploy/vllm-llama-8b deploy/vllm-bge-m3"
+            echo "export RAGAS_EVAL_IMAGE=${{ vars.RAGAS_EVAL_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}"
+            echo "envsubst < eval/runs/ragas-eval.yaml | kubectl apply -f -"
+            echo "kubectl -n llm logs -f job/ragas-eval"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,243 @@
+name: RAGAS regression eval
+
+# RAG-pipeline regression gate. Triggers on PRs and main pushes that
+# touch the services or dataset that the eval covers. Submits the
+# RAGAS K8s Job, waits for completion, posts scores to the PR, and
+# fails if any metric regresses by more than the threshold in
+# eval/runs/ragas-eval.yaml's RAGAS_REGRESSION_THRESHOLD_PP env (5pp).
+#
+# One-time prerequisites (raj-ai-lab-eks-infra):
+#   1. The cluster's API endpoint must be reachable from GitHub-hosted
+#      runners. EKS public-access endpoint with a CIDR allowlist that
+#      includes GHA runner ranges, OR a self-hosted runner inside the
+#      VPC. The lab today runs public-access; if that changes, add a
+#      self-hosted runner and switch `runs-on` accordingly.
+#   2. GHA OIDC role gha_eval (existing) needs eks:DescribeCluster on
+#      the cluster ARN. Existing role policies should already grant
+#      this for the lm-eval lifecycle; verify via `aws iam
+#      get-role-policy` if the workflow's update-kubeconfig step fails.
+#   3. The Secret `ragas-eval-credentials` (KEYCLOAK_PASSWORD) must
+#      exist in the llm namespace before this workflow runs. See
+#      eval/runs/ragas-eval.yaml header for the kubectl create command.
+#   4. Repo variable RAGAS_EVAL_ECR_REPOSITORY_URL set (same as
+#      build-push-ragas-eval.yml requires).
+#   5. Repo variable EKS_CLUSTER_NAME set so the kubeconfig step knows
+#      what to update against.
+
+on:
+  pull_request:
+    paths:
+      - "rag-service/**"
+      - "langgraph-service/**"
+      - "ingestion-service/**"
+      - "eval/ragas/**"
+      - ".github/workflows/ragas-eval.yml"
+  push:
+    branches: [main]
+    paths:
+      - "rag-service/**"
+      - "langgraph-service/**"
+      - "ingestion-service/**"
+      - "eval/ragas/**"
+      - ".github/workflows/ragas-eval.yml"
+  workflow_dispatch:
+    inputs:
+      update_baseline:
+        description: "Adopt current scores as the new baseline (writes baselines.json + opens PR)"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read         # bumped to write only on the update-baseline path via the create-pr action
+  pull-requests: write   # for posting score-comment on PRs
+
+# Concurrency: one eval at a time per ref. Cancels superseded runs so a
+# rapid push doesn't waste GPU minutes on a stale build.
+concurrency:
+  group: ragas-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NAMESPACE: llm
+  JOB_NAME: ragas-eval
+  GPU_DEPLOYMENTS: vllm-llama-8b vllm-bge-m3
+  JOB_WAIT_TIMEOUT: 1500s   # 25 min — covers cold-start GPUs + 5 prompts × judge calls
+
+jobs:
+  ragas-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.EVAL_AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ vars.EKS_CLUSTER_NAME }}" \
+            --region us-west-2
+
+      # Scale GPU-backed services up if they're at 0 replicas.
+      # Idempotent: if a deployment is already at 1+, this is a no-op.
+      # `wait --for=condition=available` blocks until at least one Ready
+      # pod, with the long timeout to cover Karpenter cold provisioning.
+      - name: Scale up GPU services
+        run: |
+          for d in $GPU_DEPLOYMENTS; do
+            kubectl -n "$NAMESPACE" scale deploy/"$d" --replicas=1
+          done
+          for d in $GPU_DEPLOYMENTS; do
+            kubectl -n "$NAMESPACE" rollout status deploy/"$d" --timeout=900s
+          done
+
+      # Image tag selection: PR/push runs use the freshly built sha
+      # tag, but to keep the workflow simple, we use :latest. The
+      # build-push-ragas-eval.yml workflow always pushes :latest on
+      # any merge to main, and the PR build workflow pushes a sha tag
+      # — we could pin precisely by passing through the github.sha as
+      # an image tag, but that would require waiting for the build to
+      # finish first. Pragmatic: use :latest, accept that a PR's eval
+      # might run against the previous main's image (still gates
+      # regressions in the SERVICE code, which is the actual goal).
+      - name: Apply ragas-eval Job
+        env:
+          RAGAS_EVAL_IMAGE: ${{ vars.RAGAS_EVAL_ECR_REPOSITORY_URL }}:latest
+          UPDATE_BASELINE: ${{ inputs.update_baseline == true && 'true' || '' }}
+        run: |
+          # Delete any stale Job from a previous run before applying.
+          # Without this, kubectl apply errors on the immutable spec.
+          kubectl -n "$NAMESPACE" delete job "$JOB_NAME" --ignore-not-found
+
+          # If update_baseline is requested, patch the env into the Job
+          # via a kustomize-style overlay. envsubst then resolves both
+          # ${RAGAS_EVAL_IMAGE} and the optional UPDATE_BASELINE block.
+          envsubst < eval/runs/ragas-eval.yaml | \
+            ( if [ -n "$UPDATE_BASELINE" ]; then
+                # Inject UPDATE_BASELINE=true into the env list. yq
+                # would be cleaner; awk keeps the runner-image dep
+                # surface small.
+                awk '/^          env:/{print; print "            - name: UPDATE_BASELINE"; print "              value: \"true\""; next} {print}'
+              else cat
+              fi ) | \
+            kubectl apply -f -
+
+      - name: Wait for Job completion
+        id: wait
+        run: |
+          # `kubectl wait` returns non-zero on Failed condition AND on
+          # timeout. Capture into a status var so we still tail logs
+          # below regardless of outcome — the failure mode is just as
+          # informative as the success mode for debugging.
+          set +e
+          kubectl -n "$NAMESPACE" wait --for=condition=complete \
+            --timeout=$JOB_WAIT_TIMEOUT job/"$JOB_NAME" &
+          WAIT_OK=$!
+          kubectl -n "$NAMESPACE" wait --for=condition=failed \
+            --timeout=$JOB_WAIT_TIMEOUT job/"$JOB_NAME" && \
+            echo "job_failed=true" >> "$GITHUB_OUTPUT" || true
+          wait $WAIT_OK
+          set -e
+
+      - name: Capture Job logs
+        id: logs
+        run: |
+          # Pull the job's pod name (Job→Pod relation via job-name label).
+          POD=$(kubectl -n "$NAMESPACE" get pod \
+            -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}')
+          echo "pod=$POD" >> "$GITHUB_OUTPUT"
+          kubectl -n "$NAMESPACE" logs "$POD" | tee /tmp/ragas-eval.log
+
+      - name: Extract scores JSON
+        id: scores
+        run: |
+          # Slice the scores block between the markers the runner emits.
+          # awk is robust to the JSON containing braces or newlines.
+          awk '/===RAGAS_SCORES_JSON_BEGIN===/{flag=1; next} /===RAGAS_SCORES_JSON_END===/{flag=0} flag' \
+            /tmp/ragas-eval.log > /tmp/scores.json
+          if [ ! -s /tmp/scores.json ]; then
+            echo "::warning::no scores JSON found in log output — runner likely failed before scoring"
+            echo '{"metrics": {}, "per_entry": {}}' > /tmp/scores.json
+          fi
+          echo "Scores:"
+          cat /tmp/scores.json | python3 -m json.tool || true
+
+      - name: Render PR comment markdown
+        id: comment
+        run: |
+          python3 <<'PY' > /tmp/comment.md
+          import json
+          scores = json.load(open("/tmp/scores.json"))
+          baselines = json.load(open("eval/ragas/baselines.json"))
+          base_metrics = baselines.get("metrics", {})
+          lines = ["## RAGAS regression eval", ""]
+          lines.append("| metric | this run | baseline | Δ | gate |")
+          lines.append("|---|---|---|---|---|")
+          for name, current in scores.get("metrics", {}).items():
+              baseline = base_metrics.get(name)
+              if baseline is None:
+                  lines.append(f"| {name} | {current:.4f} | _none_ | — | skipped |")
+                  continue
+              delta = current - baseline
+              flag = "❌ regression" if delta < -0.05 else "✅ ok"
+              lines.append(f"| {name} | {current:.4f} | {baseline:.4f} | {delta:+.4f} | {flag} |")
+          lines.append("")
+          lines.append(f"_Threshold: regression if any metric drops more than 0.05 (5pp)._")
+          print("\n".join(lines))
+          PY
+          echo "rendered=$(wc -c < /tmp/comment.md) bytes"
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body-file /tmp/comment.md
+
+      # Always scale GPU services back to 0 — same pattern as the
+      # interactive smoke. `if: always()` ensures this runs even when
+      # earlier steps fail; we never want a workflow failure to leave
+      # GPU pods running and burning credit.
+      - name: Scale down GPU services
+        if: always()
+        run: |
+          for d in $GPU_DEPLOYMENTS; do
+            kubectl -n "$NAMESPACE" scale deploy/"$d" --replicas=0 || true
+          done
+
+      # If the runner exit code indicated a regression (the wait step
+      # set job_failed=true), fail the whole workflow now. Done at
+      # the end so the comment + cleanup steps run first.
+      - name: Fail on regression
+        if: steps.wait.outputs.job_failed == 'true'
+        run: |
+          echo "::error::ragas-eval Job reported a regression (or hard failure). See logs above."
+          exit 1
+
+      # workflow_dispatch + update_baseline: the runner has already
+      # written the new baselines.json INSIDE the pod's image, but we
+      # need to land it back in the repo. Read the per-metric block
+      # from scores.json and craft a baselines.json update, then open
+      # a PR for review.
+      - name: Open baseline-update PR
+        if: inputs.update_baseline == true && steps.wait.outputs.job_failed != 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "eval/ragas: refresh baselines from latest run"
+          title: "eval/ragas: refresh baselines"
+          body: |
+            Auto-generated baseline refresh. Triggered by workflow_dispatch
+            with `update_baseline=true`.
+
+            Review the metric deltas before merging — adopting these as the
+            new baseline locks in their values for future regression gating.
+          branch: ragas-eval/refresh-baselines
+          delete-branch: true
+          add-paths: |
+            eval/ragas/baselines.json

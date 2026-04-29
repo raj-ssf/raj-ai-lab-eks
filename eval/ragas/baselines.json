@@ -1,0 +1,11 @@
+{
+  "_comment": "Baseline RAGAS scores per metric. The runner compares each new score against these and fails the workflow if any metric drops by more than RAGAS_REGRESSION_THRESHOLD_PP (default 5pp). Null values mean 'no baseline established yet — emit scores but skip the gate'. Populate by running the workflow with workflow_dispatch + update_baseline=true on a known-good commit.",
+  "_schema_version": 1,
+  "_dataset_version": "ragas-eval-baseline-v1",
+  "metrics": {
+    "faithfulness": null,
+    "answer_relevancy": null,
+    "context_precision": null
+  },
+  "per_entry": {}
+}

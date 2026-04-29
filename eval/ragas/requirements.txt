@@ -1,0 +1,43 @@
+# RAGAS — RAG-pipeline eval framework. 0.2.x is the current line; the
+# API was reshaped in 0.2.0 (metrics moved from ragas.metrics to
+# ragas.metrics module-level fns; LLM/embeddings now wrap via
+# LangchainLLMWrapper / LangchainEmbeddingsWrapper). Pinned to a range
+# until first successful CI run, then exact-pin via pip freeze.
+ragas>=0.2.10,<0.3.0
+
+# RAGAS internally uses datasets + pandas to shape its evaluation
+# inputs. datasets 3.x dropped trust_remote_code support, so anything
+# RAGAS pulls in stays parquet-native. Pinning the major to track
+# RAGAS's own range.
+datasets>=3.0,<4.0
+
+# LangChain OpenAI client — used to point RAGAS's judge LLM and the
+# embedding model at our in-cluster vllm-llama-8b and vllm-bge-m3
+# (both expose the OpenAI-compat /v1 protocol). Pinned to match the
+# range used by langgraph-service so behavior is identical.
+langchain-openai==0.2.14
+langchain-core==0.3.27
+
+# httpx — both for /invoke calls into langgraph-service and Keycloak
+# token minting. Same pin as the rest of the lab so OTel httpx
+# instrumentation behaves identically if added later.
+httpx==0.27.2
+
+# YAML for the golden dataset on disk (eval/ragas/dataset.yaml).
+PyYAML==6.0.2
+
+# boto3 for syncing scores artifact to s3 (mirrors lm-eval pattern).
+# awscli is not needed at the runtime layer — boto3 covers single
+# object PUTs without the bundled CLI baggage.
+boto3>=1.34,<2.0
+
+# Pin transformers because LangChainOpenAIEmbeddings does NOT need it
+# but ragas's own NLI-based metric (faithfulness) imports a tokenizer
+# from transformers for sentence-splitting. Without an explicit pin
+# pip resolves an older version that crashes on newer datasets calls.
+transformers>=4.45.0,<5.0
+
+# pydantic — version range is tight on RAGAS 0.2: it requires
+# pydantic>=2.x and we already use 2.9 elsewhere. Range-pin to give
+# pip room to resolve.
+pydantic>=2.9,<3.0

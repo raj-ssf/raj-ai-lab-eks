@@ -9,7 +9,12 @@ on:
   push:
     branches: [main]
     paths:
-      - "eval/**"
+      # Narrowed when eval/ragas/ was added — that subdir is built by
+      # build-push-ragas-eval.yml and shouldn't trigger an lm-eval
+      # rebuild. Match the lm-eval bits explicitly.
+      - "eval/Dockerfile"
+      - "eval/scripts/**"
+      - "eval/runs/alpaca-vs-base.yaml"
       - ".github/workflows/build-push-eval.yml"
   workflow_dispatch:
 
