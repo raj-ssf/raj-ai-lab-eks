@@ -284,7 +284,12 @@ spec:
             # creating a new template hash without functional
             # change. Read by nothing in main.py.
             - name: CANARY_SMOKE_MARKER
-              value: "2026-04-29"
+              # Bumped 2026-04-29 → 2026-04-29-bg-validate to trigger
+              # a fresh canary that exercises Phase #33 (count=4) and
+              # Phase #34 (background AnalysisRun). Those landed
+              # silently — pod-template only changes on real spec
+              # edits, so they never ran live until this bump.
+              value: "2026-04-29-bg-validate"
 
           envFrom:
             - secretRef:
