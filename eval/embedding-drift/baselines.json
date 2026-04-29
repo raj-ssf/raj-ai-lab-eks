@@ -1,0 +1,8 @@
+{
+  "_comment": "Baseline embeddings for the canary snippet set. Format: {snippet_id: [1024 floats]}. Run with UPDATE_BASELINE=true on a known-good cluster state to populate. Subsequent runs compute current embeddings, compare cosine distance vs baseline per snippet. drift_threshold and per_snippet_threshold are read from env at run time. Empty baselines = first-run mode (writes scores, no gate).",
+  "_schema_version": 1,
+  "_dataset_version": "embedding-drift-2026-04-29",
+  "model_at_baseline": null,
+  "captured_at": null,
+  "embeddings": {}
+}

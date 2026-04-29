@@ -1,0 +1,91 @@
+# Canary text snippets for embedding drift detection.
+#
+# These texts are FROZEN across runs — the same strings get embedded
+# every time the drift Job runs. What CAN change between runs:
+#   - The vllm-bge-m3 model version (image bump)
+#   - GPU driver / CUDA toolkit changes
+#   - vLLM internal changes to embedding extraction
+#   - Numerical instability across hardware migrations
+#
+# Each shift in any of those produces slightly different embeddings
+# for the same text. Small drifts are expected (numerical noise);
+# large drifts mean the embedding-space landscape has shifted enough
+# that pre-existing cached embeddings + Qdrant-stored chunks may be
+# less aligned with new queries — silent retrieval quality regression.
+#
+# Coverage strategy: 15 snippets across diverse semantic regions so
+# drift in any one area doesn't average out. Categories:
+#   tech_infra        Kubernetes / AWS / networking jargon
+#   tech_app          application-layer development
+#   common_knowledge  generic facts a chat user might ask
+#   domain_specific   queries representative of this lab's actual
+#                     RAG workload (Pod Identity, Llama, vLLM)
+#   edge_cases        very short / very long / multilingual /
+#                     code-bearing snippets
+
+snippets:
+  # tech_infra
+  - id: tech-infra-1
+    category: tech_infra
+    text: "How do EKS Pod Identity associations bind Kubernetes service accounts to AWS IAM roles without OIDC federation?"
+
+  - id: tech-infra-2
+    category: tech_infra
+    text: "Karpenter NodePool consolidation policies determine when underutilized nodes are reclaimed."
+
+  - id: tech-infra-3
+    category: tech_infra
+    text: "Istio AuthorizationPolicy with action=ALLOW combined with a mesh-wide deny-all default enforces zero-trust east-west traffic."
+
+  # tech_app
+  - id: tech-app-1
+    category: tech_app
+    text: "FastAPI's StreamingResponse with media_type='text/event-stream' enables Server-Sent Events for token-by-token chat UX."
+
+  - id: tech-app-2
+    category: tech_app
+    text: "Redis SORTED SET with ZREMRANGEBYRANK provides bounded LRU eviction in a single atomic operation."
+
+  - id: tech-app-3
+    category: tech_app
+    text: "LangGraph's astream_events with version=v2 surfaces fine-grained events from runnables nested inside graph nodes."
+
+  # common_knowledge
+  - id: common-1
+    category: common_knowledge
+    text: "The capital of France is Paris."
+
+  - id: common-2
+    category: common_knowledge
+    text: "Photosynthesis converts carbon dioxide and water into glucose and oxygen using light energy."
+
+  - id: common-3
+    category: common_knowledge
+    text: "World War II ended in 1945 with the surrender of Japan following atomic bombings of Hiroshima and Nagasaki."
+
+  # domain_specific (representative of this lab's RAG workload)
+  - id: domain-1
+    category: domain_specific
+    text: "Llama Guard 3 8B classifies conversations against Meta's 14-category hazard taxonomy, returning 'safe' or 'unsafe' with violation codes."
+
+  - id: domain-2
+    category: domain_specific
+    text: "vLLM's --tool-call-parser llama3_json converts Llama 3.1's native chat-template tool grammar into structured tool_calls fields."
+
+  - id: domain-3
+    category: domain_specific
+    text: "RAGAS faithfulness measures whether an answer's claims are supported by the retrieved context using LLM-as-judge."
+
+  # edge_cases
+  - id: edge-short
+    category: edge_cases
+    text: "OK"
+
+  - id: edge-code
+    category: edge_cases
+    text: "def cosine(a, b): return sum(x*y for x,y in zip(a,b)) / (sum(x*x for x in a)**0.5 * sum(y*y for y in b)**0.5)"
+
+  - id: edge-long
+    category: edge_cases
+    text: |
+      The hybrid retrieval pattern combines dense embedding-based search with sparse BM25 lexical matching, using Reciprocal Rank Fusion (RRF) to merge ranked lists. Dense embeddings via bge-m3 capture semantic similarity but can miss exact-keyword matches; sparse BM25 captures rare technical terms (function names, error codes, model names) that a dense model might map to a generic concept embedding. RRF fuses them by summing 1/(k + rank) across lists, robust to the absence of common scale between the two scoring systems. Cross-encoder reranking via bge-reranker-v2-m3 then scores query+candidate pairs jointly, providing the precision boost a bi-encoder cannot match because it sees both inputs simultaneously rather than embedding them independently.

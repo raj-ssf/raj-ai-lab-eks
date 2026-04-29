@@ -1,0 +1,116 @@
+# Embedding drift detection Job — runs the canary set against the live
+# vllm-bge-m3 endpoint and compares to the committed baseline.
+#
+# Apply via:
+#   kubectl create configmap embedding-drift-files \
+#     --from-file=eval/embedding-drift/ \
+#     -n llm \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl apply -f eval/runs/embedding-drift.yaml
+#   kubectl -n llm logs -f job/embedding-drift
+#
+# Pre-reqs:
+#   1. vllm-bge-m3 scaled up (this Job calls /v1/embeddings on it).
+#      Without it, embed_text raises and the Job exits 1.
+#   2. eval-pod ServiceAccount + Pod Identity — already exists from
+#      raj-ai-lab-eks-infra/eval.tf (shared with RAGAS / adversarial).
+#
+# Cadence: operator-applied today. Recommended cadence is weekly OR
+# whenever vllm-bge-m3 image rolls — whichever comes first. Could be
+# automated via a CronJob:
+#
+#   apiVersion: batch/v1
+#   kind: CronJob
+#   spec:
+#     schedule: "0 4 * * 1"  # 4 AM UTC every Monday
+#     jobTemplate: { spec: <template below> }
+#
+# Not wrapping as a CronJob today because (a) bge-m3 is at replicas=0
+# in the lab steady state — a CronJob firing on a scale-zero target
+# would always fail; (b) GPU spend per run is non-trivial (~$0.30 for
+# the cold start) so weekly auto-firing isn't free. Operator-applied
+# is the right default until traffic justifies the dashboard signal.
+#
+# UPDATE_BASELINE mode: when the bge-m3 model is intentionally
+# upgraded, run with UPDATE_BASELINE=true env override:
+#
+#   apiVersion: batch/v1
+#   kind: Job
+#   metadata: { name: embedding-drift-rebaseline }
+#   spec:
+#     template:
+#       spec:
+#         containers:
+#         - env: [{name: UPDATE_BASELINE, value: "true"}, ...]
+#
+# The Job writes new embeddings to the mounted baselines.json. To
+# persist into git, kubectl cp the file out of the pod and commit.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: embedding-drift
+  namespace: llm
+  labels:
+    app.kubernetes.io/name: embedding-drift
+    app.kubernetes.io/component: drift-detection
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: embedding-drift
+        app.kubernetes.io/component: drift-detection
+    spec:
+      serviceAccountName: eval-pod
+      restartPolicy: Never
+
+      volumes:
+        - name: workspace
+          emptyDir: { sizeLimit: 16Mi }
+        - name: eval-files
+          configMap:
+            name: embedding-drift-files
+
+      containers:
+        - name: drift
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
+
+          env:
+            - name: EMBEDDINGS_URL
+              value: http://vllm-bge-m3.llm.svc.cluster.local:8000/v1
+            - name: EMBEDDINGS_MODEL
+              value: bge-m3
+            - name: DATASET_PATH
+              value: /eval/dataset.yaml
+            - name: BASELINES_PATH
+              value: /eval/baselines.json
+            - name: SCORES_OUT_PATH
+              value: /workspace/drift-scores.json
+            - name: DRIFT_PER_SNIPPET_THRESHOLD
+              value: "0.05"
+            - name: DRIFT_MEAN_THRESHOLD
+              value: "0.02"
+            # Set UPDATE_BASELINE=true to capture a new baseline
+            # rather than gate against the existing one. Workflow:
+            # apply with this env on a known-good cluster state →
+            # kubectl cp the result out → commit baselines.json.
+            # - name: UPDATE_BASELINE
+            #   value: "true"
+
+          command: ["/bin/bash", "-euxc"]
+          args:
+            - |
+              pip install --no-cache-dir httpx==0.27.2 pyyaml==6.0.2
+              python /eval/run_drift.py
+
+          resources:
+            requests: { cpu: "200m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+            - { name: eval-files, mountPath: /eval, readOnly: true }
