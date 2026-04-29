@@ -159,6 +159,16 @@ spec:
               value: grpc
             - name: OTEL_EXPORTER_OTLP_INSECURE
               value: "true"
+
+            # Phase #36 smoke marker — forces a pod-template-hash
+            # bump so argo-rollouts spawns a canary RS and exercises
+            # the Phase #35 traffic-shifting + AnalysisRun pipeline
+            # for rag-service. First exercise of the
+            # latency-fraction gate (rag-service-canary-checks) and
+            # 5xx watchdog (rag-service-canary-error-watch-bg).
+            # Datestamp value; future bumps update the date.
+            - name: CANARY_SMOKE_MARKER
+              value: "2026-04-29"
           envFrom:
             - secretRef:
                 name: rag-service-langfuse
