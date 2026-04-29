@@ -48,10 +48,13 @@ spec:
 ---
 # Phase 10 of Gateway API migration: HTTPRoute for both hello
 # hostnames. Single HTTPRoute attaches to TWO listener sections
-# (hello-https + hello2-https) on shared-gateway. Hostnames are
-# hardcoded here (not patched per-env) since this is a test app
-# with stable lab-specific hostnames — same convention as the
-# Ingress above.
+# (hello-https + hello2-https) on shared-gateway.
+#
+# Phase 2 portability refactor (2026-04-29): hostnames are
+# placeholders here; ArgoCD's kustomize.patches in
+# raj-ai-lab-eks-infra/argocd-apps.tf:hello_app substitutes the
+# real var.domain hostnames at sync time. Same pattern as
+# rag-service / chat-ui / langgraph-service / vllm.
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -68,8 +71,8 @@ spec:
       namespace: gateway-system
       sectionName: hello2-https
   hostnames:
-    - hello.ekstest.com
-    - hello2.ekstest.com
+    - hello.example.local   # overlay/argocd patches with real FQDN
+    - hello2.example.local  # overlay/argocd patches with real FQDN
   rules:
     - matches:
         - path:

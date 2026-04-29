@@ -28,6 +28,22 @@ spec:
             - name: http
               containerPort: 8000
           env:
+            # --- Cluster-config helpers (Phase 2 portability refactor) ---
+            # DOMAIN + KEYCLOAK_REALM come from the cluster-config CM
+            # (raj-ai-lab-eks-infra/cluster-config-cm.tf) so changing
+            # var.domain in tfvars updates every public-URL env below
+            # without YAML edits. K8s expands $(VAR) at container start
+            # after all env entries are resolved.
+            - name: DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: domain
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: keycloak_realm
             # --- Where to call langgraph-service from --------------------
             # In-cluster Service URL — direct mesh path. Avoids the
             # public ingress hop. The ISTIO_MUTUAL DestinationRule on
@@ -50,7 +66,7 @@ spec:
             # User clicks the link in their browser, so this has to be
             # the public hostname (not the in-cluster Service).
             - name: LANGFUSE_HOST
-              value: https://langfuse.ekstest.com
+              value: https://langfuse.$(DOMAIN)
 
             # --- Keycloak OIDC (Authorization Code + PKCE) ---------------
             # Chainlit's Keycloak provider auto-detects from the
@@ -69,9 +85,9 @@ spec:
             # up at /auth/oauth/Sign%20in%20with%20Keycloak/login and the
             # browser hit the SPA catch-all instead of a 302 to Keycloak.
             - name: OAUTH_KEYCLOAK_BASE_URL
-              value: https://keycloak.ekstest.com
+              value: https://keycloak.$(DOMAIN)
             - name: OAUTH_KEYCLOAK_REALM
-              value: raj-ai-lab-eks
+              value: $(KEYCLOAK_REALM)
 
             # --- Chainlit listen config ----------------------------------
             # Public URL Chainlit uses to construct OAuth redirect URIs
@@ -79,7 +95,7 @@ spec:
             # valid_redirect_uris entry (chat-ui.tf), which is
             # https://chat.${var.domain}/auth/oauth/keycloak/callback.
             - name: CHAINLIT_URL
-              value: https://chat.ekstest.com
+              value: https://chat.$(DOMAIN)
 
           envFrom:
             # OAUTH_KEYCLOAK_CLIENT_ID, OAUTH_KEYCLOAK_CLIENT_SECRET,

@@ -29,12 +29,27 @@ spec:
             - name: http
               containerPort: 8000
           env:
+            # --- Cluster-config helpers (Phase 2 portability refactor) ---
+            # DOMAIN + KEYCLOAK_REALM come from the cluster-config CM in
+            # this namespace (raj-ai-lab-eks-infra/cluster-config-cm.tf).
+            # Lets us fork to a new account/domain without editing YAML.
+            - name: DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: domain
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: keycloak_realm
             # --- Keycloak OIDC config -------------------------------
             # Issuer URL — must match the realm exactly (incl. https
             # scheme + trailing /realms/<name>). Token `iss` claim is
-            # checked verbatim against this string.
+            # checked verbatim against this string. K8s expands $(VAR)
+            # at container start after all env entries are resolved.
             - name: KEYCLOAK_ISSUER
-              value: https://keycloak.ekstest.com/realms/raj-ai-lab-eks
+              value: https://keycloak.$(DOMAIN)/realms/$(KEYCLOAK_REALM)
             # Audience claim check is disabled in main.py for now (see
             # the comment there); this var is reserved for the eventual
             # azp/aud-based client lock-down.

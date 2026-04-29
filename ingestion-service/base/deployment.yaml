@@ -28,9 +28,22 @@ spec:
             - name: http
               containerPort: 8000
           env:
+            # --- Cluster-config helpers (Phase 2 portability refactor) ---
+            # DOMAIN + KEYCLOAK_REALM come from the cluster-config CM in
+            # this namespace (raj-ai-lab-eks-infra/cluster-config-cm.tf).
+            - name: DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: domain
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: keycloak_realm
             # Auth — same realm as langgraph-service / chat-ui.
             - name: KEYCLOAK_ISSUER
-              value: https://keycloak.ekstest.com/realms/raj-ai-lab-eks
+              value: https://keycloak.$(DOMAIN)/realms/$(KEYCLOAK_REALM)
             - name: KEYCLOAK_AUDIENCE
               value: ingestion-service
 
