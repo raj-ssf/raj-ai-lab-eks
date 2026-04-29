@@ -136,10 +136,20 @@ spec:
               # up where the previous attempt left off. --token reads
               # from $HF_TOKEN; explicit flag chosen over implicit env
               # for log readability.
+              #
+              # --exclude "original/*" skips the legacy PyTorch .pth
+              # checkpoint (consolidated.00.pth, params.json, the
+              # sentencepiece tokenizer.model) which sits alongside the
+              # HF-format safetensors. vLLM serves from the safetensors
+              # + tokenizer.json HF format; the PyTorch-native files
+              # are 16 GB of redundant weight data we don't use. Without
+              # this exclude, the download blows past our 32 GiB
+              # emptyDir budget (HF Hub: "Not enough free disk space").
               echo "Downloading $HF_MODEL ..."
               huggingface-cli download "$HF_MODEL" \
                 --local-dir /workspace/model \
                 --local-dir-use-symlinks False \
+                --exclude "original/*" \
                 --token "$HF_TOKEN"
               echo "Download complete; size:"
               du -sh /workspace/model
