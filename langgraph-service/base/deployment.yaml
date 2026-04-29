@@ -269,6 +269,26 @@ spec:
             - name: PII_REDACT_ENTITY_TYPES
               value: email,phone_us,ssn,credit_card,ipv4,aws_access_key
 
+            # --- Phase #13: plan-and-execute agent pattern -------------
+            # Pre-emptive planning: before tool calls, Llama 8B
+            # produces a numbered list of steps that becomes additional
+            # system context for the agentic execute loop. Per-tier
+            # opt-in via ROUTE_REGISTRY[tier].use_planner — off for
+            # trivial, on for reasoning/hard. Master switch
+            # PLANNER_ENABLED gates everything.
+            #
+            # Default disabled. Adds ~500ms LLM call to each request
+            # on enabled tiers; enable once you're comfortable with
+            # the latency budget impact and want richer agent behavior
+            # on multi-step prompts.
+            - name: PLANNER_ENABLED
+              value: "false"
+            # 5 steps is generous for most multi-step requests.
+            # Bump for tasks that benefit from longer plans (research
+            # workflows, code generation pipelines).
+            - name: PLANNER_MAX_STEPS
+              value: "5"
+
             # --- Phase #10: user feedback loop -------------------------
             # /feedback endpoints are unconditionally available — no
             # master switch. They depend on langgraph-redis being up

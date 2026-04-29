@@ -1,8 +1,8 @@
 """langgraph-service — FastAPI front-end for a LangGraph router agent.
 
-Fifteen-node state machine on /invoke (budget + safety bookends + cache
-+ memory + query rewriting + reasoning loop + hallucination check + PII
-redaction):
+Sixteen-node state machine on /invoke (budget + safety bookends + cache
++ memory + query rewriting + planning + reasoning loop + hallucination
+check + PII redaction):
 
     START -> budget_check -> safety_input -> load_memory -> rewrite_query
                           -> classify -> retrieve -> ensure_warm
@@ -43,6 +43,12 @@ redaction):
   original prompt and accumulates chunks (deduped) across cycles.
 - ensure_warm: if the routed-to variant is at replicas=0, scale to 1 and
   wait for Ready.
+- plan: per-tier opt-in plan-and-execute pattern. Llama 8B produces a
+  numbered list of steps (TOOL/REASON/RESPOND) before execute runs.
+  The plan becomes additional system context for the agentic execute
+  loop — guidance, not a script. Per-tier via
+  ROUTE_REGISTRY[tier].use_planner; off for trivial, on for
+  reasoning/hard. Globally gated by PLANNER_ENABLED.
 - execute: HTTP POST to the chosen variant's vLLM OpenAI-compat endpoint.
   For tool-capable tiers, runs an agentic tool-call loop bounded by
   AGENT_MAX_ITERATIONS (per-execute, distinct from the graph-level cap).
@@ -224,6 +230,13 @@ ROUTE_REGISTRY: dict[str, dict] = {
         # in node_execute — current 70B / DeepSeek deployments don't
         # have the tool-call-parser flag wired up yet.
         "supports_tools": True,
+        # Phase #13: plan-and-execute opt-in. Trivial tier prompts are
+        # typically single-step ("what's 2+2") so planning would add
+        # ~500ms of LLM call latency for marginal benefit. Default off.
+        # Operators wanting to demo plan-and-execute on this tier flip
+        # to True via a deployment.yaml env override (per-tier flags
+        # are in code; the master switch PLANNER_ENABLED gates all).
+        "use_planner": False,
     },
     "tuned-lora": {
         # Reuses the trivial tier's vLLM pod and Deployment — the
@@ -247,6 +260,7 @@ ROUTE_REGISTRY: dict[str, dict] = {
         # fine-tune that includes tool-call data (e.g., on the
         # toolbench dataset).
         "supports_tools": False,
+        "use_planner": False,
     },
     "reasoning": {
         "url": f"{MODEL_REASONING_URL}/v1",
@@ -254,6 +268,10 @@ ROUTE_REGISTRY: dict[str, dict] = {
         "deployment": DEPLOY_REASONING,
         "always_on": False,
         "supports_tools": False,  # DeepSeek-R1 70B's chat-template support TBD
+        # Reasoning tier handles complex multi-step queries — planning
+        # helps most here. On by default at the tier level (still
+        # gated by master PLANNER_ENABLED).
+        "use_planner": True,
     },
     "hard": {
         "url": f"{MODEL_HARD_URL}/v1",
@@ -261,6 +279,8 @@ ROUTE_REGISTRY: dict[str, dict] = {
         "deployment": DEPLOY_HARD,
         "always_on": False,
         "supports_tools": False,  # 70B AWQ tier; tool support TBD
+        # Hard tier serves long-form / complex tasks. Planning helps.
+        "use_planner": True,
     },
 }
 
@@ -585,6 +605,19 @@ class AgentState(TypedDict, total=False):
     pii_redact_action: Literal["redacted", "passed", "skipped"]
     pii_entities_found: dict
     pii_redact_ms: int
+    # Phase #13: planner output.
+    #   plan_text: raw planner LLM output (numbered list of steps,
+    #     human-readable). Empty when planner skipped.
+    #   plan_steps_count: parsed count of steps the planner emitted.
+    #     Bounded by PLANNER_MAX_STEPS in the prompt; runtime parses
+    #     for telemetry, not for control flow.
+    #   planner_action: terminal disposition — "planned" | "skipped"
+    #     | "fail_open" (planner LLM call failed).
+    #   plan_ms: per-node latency.
+    plan_text: str
+    plan_steps_count: int
+    planner_action: Literal["planned", "skipped", "fail_open"]
+    plan_ms: int
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -2124,6 +2157,37 @@ def _build_rag_prompt(prompt: str, chunks: list[dict]) -> str:
 # without tools bound.
 AGENT_MAX_ITERATIONS = int(os.environ.get("AGENT_MAX_ITERATIONS", "5"))
 
+# --- Phase #13: plan-and-execute agent pattern -----------------------------
+#
+# The current agentic loop in node_execute is ReAct-style — model sees a
+# question + tools, decides one tool to call, sees result, decides next
+# tool, iterates. Effective for simple multi-step tasks but degrades on
+# complex tasks where the model loses track of what it's done vs what
+# remains.
+#
+# Plan-and-execute adds an UPFRONT planning step: before any tool calls,
+# the model produces a structured plan (numbered list of steps), then
+# the execute loop is gently steered by that plan via an additional
+# system message. Empirically improves multi-step task completion vs
+# bare ReAct (LangChain blog, 2023; Plan-and-Solve paper).
+#
+# Per-tier opt-in via ROUTE_REGISTRY[<tier>]["use_planner"] — planning
+# helps most on hard/reasoning tiers where the prompt is multi-faceted.
+# trivial-tier prompts ("what's 2+2") shouldn't pay the ~500ms planning
+# overhead.
+#
+# Default disabled globally (PLANNER_ENABLED=false) so this commit lands
+# without changing observable behavior.
+
+PLANNER_ENABLED = os.environ.get("PLANNER_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+PLANNER_MAX_STEPS = int(os.environ.get("PLANNER_MAX_STEPS", "5"))
+PLANNER_MAX_TOKENS = int(os.environ.get("PLANNER_MAX_TOKENS", "256"))
+PLANNER_TIMEOUT_SECONDS = float(os.environ.get("PLANNER_TIMEOUT_SECONDS", "20"))
+
 # Phase T2: graph-level reasoning loop cap. Distinct from
 # AGENT_MAX_ITERATIONS — that one bounds the per-execute tool-call
 # loop inside ONE LLM exchange. This one bounds the count of full
@@ -2818,6 +2882,144 @@ TOOLS = [calculator, get_current_time, http_fetch, search_session_docs]
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 
 
+# --- Planner (Phase #13) ---------------------------------------------------
+
+
+_PLANNER_SYSTEM_PROMPT = """You are a planning agent. Given the user's request, retrieved context, and available tools, produce a SHORT structured plan as a numbered list.
+
+Each step must be one of these forms:
+  N. TOOL <tool_name>: <one-line reason>
+  N. REASON: <one-line thought>
+  N. RESPOND: <one-line description of the final answer>
+
+Rules:
+- Output ONLY the numbered list. No prose, no preamble, no code fences.
+- Maximum {max_steps} steps. Plan must end with a RESPOND step.
+- TOOL steps may only reference tools listed under "Available tools" below.
+- Keep each step to one line — concise, actionable.
+
+Example for "What time is it in Tokyo and what's 2+2?":
+  1. TOOL get_current_time: get current time in Asia/Tokyo
+  2. TOOL calculator: compute 2+2
+  3. RESPOND: combine the two results in a single answer"""
+
+
+def _generate_plan(prompt: str, chunks: list[dict], supports_tools: bool) -> tuple[str, int, int]:
+    """Call Llama 8B to produce a numbered plan.
+
+    Returns (plan_text, step_count, latency_ms). Empty plan_text on
+    failure (caller treats as fail_open).
+    """
+    started = time.monotonic()
+
+    # Available tools advertised to the planner. If the route doesn't
+    # support tools, the planner should produce REASON/RESPOND only.
+    if supports_tools:
+        tool_list = ", ".join(t.name for t in TOOLS)
+        tools_line = f"Available tools: {tool_list}\n"
+    else:
+        tools_line = "Available tools: (none — REASON and RESPOND only)\n"
+
+    # Compact chunk preview — first line of each, capped at 5 chunks.
+    if chunks:
+        preview = "\n".join(
+            f"  [{i+1}] {(c.get('text') or '').splitlines()[0][:120]}"
+            for i, c in enumerate(chunks[:5])
+        )
+        chunks_block = f"Retrieved context preview:\n{preview}\n"
+    else:
+        chunks_block = "Retrieved context: (none)\n"
+
+    user_msg = (
+        f"User request: {prompt}\n\n"
+        f"{tools_line}"
+        f"{chunks_block}\n"
+        f"Plan:"
+    )
+
+    cfg_trivial = ROUTE_REGISTRY["trivial"]
+    client = ChatOpenAI(
+        model=cfg_trivial["model_name"],
+        base_url=cfg_trivial["url"],
+        api_key="not-required",
+        temperature=0.0,
+        max_tokens=PLANNER_MAX_TOKENS,
+        timeout=PLANNER_TIMEOUT_SECONDS,
+    )
+    try:
+        response = client.invoke([
+            SystemMessage(
+                content=_PLANNER_SYSTEM_PROMPT.format(max_steps=PLANNER_MAX_STEPS)
+            ),
+            HumanMessage(content=user_msg),
+        ])
+        text = (response.content or "").strip()
+    except Exception as e:
+        log.warning("planner: LLM call failed: %s, fail-open", e)
+        return ("", 0, int((time.monotonic() - started) * 1000))
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    # Count numbered lines as a rough step count for telemetry.
+    # Strict parsing isn't needed — node_execute uses the raw text
+    # as a system message hint, not as a structured plan.
+    step_count = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and stripped[0].isdigit():
+            step_count += 1
+
+    return (text, step_count, elapsed_ms)
+
+
+def node_plan(state: AgentState) -> AgentState:
+    """Run the planner LLM if enabled for this tier; fail-OPEN."""
+    if not PLANNER_ENABLED:
+        return {
+            "plan_text": "",
+            "plan_steps_count": 0,
+            "planner_action": "skipped",
+            "plan_ms": 0,
+        }
+
+    cfg = ROUTE_REGISTRY[state["route"]]
+    if not cfg.get("use_planner"):
+        return {
+            "plan_text": "",
+            "plan_steps_count": 0,
+            "planner_action": "skipped",
+            "plan_ms": 0,
+        }
+
+    text, count, ms = _generate_plan(
+        state.get("prompt", ""),
+        state.get("retrieved_chunks") or [],
+        bool(cfg.get("supports_tools")),
+    )
+
+    if not text:
+        # Fail-open: no plan produced, but the request still proceeds.
+        # node_execute simply runs without the plan-system-message
+        # injection.
+        return {
+            "plan_text": "",
+            "plan_steps_count": 0,
+            "planner_action": "fail_open",
+            "plan_ms": ms,
+        }
+
+    log.info(
+        "node_plan route=%s steps=%d ms=%d",
+        state.get("route"), count, ms,
+    )
+    return {
+        "plan_text": text,
+        "plan_steps_count": count,
+        "planner_action": "planned",
+        "plan_ms": ms,
+    }
+
+
 def node_execute(state: AgentState) -> AgentState:
     """Run the user's prompt against the routed-to variant.
 
@@ -2854,7 +3056,22 @@ def node_execute(state: AgentState) -> AgentState:
             timeout=EXECUTE_TIMEOUT_SECONDS,
             streaming=True,
         )
-        response = client.invoke([HumanMessage(content=final_prompt)])
+        # Phase #13: prepend the plan as a system message on the
+        # legacy path too. Same guidance pattern as path A. The plan
+        # was generated assuming no tools; node_plan reflects that
+        # by emitting REASON/RESPOND-only steps when supports_tools
+        # is False.
+        legacy_messages: list[BaseMessage] = []
+        plan_text_b = state.get("plan_text") or ""
+        if plan_text_b:
+            legacy_messages.append(SystemMessage(
+                content=(
+                    "Suggested plan for this request (you may deviate "
+                    "if you discover better steps):\n" + plan_text_b
+                )
+            ))
+        legacy_messages.append(HumanMessage(content=final_prompt))
+        response = client.invoke(legacy_messages)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         return {
             "response": response.content or "",
@@ -2898,8 +3115,21 @@ def node_execute(state: AgentState) -> AgentState:
                 "knowledge or the provided context."
             )
         ),
-        HumanMessage(content=final_prompt),
     ]
+    # Phase #13: if a plan was produced (planner_action="planned"),
+    # inject it as an additional system-level hint. The agent loop
+    # still decides each tool call autonomously — the plan is
+    # guidance, not a script. Empirically improves multi-step
+    # completion on complex prompts.
+    plan_text = state.get("plan_text") or ""
+    if plan_text:
+        messages.append(SystemMessage(
+            content=(
+                "Suggested plan for this request (you may deviate if "
+                "you discover better steps):\n" + plan_text
+            )
+        ))
+    messages.append(HumanMessage(content=final_prompt))
 
     # Set contextvars so search_session_docs sees the request's
     # session_id + auth_token. Reset in finally so we don't leak
@@ -3224,6 +3454,7 @@ def build_graph() -> StateGraph:
     g.add_node("classify", node_classify)
     g.add_node("retrieve", node_retrieve)
     g.add_node("ensure_warm", node_ensure_warm)
+    g.add_node("plan", node_plan)
     g.add_node("execute", node_execute)
     g.add_node("reflect", node_reflect)
     g.add_node("safety_output", node_safety_output)
@@ -3255,7 +3486,8 @@ def build_graph() -> StateGraph:
     g.add_edge("rewrite_query", "classify")
     g.add_edge("classify", "retrieve")
     g.add_edge("retrieve", "ensure_warm")
-    g.add_edge("ensure_warm", "execute")
+    g.add_edge("ensure_warm", "plan")
+    g.add_edge("plan", "execute")
     g.add_edge("execute", "reflect")
     g.add_conditional_edges(
         "reflect",
@@ -3439,6 +3671,14 @@ class InvokeResponse(BaseModel):
     pii_redact_action: str = "skipped"
     pii_entities_found: dict = Field(default_factory=dict)
     pii_redact_ms: int = 0
+    # Phase #13: planner output. plan_text is the raw numbered list
+    # the planner produced (empty when planner skipped). chat-ui can
+    # render it as a "Show plan" expandable section so users see
+    # the model's intended approach before tools fire.
+    planner_action: str = "skipped"
+    plan_text: str = ""
+    plan_steps_count: int = 0
+    plan_ms: int = 0
 
 
 # --- Routes ----------------------------------------------------------------
@@ -3498,6 +3738,10 @@ def _build_invoke_response_dict(
         "pii_redact_action": final_state.get("pii_redact_action", "skipped"),
         "pii_entities_found": final_state.get("pii_entities_found") or {},
         "pii_redact_ms": final_state.get("pii_redact_ms", 0),
+        "planner_action": final_state.get("planner_action", "skipped"),
+        "plan_text": final_state.get("plan_text", ""),
+        "plan_steps_count": final_state.get("plan_steps_count", 0),
+        "plan_ms": final_state.get("plan_ms", 0),
     }
 
 
@@ -3629,7 +3873,7 @@ def invoke(
 _NODE_NAMES = {
     "budget_check", "safety_input", "cache_lookup",
     "load_memory", "rewrite_query", "classify", "retrieve",
-    "ensure_warm", "execute", "reflect", "safety_output",
+    "ensure_warm", "plan", "execute", "reflect", "safety_output",
     "hallucination_check", "pii_redact_output",
     "cache_store", "save_memory",
 }
@@ -3646,6 +3890,7 @@ _NODE_END_FIELDS = {
     "classify": ["route", "classifier_raw"],
     "retrieve": ["retrieve_count", "retrieve_ms"],
     "ensure_warm": ["cold_start", "warm_wait_seconds"],
+    "plan": ["planner_action", "plan_steps_count"],
     "execute": ["execute_latency_ms", "tool_iterations", "tool_calls_log"],
     "reflect": ["cycles", "needs_more_context"],
     "safety_output": ["safety_output_verdict", "safety_action"],
