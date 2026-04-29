@@ -157,18 +157,35 @@ spec:
 
               # Upload to S3 with sync (incremental, idempotent on re-run).
               # --no-progress for cleaner CI logs.
+              #
+              # --exclude ".cache/*": HF Hub creates a .cache/huggingface/
+              # directory inside --local-dir to track resumable-download
+              # state (per-file .metadata pointers). aws s3 sync mirrors
+              # the entire dir by default, so without this exclude the
+              # cache cruft ends up in S3, which then propagates to every
+              # vllm-llama-guard-3-8b cold start (the model-sync init
+              # container re-fetches the cruft). vLLM ignores it
+              # functionally but the wasted bytes-and-bandwidth add up.
               echo "Uploading to $S3_DEST ..."
-              aws s3 sync /workspace/model "$S3_DEST" --no-progress
+              aws s3 sync /workspace/model "$S3_DEST" \
+                --no-progress \
+                --exclude ".cache/*"
               echo "Upload complete."
 
-              # Verify the upload landed and matches what we downloaded.
-              # ls compares object counts; mismatched counts means a
-              # partial upload (rare with sync, but worth catching).
-              local_count=$(find /workspace/model -type f | wc -l)
-              s3_count=$(aws s3 ls --recursive "$S3_DEST" | wc -l)
-              echo "local files: $local_count, s3 objects: $s3_count"
-              if [ "$local_count" -ne "$s3_count" ]; then
-                echo "MISMATCH — investigate before scaling up the Llama Guard Deployment"
+              # Verify each local file made it to S3. The check is
+              # one-directional (fail only when S3 has FEWER files than
+              # we expected) — pre-existing leftovers in S3 from a prior
+              # failed staging attempt would otherwise trip a symmetric
+              # equality check as a false positive. Empirically caught
+              # 2026-04-29 when an early run's .cache/.../original/*.metadata
+              # leftovers caused s3_count=local_count+3 and the prior
+              # `-ne` check fired despite the actual upload being complete.
+              # Both counts exclude .cache/ for an apples-to-apples compare.
+              local_count=$(find /workspace/model -type f -not -path '*/.cache/*' | wc -l)
+              s3_count=$(aws s3 ls --recursive "$S3_DEST" | grep -v '/\.cache/' | wc -l)
+              echo "local files: $local_count, s3 objects (excl .cache): $s3_count"
+              if [ "$s3_count" -lt "$local_count" ]; then
+                echo "MISMATCH — S3 has fewer files than local; partial upload, investigate before scaling up the Llama Guard Deployment"
                 exit 1
               fi
               echo "Stage complete. vllm-llama-guard-3-8b can now scale up."
