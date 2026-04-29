@@ -48,3 +48,13 @@ opentelemetry-exporter-otlp-proto-grpc>=1.33.1,<2.0.0
 opentelemetry-instrumentation-fastapi>=0.54b0,<1.0.0
 opentelemetry-instrumentation-httpx>=0.54b0,<1.0.0
 opentelemetry-instrumentation-logging>=0.54b0,<1.0.0
+
+# Tool-calling (Phase T) deps:
+# numexpr: safe arithmetic evaluator for the calculator tool. Parses
+# math expressions via NumPy's expression compiler — never invokes
+# Python's eval(). Bounded to numeric ops which is exactly what we want.
+numexpr==2.10.2
+# pytz: timezone DB for get_current_time. stdlib zoneinfo depends on
+# OS-shipped tzdata which slim images often skip; pytz ships its own DB
+# so the tool works regardless of base image's tzdata presence.
+pytz==2024.2

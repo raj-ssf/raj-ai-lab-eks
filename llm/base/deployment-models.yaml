@@ -150,6 +150,21 @@ spec:
             # Loaded at vLLM cold-start; lives for the pod's lifetime.
             - "--lora-modules"
             - "llama-3.1-8b-alpaca=/adapters/alpaca-lora"
+            # Tool calling (Phase T): expose the OpenAI-style tools=[...]
+            # parameter so callers can give Llama 3.1 8B a tool catalog
+            # and have it return structured tool_calls when it decides to
+            # use one. langgraph-service uses this for the agentic-loop
+            # path (tool registry: calculator, get_current_time,
+            # http_fetch, search_session_docs).
+            #
+            # --tool-call-parser llama3_json matches Llama 3.1's native
+            # tool-call output format (<|python_tag|>{"name":...} or
+            # JSON in the assistant turn). Without this flag vLLM accepts
+            # tools= in the request but doesn't auto-parse the response —
+            # caller would have to scrape JSON from the model's text.
+            - "--enable-auto-tool-choice"
+            - "--tool-call-parser"
+            - "llama3_json"
           ports:
             - { name: http, containerPort: 8000 }
           env:

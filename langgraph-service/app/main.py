@@ -30,7 +30,14 @@ from jose import JWTError, jwt
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langfuse.langchain import CallbackHandler as LangfuseCallback
 from langgraph.graph import END, START, StateGraph
@@ -145,6 +152,15 @@ ROUTE_REGISTRY: dict[str, dict] = {
         "model_name": MODEL_TRIVIAL_NAME,
         "deployment": DEPLOY_TRIVIAL,
         "always_on": True,  # Llama 8B is the always-on tier; never JIT-scaled
+        # Tool calling: vllm-llama-8b is started with
+        # --enable-auto-tool-choice + --tool-call-parser llama3_json
+        # (see llm/base/deployment-models.yaml). The Llama 3.1 chat
+        # template natively encodes tool definitions, so the model
+        # returns structured tool_calls when it decides to use one.
+        # Routes WITHOUT this flag take the legacy single-shot path
+        # in node_execute — current 70B / DeepSeek deployments don't
+        # have the tool-call-parser flag wired up yet.
+        "supports_tools": True,
     },
     "tuned-lora": {
         # Reuses the trivial tier's vLLM pod and Deployment — the
@@ -156,18 +172,24 @@ ROUTE_REGISTRY: dict[str, dict] = {
         "model_name": MODEL_TUNED_LORA_NAME,
         "deployment": DEPLOY_TRIVIAL,
         "always_on": True,
+        # Tools work for the LoRA-merged model too — the adapter
+        # modifies attention/projection weights but keeps the chat
+        # template's tool-call grammar intact.
+        "supports_tools": True,
     },
     "reasoning": {
         "url": f"{MODEL_REASONING_URL}/v1",
         "model_name": MODEL_REASONING_NAME,
         "deployment": DEPLOY_REASONING,
         "always_on": False,
+        "supports_tools": False,  # DeepSeek-R1 70B's chat-template support TBD
     },
     "hard": {
         "url": f"{MODEL_HARD_URL}/v1",
         "model_name": MODEL_HARD_NAME,
         "deployment": DEPLOY_HARD,
         "always_on": False,
+        "supports_tools": False,  # 70B AWQ tier; tool support TBD
     },
 }
 
@@ -382,6 +404,14 @@ class AgentState(TypedDict, total=False):
     # Set by execute
     response: str
     execute_latency_ms: int
+    # Tool calling (Phase T) — populated by node_execute when the
+    # routed-to model supports tools and the agent loop fires off
+    # tool calls. tool_iterations counts loop passes (capped at
+    # AGENT_MAX_ITERATIONS); tool_calls_log is the ordered list of
+    # tools the agent invoked, useful for chat-ui display + Langfuse
+    # trace correlation.
+    tool_iterations: int
+    tool_calls_log: list[str]
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -625,26 +655,313 @@ def _build_rag_prompt(prompt: str, chunks: list[dict]) -> str:
     )
 
 
+# --- Tools (Phase T) --------------------------------------------------------
+#
+# The agent loop binds these tools to ChatOpenAI via .bind_tools(). When
+# vLLM (started with --enable-auto-tool-choice + --tool-call-parser
+# llama3_json) decides to call one, the response carries structured
+# tool_calls; node_execute_agent dispatches each to the local handler,
+# appends a ToolMessage with the result, and loops back into the model.
+#
+# Why these four tools (and not more):
+#   - calculator: single-shot arithmetic, the canonical "I can do math"
+#     demo. numexpr keeps it safe (no eval()).
+#   - get_current_time: trivial-but-useful, makes time-aware questions
+#     work without retraining the model on current dates.
+#   - http_fetch: opens up "what's on this page" questions. Bounded
+#     to https + 50 KB to keep the agent from being a side-channel.
+#   - search_session_docs: lets the AGENT decide when to RAG-retrieve
+#     mid-conversation, vs. the always-pre-retrieve current behavior.
+#     Calls rag-service /retrieve with the user's bearer token.
+#
+# Adding a tool: define a @tool function, append to TOOLS list. The
+# bind_tools() in node_execute_agent picks them up at every call.
+
+# Cap on agent loop iterations. 5 is generous — the user's question
+# rarely needs more than 2-3 tool calls; 5 is a safety net against
+# runaway loops (model keeps calling tools and never producing a
+# final text response). After cap, we force a final-answer call
+# without tools bound.
+AGENT_MAX_ITERATIONS = int(os.environ.get("AGENT_MAX_ITERATIONS", "5"))
+
+# Bound on http_fetch result size. Larger than 50 KB starts straining
+# the model's 8K context (roughly 32 KB of text at most).
+HTTP_FETCH_MAX_BYTES = 50 * 1024
+
+# Allowed URL schemes for http_fetch. https only — http would be a
+# trivial credential exfil channel through the agent. file:// would
+# read pod local files. Hard-allowlist.
+HTTP_FETCH_ALLOWED_SCHEMES = {"https"}
+
+
+@tool
+def calculator(expression: str) -> str:
+    """Evaluate a mathematical expression. Use for arithmetic, not for
+    word problems — the input must be a pure math expression like
+    `2+2*3` or `sqrt(144)/12`. Returns the numeric result as a string.
+    Supports +, -, *, /, **, sqrt, sin, cos, log, etc."""
+    import numexpr
+    try:
+        # numexpr.evaluate parses and runs via NumPy without invoking
+        # Python eval(). Operators + numeric functions only — no
+        # attribute access, no imports.
+        result = numexpr.evaluate(expression).item()
+        return str(result)
+    except Exception as e:
+        return f"calculator error: {e}"
+
+
+@tool
+def get_current_time(timezone: str = "UTC") -> str:
+    """Return the current date and time in the given timezone. timezone
+    must be an IANA name like 'America/Los_Angeles', 'Europe/London',
+    'Asia/Tokyo', or 'UTC' (default). Returns ISO-8601 format."""
+    import pytz
+    from datetime import datetime
+    try:
+        tz = pytz.timezone(timezone)
+        now = datetime.now(tz)
+        return now.isoformat()
+    except pytz.UnknownTimeZoneError:
+        return f"unknown timezone '{timezone}'; use IANA names like 'America/Los_Angeles'"
+
+
+@tool
+def http_fetch(url: str) -> str:
+    """Fetch a URL and return the response body (truncated to 50 KB).
+    Only https URLs are allowed. Use for retrieving content from a
+    specific page when the user asks about it. Returns the response
+    text, or an error message if the fetch fails."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in HTTP_FETCH_ALLOWED_SCHEMES:
+        return f"error: only {HTTP_FETCH_ALLOWED_SCHEMES} URLs allowed; got '{parsed.scheme}'"
+    try:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as c:
+            resp = c.get(url)
+            resp.raise_for_status()
+        body = resp.text[:HTTP_FETCH_MAX_BYTES]
+        if len(resp.text) > HTTP_FETCH_MAX_BYTES:
+            body += f"\n\n[truncated to {HTTP_FETCH_MAX_BYTES} bytes; original was {len(resp.text)}]"
+        return body
+    except httpx.HTTPError as e:
+        return f"fetch error: {e}"
+
+
+@tool
+def search_session_docs(query: str) -> str:
+    """Search the user's uploaded documents for chunks matching the
+    query. Use this when the user references documents they uploaded
+    earlier in this chat session, OR when the answer might be in
+    their docs. Returns up to 5 matching chunks with their sources.
+    Each chunk is numbered [1], [2], etc. — cite them in your answer.
+
+    NOTE: requires session_id and bearer token in the agent's context;
+    these are injected by the LangGraph runner — DO NOT pass them as
+    arguments."""
+    # The actual implementation pulls session_id + auth_token from a
+    # contextvar set by node_execute_agent before invoke(). Tools
+    # called by LangChain don't see graph state directly — contextvars
+    # are the standard pattern for "ambient" args.
+    session_id = _AGENT_SESSION_ID.get(None)
+    auth_token = _AGENT_AUTH_TOKEN.get(None)
+    if not session_id or not auth_token:
+        return "search unavailable: no session_id or auth in context"
+    try:
+        with httpx.Client(timeout=RAG_RETRIEVE_TIMEOUT_SECONDS) as c:
+            resp = c.post(
+                f"{RAG_SERVICE_URL}/retrieve",
+                json={"query": query, "session_id": session_id, "top_k": 5},
+                headers={"Authorization": f"Bearer {auth_token}"},
+            )
+            resp.raise_for_status()
+        body = resp.json()
+        chunks = body.get("chunks", [])
+        if not chunks:
+            return "no matching chunks in this session"
+        return "\n\n".join(
+            f"[{i + 1}] (source: {c.get('source', 'unknown')}) {c.get('text', '')[:500]}"
+            for i, c in enumerate(chunks)
+        )
+    except httpx.HTTPError as e:
+        return f"search error: {e}"
+
+
+# Contextvars carry the per-request session_id + auth_token into
+# search_session_docs without LangChain's tool decorator seeing them
+# as model-visible arguments.
+import contextvars
+_AGENT_SESSION_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_AGENT_SESSION_ID", default=None
+)
+_AGENT_AUTH_TOKEN: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_AGENT_AUTH_TOKEN", default=None
+)
+
+TOOLS = [calculator, get_current_time, http_fetch, search_session_docs]
+TOOLS_BY_NAME = {t.name: t for t in TOOLS}
+
+
 def node_execute(state: AgentState) -> AgentState:
     """Run the user's prompt against the routed-to variant.
 
-    Phase 4: if retrieve produced chunks, prepend them as RAG context
-    to the prompt before calling vLLM. Falls back to the raw prompt when
-    no chunks (no session, no upload, retrieve failure).
+    Two paths:
+      A. Tool-capable route (supports_tools=True): agentic loop —
+         bind tools, call vLLM, dispatch any tool_calls returned,
+         append ToolMessages, loop back. Cap at AGENT_MAX_ITERATIONS.
+      B. Plain route: legacy single-shot ChatOpenAI.invoke (no tools
+         bound). Used for tiers whose vLLM Deployment doesn't have
+         --enable-auto-tool-choice (currently 70B + DeepSeek).
+
+    RAG context (Phase 4 chunks from node_retrieve) is prepended to
+    the user prompt either way — tool-capable agents can ALSO call
+    search_session_docs mid-conversation if they want fresh chunks
+    for a follow-up question.
     """
     cfg = ROUTE_REGISTRY[state["route"]]
+    final_prompt = _build_rag_prompt(state["prompt"], state.get("retrieved_chunks", []))
+    started = time.monotonic()
+
+    if not cfg.get("supports_tools"):
+        # Path B — legacy single-shot. Same code as before tool calling
+        # was added; preserves behavior for 70B/DeepSeek tiers.
+        client = ChatOpenAI(
+            model=cfg["model_name"],
+            base_url=cfg["url"],
+            api_key="not-required",
+            max_tokens=state.get("max_tokens", 512),
+            timeout=EXECUTE_TIMEOUT_SECONDS,
+        )
+        response = client.invoke([HumanMessage(content=final_prompt)])
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return {
+            "response": response.content or "",
+            "execute_latency_ms": elapsed_ms,
+            "tool_iterations": 0,
+            "tool_calls_log": [],
+        }
+
+    # Path A — agentic loop with tool calling.
+    # Bind tools so vLLM gets a tools=[...] payload on every request;
+    # Llama 3.1 + llama3_json parser converts the model's tool-call
+    # output into structured response.tool_calls. The bound client is
+    # the SAME ChatOpenAI but with .bind_tools() applied — LangChain
+    # plumbs the schema into the request.
     client = ChatOpenAI(
         model=cfg["model_name"],
         base_url=cfg["url"],
         api_key="not-required",
         max_tokens=state.get("max_tokens", 512),
         timeout=EXECUTE_TIMEOUT_SECONDS,
-    )
-    final_prompt = _build_rag_prompt(state["prompt"], state.get("retrieved_chunks", []))
-    started = time.monotonic()
-    response = client.invoke([HumanMessage(content=final_prompt)])
+    ).bind_tools(TOOLS)
+
+    # System prompt — sets the agent persona + reminds the model that
+    # tools are available. Without this, Llama 3.1 8B sometimes
+    # ignores the tools= field and answers from the chat-template
+    # default of "be a helpful assistant".
+    messages: list[BaseMessage] = [
+        SystemMessage(
+            content=(
+                "You are a helpful assistant with access to tools. Use them when "
+                "they help: calculator for arithmetic, get_current_time for "
+                "time-aware questions, http_fetch when the user references a URL, "
+                "and search_session_docs when the user references documents they "
+                "uploaded earlier. Otherwise, answer directly from your own "
+                "knowledge or the provided context."
+            )
+        ),
+        HumanMessage(content=final_prompt),
+    ]
+
+    # Set contextvars so search_session_docs sees the request's
+    # session_id + auth_token. Reset in finally so we don't leak
+    # one request's token into another request's context.
+    sid_token = _AGENT_SESSION_ID.set(state.get("session_id"))
+    auth_token_token = _AGENT_AUTH_TOKEN.set(state.get("auth_token"))
+
+    tool_calls_log: list[str] = []
+    iterations = 0
+    final_response = ""
+    try:
+        for iterations in range(1, AGENT_MAX_ITERATIONS + 1):
+            response = client.invoke(messages)
+            messages.append(response)
+
+            tool_calls = getattr(response, "tool_calls", None) or []
+            if not tool_calls:
+                # Model produced a plain-text answer — we're done.
+                final_response = response.content or ""
+                break
+
+            log.info(
+                "agent_iter=%d tool_calls=%s",
+                iterations,
+                [tc.get("name") for tc in tool_calls],
+            )
+
+            # Dispatch each tool call. ToolMessage carries the result
+            # back into the next loop pass; tool_call_id ties the
+            # result to the corresponding model-emitted call (the
+            # OpenAI-tools spec requires this matching).
+            for tc in tool_calls:
+                name = tc.get("name", "")
+                args = tc.get("args", {}) or {}
+                tool_calls_log.append(name)
+                t = TOOLS_BY_NAME.get(name)
+                if t is None:
+                    result = f"unknown tool '{name}'"
+                else:
+                    try:
+                        result = t.invoke(args)
+                    except Exception as e:
+                        # Surface tool errors to the model rather than
+                        # failing the whole graph — the model can decide
+                        # to retry, fall back, or apologize gracefully.
+                        result = f"tool {name} failed: {e}"
+                messages.append(
+                    ToolMessage(
+                        content=str(result),
+                        tool_call_id=tc.get("id", ""),
+                    )
+                )
+        else:
+            # Loop hit AGENT_MAX_ITERATIONS without a final-text answer.
+            # Force one more invoke without tools bound — the model has
+            # to commit to a text response now.
+            log.warning(
+                "agent loop hit max iterations (%d); forcing final answer",
+                AGENT_MAX_ITERATIONS,
+            )
+            no_tools_client = ChatOpenAI(
+                model=cfg["model_name"],
+                base_url=cfg["url"],
+                api_key="not-required",
+                max_tokens=state.get("max_tokens", 512),
+                timeout=EXECUTE_TIMEOUT_SECONDS,
+            )
+            final = no_tools_client.invoke(
+                messages
+                + [
+                    HumanMessage(
+                        content=(
+                            "Stop calling tools and give the final answer to the "
+                            "original question using everything you've learned so far."
+                        )
+                    )
+                ]
+            )
+            final_response = final.content or ""
+    finally:
+        _AGENT_SESSION_ID.reset(sid_token)
+        _AGENT_AUTH_TOKEN.reset(auth_token_token)
+
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    return {"response": response.content or "", "execute_latency_ms": elapsed_ms}
+    return {
+        "response": final_response,
+        "execute_latency_ms": elapsed_ms,
+        "tool_iterations": iterations,
+        "tool_calls_log": tool_calls_log,
+    }
 
 
 def build_graph() -> StateGraph:
@@ -714,6 +1031,13 @@ class InvokeResponse(BaseModel):
     # because the langfuse callback is None when public/secret keys
     # aren't configured (lab environments without trace export).
     langfuse_trace_id: Optional[str] = None
+    # Phase T: agentic loop telemetry. tool_iterations==0 means the
+    # routed-to model answered without any tool calls (or the tier
+    # doesn't support tools). tool_calls_log lists tool names in
+    # call order — chat-ui can render "Tools used: calculator,
+    # http_fetch" alongside the response.
+    tool_iterations: int = 0
+    tool_calls_log: list[str] = []
 
 
 # --- Routes ----------------------------------------------------------------
@@ -800,4 +1124,6 @@ def invoke(
             RetrievedChunkOut(**c) for c in final_state.get("retrieved_chunks", [])
         ],
         langfuse_trace_id=trace_id,
+        tool_iterations=final_state.get("tool_iterations", 0),
+        tool_calls_log=final_state.get("tool_calls_log", []),
     )
