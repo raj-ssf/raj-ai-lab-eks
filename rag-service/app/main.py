@@ -89,6 +89,23 @@ DOCS_COLLECTION = os.environ.get("DOCS_COLLECTION", "documents")
 RETRIEVE_DEFAULT_TOP_K = int(os.environ.get("RETRIEVE_DEFAULT_TOP_K", "5"))
 EMBEDDING_TIMEOUT_SECONDS = float(os.environ.get("EMBEDDING_TIMEOUT_SECONDS", "60"))
 
+# RAG completeness — reranker config.
+# After Qdrant returns the dense top-N candidates, we rerank them
+# with a cross-encoder (bge-reranker-v2-m3 served by TEI at the URL
+# below) and take the top-K. The 50→5 narrowing typically improves
+# retrieval@K precision by 10-25 pp on instruction-following tasks.
+# Empty RERANKER_URL = reranker disabled (fall back to dense-only
+# top-K). Useful for A/B perf tests without YAML thrashing.
+RERANKER_URL = os.environ.get(
+    "RERANKER_URL", "http://vllm-bge-reranker.llm.svc.cluster.local:8000"
+)
+# How many dense candidates to fetch from Qdrant pre-rerank. Bigger
+# = better recall (more chances for the cross-encoder to find the
+# right doc) at the cost of reranker latency. 50 is a typical sweet
+# spot for chat-RAG; bump to 100 for heavier re-ranking.
+RETRIEVE_PRE_RERANK_TOP_K = int(os.environ.get("RETRIEVE_PRE_RERANK_TOP_K", "50"))
+RERANKER_TIMEOUT_SECONDS = float(os.environ.get("RERANKER_TIMEOUT_SECONDS", "10"))
+
 # Keycloak JWT validation for /retrieve. Issuer-only (audience disabled,
 # matching langgraph-service & ingestion-service); the realm is the trust
 # boundary — any token signed by it can hit /retrieve, and the in-payload
@@ -155,6 +172,23 @@ embed_client = httpx.Client(
         write=10.0,
         pool=5.0,
     ),
+)
+
+# Cross-encoder reranker client. Lazily initialized — None when
+# RERANKER_URL env is unset, which disables the rerank step
+# (dense top-K is returned directly).
+rerank_client: Optional[httpx.Client] = (
+    httpx.Client(
+        base_url=RERANKER_URL,
+        timeout=httpx.Timeout(
+            connect=3.0,
+            read=RERANKER_TIMEOUT_SECONDS,
+            write=10.0,
+            pool=5.0,
+        ),
+    )
+    if RERANKER_URL
+    else None
 )
 
 
@@ -466,6 +500,76 @@ def embed_query_bge_m3(text: str) -> list[float]:
     return body["data"][0]["embedding"]
 
 
+# --- Cross-encoder reranker (TEI /rerank endpoint) -------------------
+#
+# TEI exposes a /rerank endpoint that accepts {query, texts: [...]} and
+# returns scored indices in descending relevance order. We pass the raw
+# chunk text from each Qdrant hit; TEI's bge-reranker-v2-m3 scores
+# query+text pairs via cross-attention and returns relative ordering.
+#
+# Returns the same list of hits (preserving Qdrant's payload + dense
+# score) but reordered by reranker score, with the reranker score
+# attached to each result for diagnosability. If RERANKER_URL is unset
+# (rerank_client is None) or the call fails, returns the input list
+# unchanged — fail-open behavior keeps RAG working when the reranker
+# is down. Caller is responsible for slicing to top_k after the call.
+def rerank_chunks(
+    query: str, hits: list, top_k: int
+) -> tuple[list, bool]:
+    """Rerank a list of Qdrant hits via TEI /rerank.
+
+    Returns (reranked_hits[:top_k], reranker_used). reranker_used
+    is False if we fell back to the dense ordering — useful for
+    log diagnostics + future Langfuse trace metadata.
+    """
+    if rerank_client is None or not hits:
+        return hits[:top_k], False
+
+    texts = [(h.payload or {}).get("text", "") for h in hits]
+    try:
+        # TEI's /rerank takes raw_scores=true to also return the
+        # absolute logit (handy for thresholding); return_text=false
+        # because we already have the texts and don't want to ship
+        # them back over the wire.
+        resp = rerank_client.post(
+            "/rerank",
+            json={
+                "query": query,
+                "texts": texts,
+                "raw_scores": True,
+                "return_text": False,
+            },
+        )
+        resp.raise_for_status()
+        body = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        # Fail-open: log and return dense ordering. RAG still works,
+        # just without the cross-encoder boost. Caller sees
+        # reranker_used=False so logs/traces can attribute quality
+        # to the dense-only path.
+        log.warning("reranker call failed (falling back to dense): %s", e)
+        return hits[:top_k], False
+
+    # Body is a list of {index, score}. Sort by index to map back to
+    # the original hits (TEI returns them sorted by score already,
+    # but we re-sort defensively in case the API contract changes).
+    # Then take the top-k by score.
+    by_score = sorted(body, key=lambda r: r["score"], reverse=True)
+    reranked = []
+    for item in by_score[:top_k]:
+        idx = item["index"]
+        # Attach the rerank score to the hit's payload for downstream
+        # use (e.g., chat-ui can show "rerank_score: 0.97" alongside
+        # the dense score). We mutate the payload dict; harmless since
+        # the hit is short-lived.
+        h = hits[idx]
+        if h.payload is None:
+            h.payload = {}
+        h.payload["rerank_score"] = float(item["score"])
+        reranked.append(h)
+    return reranked, True
+
+
 # --- LLM dispatchers ---
 class LLMResult(BaseModel):
     """Provider-agnostic view of an LLM response."""
@@ -611,11 +715,20 @@ def retrieve(
         ]
     )
 
+    # Two-stage retrieval (RAG completeness):
+    #   1. Dense top-N from Qdrant (N = RETRIEVE_PRE_RERANK_TOP_K, ~50)
+    #   2. Cross-encoder rerank → take top req.top_k (~5)
+    # The reranker call has a fail-open path; if it errors or is
+    # disabled (RERANKER_URL unset), we slice the dense top-N to
+    # req.top_k and return that — RAG keeps working, just without
+    # the rerank quality boost. reranker_used in the log line tells
+    # which code path served the request.
+    pre_rerank_top_k = max(req.top_k, RETRIEVE_PRE_RERANK_TOP_K)
     try:
         hits = qdrant.query_points(
             collection_name=DOCS_COLLECTION,
             query=vec,
-            limit=req.top_k,
+            limit=pre_rerank_top_k,
             query_filter=qfilter,
         ).points
     except Exception as e:
@@ -624,6 +737,8 @@ def retrieve(
         # "no context found" message.
         log.warning("qdrant query failed (treating as 0 hits): %s", e)
         hits = []
+
+    hits, reranker_used = rerank_chunks(req.query, hits, req.top_k)
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     chunks: list[RetrievedChunk] = []
@@ -639,8 +754,8 @@ def retrieve(
         )
 
     log.info(
-        "retrieve session=%s user=%s top_k=%d hits=%d ms=%d",
-        req.session_id, user, req.top_k, len(chunks), elapsed_ms,
+        "retrieve session=%s user=%s top_k=%d hits=%d reranker_used=%s ms=%d",
+        req.session_id, user, req.top_k, len(chunks), reranker_used, elapsed_ms,
     )
 
     return RetrieveResponse(

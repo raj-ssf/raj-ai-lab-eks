@@ -588,20 +588,39 @@ def node_ensure_warm(state: AgentState) -> AgentState:
 def _build_rag_prompt(prompt: str, chunks: list[dict]) -> str:
     """Format retrieved chunks as RAG context, then the user's question.
 
-    Format borrowed from rag-service /invoke's existing convention:
-    numbered Source blocks, explicit instruction to fall back if context
-    doesn't help. Keeps the prompt model-agnostic — the same string works
-    on Llama 3.1 8B, 3.3 70B, and DeepSeek-R1 70B.
+    Format: each source block carries a numeric ID + filename + chunk
+    index so the LLM can cite them as [1], [2], etc. — chat-ui renders
+    those refs as clickable citations using `retrieved_chunks` in the
+    response. Numeric IDs (not filenames in the citation marker) keep
+    the markup compact and survive even when filenames have spaces or
+    special characters.
+
+    Keeps the prompt model-agnostic — the same string works on Llama
+    3.1 8B, 3.3 70B, and DeepSeek-R1 70B.
     """
     if not chunks:
         return prompt
+    # Each source includes the filename + chunk index so the LLM has
+    # enough context to choose between near-duplicate sources from
+    # different files. The bracketed [N] is what we ask the LLM to
+    # echo back as a citation.
     context = "\n\n".join(
-        f"[Source {i + 1}] {c.get('text', '')}" for i, c in enumerate(chunks)
+        "[{n}] (source: {src}, chunk {ci})\n{text}".format(
+            n=i + 1,
+            src=c.get("source", "unknown") or "unknown",
+            ci=c.get("chunk_index", 0),
+            text=c.get("text", ""),
+        )
+        for i, c in enumerate(chunks)
     )
     return (
-        "Use the following context to answer the question. If the context "
-        "doesn't help, say so.\n\n"
-        f"=== Context ===\n{context}\n\n"
+        "Answer the question using the numbered sources below. When a "
+        "claim is supported by a source, cite it with [N] matching the "
+        "source's number — multiple cites are fine like [1][3]. Do NOT "
+        "cite a source that doesn't actually support the claim. If the "
+        "sources don't help at all, answer from your own knowledge and "
+        "say so explicitly without using any [N] markers.\n\n"
+        f"=== Sources ===\n{context}\n\n"
         f"=== Question ===\n{prompt}"
     )
 

@@ -130,3 +130,23 @@ spec:
       port: 8000
       targetPort: http
       protocol: TCP
+
+---
+# Matches the vllm-bge-reranker Deployment (deployment-models.yaml).
+# Used by rag-service for the post-Qdrant rerank step.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-bge-reranker
+  labels:
+    app: vllm-bge-reranker
+    vllm-model: bge-reranker-v2-m3
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-bge-reranker
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
