@@ -53,6 +53,17 @@ LIMIT       = os.environ.get("LIMIT", "100")
 RUN_ID      = os.environ.get("RUN_ID") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 S3_DEST     = os.environ.get("S3_DEST") or f"s3://raj-ai-lab-eks-training/eval-results/{RUN_ID}"
 
+# HF Hub tokenizer to use locally for prompt construction + logprob math.
+# The lm-eval `local-completions` adapter ALWAYS loads a tokenizer to
+# format multiple-choice options for logprob comparison (MMLU, HellaSwag,
+# ARC are all logprob-based tasks). It defaults to using the model NAME
+# as the tokenizer identifier — but our vLLM `served-model-name`
+# (`llama-3.1-8b`) is an arbitrary label, not an HF Hub model ID.
+# So we explicitly point the tokenizer at the open Llama 3.1 mirror.
+# Both base and LoRA flights use the same tokenizer (LoRA doesn't touch
+# tokenization).
+TOKENIZER   = os.environ.get("TOKENIZER", "NousResearch/Meta-Llama-3.1-8B")
+
 OUTPUT_DIR  = Path("/workspace/output") / RUN_ID
 MODELS = [
     ("llama-3.1-8b",        OUTPUT_DIR / "base"),
@@ -77,6 +88,7 @@ def run_eval(model_name: str, output_path: Path) -> int:
     model_args = (
         f"model={model_name},"
         f"base_url={VLLM_URL}/completions,"
+        f"tokenizer={TOKENIZER},"
         "num_concurrent=4,"
         "max_retries=3,"
         "tokenized_requests=False"
