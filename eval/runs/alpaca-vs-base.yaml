@@ -70,11 +70,18 @@ spec:
             # vLLM Service in the same namespace — short DNS form works.
             - name: VLLM_URL
               value: http://vllm-llama-8b:8000/v1
-            # Smoke task set (small, fast). Override with TASKS env on
-            # the Job spec for a different benchmark mix:
+            # Smoke task set (small, fast). All three tasks are
+            # parquet-native on HF Hub — no script-execution dataset
+            # loading. Earlier choice of `hellaswag` triggered the
+            # `trust_remote_code is not supported anymore` failure
+            # in datasets>=3.0 because hellaswag is still a Python
+            # loading script on the Hub. winogrande fills the same
+            # "common-sense reasoning" slot without the loading-script
+            # baggage. Override with TASKS env on the Job spec for a
+            # different benchmark mix:
             #   mmlu (full), arc_challenge, gsm8k_cot, truthfulqa_mc2, etc.
             - name: TASKS
-              value: mmlu_anatomy,arc_easy,hellaswag
+              value: mmlu_anatomy,arc_easy,winogrande
             # Per-task sample cap. 100 samples × 3 tasks × 2 models =
             # 600 prompts total. At ~1 sec/prompt through vLLM (batched),
             # ~10 min wall time. Bump LIMIT for higher-confidence numbers.
