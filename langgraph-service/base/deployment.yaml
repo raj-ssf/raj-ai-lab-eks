@@ -268,6 +268,13 @@ spec:
               value: "false"
             - name: PII_REDACT_ENTITY_TYPES
               value: email,phone_us,ssn,credit_card,ipv4,aws_access_key
+            # Phase #16: input-side PII redaction. Closes the
+            # complementary half of #11 — together they bound where
+            # PII can sit to a single hot path: prompt → execute →
+            # response, never touching cache, memory, or retrieval
+            # query logs.
+            - name: PII_REDACT_INPUT_ENABLED
+              value: "false"
 
             # --- Phase #13: plan-and-execute agent pattern -------------
             # Pre-emptive planning: before tool calls, Llama 8B

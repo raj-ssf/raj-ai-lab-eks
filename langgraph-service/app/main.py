@@ -1,8 +1,8 @@
 """langgraph-service — FastAPI front-end for a LangGraph router agent.
 
-Sixteen-node state machine on /invoke (budget + safety bookends + cache
-+ memory + query rewriting + planning + reasoning loop + hallucination
-check + PII redaction):
+Seventeen-node state machine on /invoke (budget + safety + input/output
+PII redaction + cache + memory + query rewriting + planning + reasoning
+loop + hallucination check):
 
     START -> budget_check -> safety_input -> load_memory -> rewrite_query
                           -> classify -> retrieve -> ensure_warm
@@ -21,6 +21,11 @@ check + PII redaction):
   categories intersect SAFETY_BLOCK_CATEGORIES, the graph short-
   circuits to END with a refusal response. No-op when
   SAFETY_FILTER_ENABLED=false.
+- pii_redact_input: regex-based PII detection over the user's prompt
+  (Phase #16). Produces state.redacted_prompt used by cache_lookup,
+  retrieve, rewrite_query, save_memory. Original prompt still goes
+  to node_execute (model needs the actual content). No-op when
+  PII_REDACT_INPUT_ENABLED=false.
 - cache_lookup: embeds the prompt via vllm-bge-m3 and finds the most-
   similar cached entry for (user, session_id). On hit (cosine ≥
   CACHE_SIMILARITY_THRESHOLD), the cached response is returned and
@@ -540,6 +545,7 @@ _NODE_MS_FIELDS: dict[str, str] = {
     "memory_save": "memory_save_ms",
     "query_rewrite": "query_rewrite_ms",
     "hallucination_check": "hallucination_check_ms",
+    "pii_redact_input": "pii_input_redact_ms",
     "pii_redact_output": "pii_redact_ms",
     "plan": "plan_ms",
     "execute": "execute_latency_ms",
@@ -810,6 +816,17 @@ class AgentState(TypedDict, total=False):
     pii_redact_action: Literal["redacted", "passed", "skipped"]
     pii_entities_found: dict
     pii_redact_ms: int
+    # Phase #16: input-side PII redaction.
+    #   redacted_prompt: the user's prompt with PII replaced by
+    #     <redacted_TYPE> placeholders. Used by cache_lookup, retrieve,
+    #     rewrite_query, save_memory. Falls back to state.prompt when
+    #     filter is disabled or no PII found.
+    #   pii_input_action / _entities_found / _ms: mirror output-side
+    #     telemetry shape.
+    redacted_prompt: str
+    pii_input_action: Literal["redacted", "passed", "skipped"]
+    pii_input_entities_found: dict
+    pii_input_redact_ms: int
     # Phase #13: planner output.
     #   plan_text: raw planner LLM output (numbered list of steps,
     #     human-readable). Empty when planner skipped.
@@ -1271,7 +1288,10 @@ def node_cache_lookup(state: AgentState) -> AgentState:
 
     # Step 1: embed the prompt. If bge-m3 is unreachable, fail-open
     # (cache miss, downstream pipeline runs normally).
-    prompt = state.get("prompt", "")
+    # Phase #16: prefer redacted_prompt when present so PII doesn't
+    # become part of the cache embedding signature. Falls back to
+    # raw prompt when input redaction is disabled.
+    prompt = state.get("redacted_prompt") or state.get("prompt", "")
     embedding = _embed_prompt_for_cache(prompt)
     if embedding is None:
         return {
@@ -1441,7 +1461,15 @@ def node_cache_store(state: AgentState) -> AgentState:
     entry_key = _cache_entry_key(user, session_id, entry_id)
     index_key = _cache_index_key(user, session_id)
     ts = time.time()
-    prompt = state.get("original_prompt") or state.get("prompt") or ""
+    # Phase #16: cache the redacted prompt, not the raw one. Cache
+    # entries persist for CACHE_TTL_SECONDS (24h default); raw PII
+    # would otherwise sit in Redis for that whole window.
+    prompt = (
+        state.get("redacted_prompt")
+        or state.get("original_prompt")
+        or state.get("prompt")
+        or ""
+    )
 
     try:
         # Pipeline: HSET entry, ZADD index, ZREMRANGEBYRANK to keep
@@ -1675,6 +1703,68 @@ def node_hallucination_check(state: AgentState) -> AgentState:
     }
 
 
+# --- PII redaction at input (Phase #16) ------------------------------------
+#
+# Detects PII in the user's prompt and stores a redacted copy in
+# state.redacted_prompt. Downstream nodes (cache_lookup, retrieve,
+# rewrite_query, save_memory) read state.redacted_prompt instead of
+# state.prompt so PII never lands in cache keys, vector-search queries,
+# or conversation history. node_execute still uses state.prompt — the
+# model needs the user's actual content to answer.
+#
+# Position: AFTER safety_input (Llama Guard scans the original — its
+# safety verdict needs the actual content), BEFORE cache_lookup (so
+# cache embedding is on the redacted form, preventing PII-keyed cache
+# entries) and load_memory.
+#
+# Reuses the regex detector + redactor from Phase #11.
+
+
+def node_pii_redact_input(state: AgentState) -> AgentState:
+    """Detect PII in state.prompt; populate state.redacted_prompt.
+
+    When disabled OR no PII found, redacted_prompt is identical to
+    prompt (downstream nodes read it the same way regardless of
+    whether redaction actually changed anything).
+    """
+    prompt = state.get("prompt", "") or ""
+    if not PII_REDACT_INPUT_ENABLED or not prompt:
+        return {
+            "redacted_prompt": prompt,
+            "pii_input_action": "skipped",
+            "pii_input_entities_found": {},
+            "pii_input_redact_ms": 0,
+        }
+
+    started = time.monotonic()
+    spans = _detect_pii(prompt)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    if not spans:
+        return {
+            "redacted_prompt": prompt,
+            "pii_input_action": "passed",
+            "pii_input_entities_found": {},
+            "pii_input_redact_ms": elapsed_ms,
+        }
+
+    counts: dict[str, int] = {}
+    for entity_type, _, _ in spans:
+        counts[entity_type] = counts.get(entity_type, 0) + 1
+
+    redacted = _redact_pii(prompt, spans)
+    log.info(
+        "pii_redact_input entities=%s ms=%d",
+        counts, elapsed_ms,
+    )
+    return {
+        "redacted_prompt": redacted,
+        "pii_input_action": "redacted",
+        "pii_input_entities_found": counts,
+        "pii_input_redact_ms": elapsed_ms,
+    }
+
+
 # --- PII redaction at output (Phase #11) -----------------------------------
 
 
@@ -1861,7 +1951,13 @@ def node_rewrite_query(state: AgentState) -> AgentState:
         prompt IS already standalone, no rewrite would change it
       - LLM call fails (fail-open, retrieve uses original prompt)
     """
-    original_prompt = state.get("prompt", "")
+    # Phase #16: rewrite operates on the redacted prompt so the
+    # refined_query produced (used for retrieval, possibly logged
+    # downstream) doesn't contain PII. The "original_prompt" state
+    # field name predates redaction — kept for API compatibility but
+    # really means "input to rewrite" which is now the redacted form
+    # when redaction is on.
+    original_prompt = state.get("redacted_prompt") or state.get("prompt", "")
     if not QUERY_REWRITE_ENABLED:
         return {
             "original_prompt": original_prompt,
@@ -1979,7 +2075,16 @@ def node_save_memory(state: AgentState) -> AgentState:
 
     import json as _json
     turn = {
-        "prompt": state.get("original_prompt") or state.get("prompt") or "",
+        # Phase #16: persist the redacted prompt to memory so PII
+        # doesn't sit in conversation history. Falls back to
+        # original_prompt (the rewrite-input) and finally to raw
+        # prompt when redaction is off.
+        "prompt": (
+            state.get("redacted_prompt")
+            or state.get("original_prompt")
+            or state.get("prompt")
+            or ""
+        ),
         "response": state.get("response") or "",
         "ts": time.time(),
     }
@@ -2168,9 +2273,19 @@ def node_retrieve(state: AgentState) -> AgentState:
 
     # T2: prefer the refined query the reflect node emitted on the previous
     # cycle. On the first pass, refined_query is None and we use the
-    # original prompt. After this consumes it, we reset it to None so the
+    # prompt. After this consumes it, we reset it to None so the
     # next reflect call doesn't see stale data.
-    query_for_retrieval = state.get("refined_query") or state["prompt"]
+    #
+    # Phase #16: prefer redacted_prompt over raw prompt when present so
+    # PII doesn't end up in retrieval queries (which may be logged by
+    # rag-service or its observability stack). refined_query already
+    # passes through pii-aware contexts (rewrite operates on redacted),
+    # so the falback chain is: refined_query → redacted_prompt → prompt.
+    query_for_retrieval = (
+        state.get("refined_query")
+        or state.get("redacted_prompt")
+        or state["prompt"]
+    )
     existing_chunks = list(state.get("retrieved_chunks") or [])
     existing_keys = {
         (c.get("source", ""), c.get("chunk_index", 0)) for c in existing_chunks
@@ -2807,6 +2922,20 @@ def _get_langfuse_client():
 
 PII_REDACT_OUTPUT_ENABLED = os.environ.get(
     "PII_REDACT_OUTPUT_ENABLED", "false"
+).lower() in ("1", "true", "yes")
+
+# Phase #16: input-side PII redaction. Detects PII in the user's prompt
+# and produces a redacted version used for cache keys, retrieval search
+# queries, memory storage, and rewrite-query input. The ORIGINAL prompt
+# still goes to node_execute (the model needs the user's actual question).
+#
+# This closes the PII compliance picture: input redaction prevents PII
+# from being indexed in cache/memory/retrieval logs; output redaction
+# (Phase #11) prevents PII from leaking back through the response.
+# Together they bound where PII can sit in the system to a single hot
+# path: prompt → execute → response, never touching durable storage.
+PII_REDACT_INPUT_ENABLED = os.environ.get(
+    "PII_REDACT_INPUT_ENABLED", "false"
 ).lower() in ("1", "true", "yes")
 
 # Entity types to redact, comma-separated. Default = all six. Operators
@@ -3672,6 +3801,7 @@ def build_graph() -> StateGraph:
     g: StateGraph = StateGraph(AgentState)
     g.add_node("budget_check", node_budget_check)
     g.add_node("safety_input", node_safety_input)
+    g.add_node("pii_redact_input", node_pii_redact_input)
     g.add_node("cache_lookup", node_cache_lookup)
     g.add_node("load_memory", node_load_memory)
     g.add_node("rewrite_query", node_rewrite_query)
@@ -3695,10 +3825,12 @@ def build_graph() -> StateGraph:
     g.add_conditional_edges(
         "safety_input",
         _route_after_safety_input,
-        # Routes to cache_lookup first; on cache miss the lookup node
-        # routes onward to load_memory.
-        {"classify": "cache_lookup", END: END},
+        # Routes to pii_redact_input first; that produces the redacted
+        # prompt used by cache_lookup as the embedding key, and by
+        # downstream retrieve / rewrite / save_memory.
+        {"classify": "pii_redact_input", END: END},
     )
+    g.add_edge("pii_redact_input", "cache_lookup")
     g.add_conditional_edges(
         "cache_lookup",
         _route_after_cache_lookup,
@@ -3895,6 +4027,11 @@ class InvokeResponse(BaseModel):
     pii_redact_action: str = "skipped"
     pii_entities_found: dict = Field(default_factory=dict)
     pii_redact_ms: int = 0
+    # Phase #16: input-side PII redaction telemetry. Same shape as
+    # the output-side fields, prefix _input distinguishes which side.
+    pii_input_action: str = "skipped"
+    pii_input_entities_found: dict = Field(default_factory=dict)
+    pii_input_redact_ms: int = 0
     # Phase #13: planner output. plan_text is the raw numbered list
     # the planner produced (empty when planner skipped). chat-ui can
     # render it as a "Show plan" expandable section so users see
@@ -3969,6 +4106,9 @@ def _build_invoke_response_dict(
         "pii_redact_action": final_state.get("pii_redact_action", "skipped"),
         "pii_entities_found": final_state.get("pii_entities_found") or {},
         "pii_redact_ms": final_state.get("pii_redact_ms", 0),
+        "pii_input_action": final_state.get("pii_input_action", "skipped"),
+        "pii_input_entities_found": final_state.get("pii_input_entities_found") or {},
+        "pii_input_redact_ms": final_state.get("pii_input_redact_ms", 0),
         "planner_action": final_state.get("planner_action", "skipped"),
         "plan_text": final_state.get("plan_text", ""),
         "plan_steps_count": final_state.get("plan_steps_count", 0),
@@ -4110,10 +4250,10 @@ def invoke(
 
 
 _NODE_NAMES = {
-    "budget_check", "safety_input", "cache_lookup",
-    "load_memory", "rewrite_query", "classify", "retrieve",
-    "ensure_warm", "plan", "execute", "reflect", "safety_output",
-    "hallucination_check", "pii_redact_output",
+    "budget_check", "safety_input", "pii_redact_input",
+    "cache_lookup", "load_memory", "rewrite_query", "classify",
+    "retrieve", "ensure_warm", "plan", "execute", "reflect",
+    "safety_output", "hallucination_check", "pii_redact_output",
     "cache_store", "save_memory",
 }
 
@@ -4139,6 +4279,7 @@ _NODE_END_FIELDS = {
     "hallucination_check": [
         "hallucination_action", "hallucination_verdict", "hallucination_confidence",
     ],
+    "pii_redact_input": ["pii_input_action", "pii_input_entities_found"],
     "pii_redact_output": ["pii_redact_action", "pii_entities_found"],
     "cache_store": [],
     "save_memory": [],
