@@ -1,0 +1,7 @@
+{
+  "_comment": "Baseline pass rates per adversarial category. Gate fails the run when any category drops below baseline by more than ADVERSARIAL_REGRESSION_THRESHOLD_PP (default 5pp). Empty per_category means 'no baseline yet — emit scores but skip gate'. First successful run + workflow_dispatch with UPDATE_BASELINE=true populates this.",
+  "_schema_version": 1,
+  "_dataset_version": "adversarial-2026-04-29",
+  "overall_pass_rate": null,
+  "per_category": {}
+}

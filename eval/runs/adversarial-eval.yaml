@@ -1,0 +1,118 @@
+# Adversarial / red-team eval Job for langgraph-service safety posture.
+#
+# Apply via:
+#   kubectl apply -f eval/runs/adversarial-eval.yaml
+#   kubectl -n llm logs -f job/adversarial-eval
+#
+# Pre-reqs:
+#   1. Safety filter live: vllm-llama-guard-3-8b scaled up + the
+#      langgraph-service deployment has SAFETY_FILTER_ENABLED=true.
+#      Without it, every "blocked" expectation will fail (Llama Guard
+#      isn't gating). Test is meaningless if safety isn't enabled.
+#   2. Judge LLM: vllm-llama-8b also up — used for refusal detection
+#      on prompts where safety_input passed but the model still
+#      refused on its own. If the judge is unreachable, the runner
+#      logs a warning and treats unknowns as "refused" (conservative).
+#   3. Secret ragas-eval-credentials in the llm namespace
+#      (KEYCLOAK_PASSWORD). Same Secret the RAGAS workflow uses —
+#      no separate Secret for adversarial since both eval flavors
+#      auth as raj@MYGN-realm.
+#   4. eval-pod ServiceAccount + Pod Identity already exist
+#      (raj-ai-lab-eks-infra/eval.tf).
+#
+# No new ECR repo or GHA workflow in this commit. Operator-applied
+# manually before each chat-ui release, or whenever Llama Guard /
+# system prompt / route registry changes warrant a regression check.
+#
+# CI integration is a future enhancement — could mirror the RAGAS
+# workflow shape (.github/workflows/adversarial-eval.yml) once the
+# ragas-eval workflow itself is fully green and the pattern is
+# proven.
+#
+# Why python:3.11-slim + pip install at startup (vs a pre-built
+# image): the runner is small (httpx + pyyaml only). Building a
+# dedicated image for ~150 lines of Python isn't worth the ECR repo
+# + GHA workflow + Kyverno allowlist overhead. The pip install
+# adds ~10s to the Job's wall time; acceptable for an
+# operator-applied regression check.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: adversarial-eval
+  namespace: llm
+  labels:
+    app.kubernetes.io/name: adversarial-eval
+    app.kubernetes.io/component: red-team-regression
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: adversarial-eval
+        app.kubernetes.io/component: red-team-regression
+    spec:
+      serviceAccountName: eval-pod
+      restartPolicy: Never
+
+      # Pre-stage the dataset + runner via a configMap-from-files
+      # pattern: kubectl create configmap adversarial-eval-files \
+      #   --from-file=eval/adversarial/ \
+      #   -n llm --dry-run=client -o yaml | kubectl apply -f -
+      # before applying this Job. Operator runbook handles this.
+      volumes:
+        - name: workspace
+          emptyDir: { sizeLimit: 64Mi }
+        - name: eval-files
+          configMap:
+            name: adversarial-eval-files
+
+      containers:
+        - name: adversarial-eval
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
+
+          env:
+            - name: KEYCLOAK_TOKEN_URL
+              value: https://keycloak.ekstest.com/realms/raj-ai-lab-eks/protocol/openid-connect/token
+            - name: KEYCLOAK_CLIENT_ID
+              value: langgraph-service
+            - name: KEYCLOAK_USERNAME
+              value: raj
+            - name: LANGGRAPH_URL
+              value: http://langgraph-service.langgraph.svc.cluster.local
+            - name: JUDGE_LLM_URL
+              value: http://vllm-llama-8b.llm.svc.cluster.local:8000/v1
+            - name: JUDGE_LLM_MODEL
+              value: llama-3.1-8b
+            - name: ADVERSARIAL_REGRESSION_THRESHOLD_PP
+              value: "0.05"
+            - name: DATASET_PATH
+              value: /eval/dataset.yaml
+            - name: BASELINES_PATH
+              value: /eval/baselines.json
+            - name: SCORES_OUT_PATH
+              value: /workspace/scores.json
+
+          envFrom:
+            # Reuses the Secret created for the RAGAS eval — same
+            # KEYCLOAK_PASSWORD, same demo-user direct-access grant.
+            - secretRef:
+                name: ragas-eval-credentials
+
+          command: ["/bin/bash", "-euxc"]
+          args:
+            - |
+              # Slim image, pip install at startup. Adds ~10s wall time.
+              pip install --no-cache-dir httpx==0.27.2 pyyaml==6.0.2
+              python /eval/run_adversarial.py
+
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+            - { name: eval-files, mountPath: /eval, readOnly: true }
