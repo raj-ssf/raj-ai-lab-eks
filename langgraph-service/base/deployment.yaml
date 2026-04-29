@@ -123,6 +123,32 @@ spec:
             - name: LANGFUSE_HOST
               value: http://langfuse-web.langfuse.svc.cluster.local:3000
 
+            # --- Phase #4: content safety (Llama Guard 3 8B) -----------
+            # Master switch defaults to "false" so the safety nodes
+            # pass through (return safety_action="passed", no Llama
+            # Guard call). Flip to "true" after vllm-llama-guard-3-8b
+            # has been scaled up at least once and the operator wants
+            # the safety filter active. The graph topology is identical
+            # whether enabled or not — only the per-node call/skip
+            # behavior changes — so toggling this is a Deployment env
+            # edit + ArgoCD sync, no graph rewiring.
+            - name: SAFETY_FILTER_ENABLED
+              value: "false"
+            - name: SAFETY_LLAMA_GUARD_URL
+              value: http://vllm-llama-guard-3-8b.llm.svc.cluster.local:8000/v1
+            - name: SAFETY_LLAMA_GUARD_MODEL
+              value: llama-guard-3-8b
+            # Fail-open in the lab. Production switches to "closed".
+            - name: SAFETY_FAIL_MODE
+              value: open
+            # Hazard category allowlist — comma-separated S-codes from
+            # Meta's taxonomy that should trigger a block. Default is
+            # all 14 categories. Narrow by setting to e.g. "S1,S4,S9"
+            # if some categories produce too many false positives for
+            # this lab's user-base.
+            - name: SAFETY_BLOCK_CATEGORIES
+              value: S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11,S12,S13,S14
+
           envFrom:
             # Langfuse keys live in a Secret created by
             # raj-ai-lab-eks-infra/langgraph.tf, mirroring the

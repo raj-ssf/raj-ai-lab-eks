@@ -98,3 +98,22 @@ spec:
   resources:
     requests:
       storage: 10Gi
+
+---
+# Llama Guard 3 8B (Meta) — content-safety classifier model used by
+# langgraph-service's safety_input and safety_output nodes. ~16 GB on
+# disk (FP16 weights + tokenizer + chat template). 30 GiB PVC leaves
+# headroom for the next minor version (Llama Guard 4 if it lands) and
+# any auxiliary files Meta ships alongside the weights.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-llama-guard-3-8b
+  labels:
+    app: vllm
+    model: llama-guard-3-8b
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 30Gi

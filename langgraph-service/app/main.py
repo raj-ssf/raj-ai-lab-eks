@@ -1,12 +1,19 @@
 """langgraph-service — FastAPI front-end for a LangGraph router agent.
 
-Five-node state machine on /invoke (with a graph-level reasoning loop):
+Seven-node state machine on /invoke (safety bookends + reasoning loop):
 
-    START -> classify -> retrieve -> ensure_warm -> execute -> reflect -> END
-                          ^                                     |
-                          |_____________________________________|
-                                  loop (capped at MAX_REASONING_CYCLES)
+    START -> safety_input -> classify -> retrieve -> ensure_warm
+                          -> execute -> reflect -> safety_output -> END
+              |                            ^          |
+              |                            |__________|  (loop, capped)
+              v                            |
+              END (refused)                |
 
+- safety_input: Llama Guard 3 8B grades the user's prompt against
+  Meta's 14-category hazard taxonomy. If unsafe AND the violated
+  categories intersect SAFETY_BLOCK_CATEGORIES, the graph short-
+  circuits to END with a refusal response. No-op when
+  SAFETY_FILTER_ENABLED=false.
 - classify: always-on Llama 3.1 8B answers a JSON-schema classification
   prompt categorizing the user's input as `trivial` / `tuned-lora` /
   `reasoning` / `hard`.
@@ -21,7 +28,9 @@ Five-node state machine on /invoke (with a graph-level reasoning loop):
 - reflect: gates whether to loop. Asks the cheap Llama 8B to decide if
   another retrieval cycle (with a new query) would meaningfully improve
   the draft answer. If yes AND we haven't hit MAX_REASONING_CYCLES,
-  routes back to retrieve; otherwise terminates.
+  routes back to retrieve; otherwise routes to safety_output.
+- safety_output: Llama Guard 3 8B grades the model's draft. If unsafe,
+  replaces `response` with the refusal message before END.
 
 Every node emits a Langfuse span via the LangChain callback handler. The
 whole flow is also instrumented for OTel so traces appear in Tempo.
@@ -445,6 +454,25 @@ class AgentState(TypedDict, total=False):
     refined_query: Optional[str]
     needs_more_context: bool
     reflection_log: list[str]
+    # Phase #4: content safety bookkeeping.
+    #   safety_input_verdict / safety_output_verdict: "safe", "unsafe",
+    #     "skipped" (filter disabled), or "fail_open"/"fail_closed"
+    #     (Llama Guard unreachable, fell back to configured fail mode).
+    #   safety_categories: list of S-codes that triggered the block,
+    #     in the order Llama Guard returned them. Empty for "safe" or
+    #     "skipped" verdicts.
+    #   safety_action: terminal disposition — "passed", "blocked_input",
+    #     "blocked_output", "disabled". Drives the conditional edges
+    #     after each safety node.
+    #   safety_input_ms / safety_output_ms: per-node latency for
+    #     telemetry budgeting (Llama Guard call time on a warm pod
+    #     is ~150-300 ms; cold-start adds the usual 8 min).
+    safety_input_verdict: Literal["safe", "unsafe", "skipped", "fail_open", "fail_closed"]
+    safety_output_verdict: Literal["safe", "unsafe", "skipped", "fail_open", "fail_closed"]
+    safety_categories: list[str]
+    safety_action: Literal["passed", "blocked_input", "blocked_output", "disabled"]
+    safety_input_ms: int
+    safety_output_ms: int
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -469,6 +497,242 @@ Examples:
   Prompt: "Implement a thread-safe LRU cache in Go." -> hard
 
 Output ONLY the single word. No explanation. No punctuation."""
+
+
+# --- Content safety (Phase #4) ---------------------------------------------
+#
+# Llama Guard 3 8B is a Llama-family classifier fine-tuned on Meta's
+# 14-category hazard taxonomy. Its tokenizer ships a chat template that
+# wraps an input conversation in a safety-categories prompt and asks
+# the model to output 'safe' or 'unsafe\n<S-codes>'. vLLM applies the
+# template automatically when we POST /v1/chat/completions with
+# model=llama-guard-3-8b, so the call site is the same as any other
+# OpenAI-compat chat call.
+#
+# Two graph nodes use this:
+#   safety_input  — runs BEFORE classify. Saves cost (a malicious
+#                   prompt never pays for retrieve+execute), AND
+#                   shifts content blocks earlier than late-binding
+#                   would (a user typing an unsafe prompt sees the
+#                   refusal in <300ms instead of 5+ sec).
+#   safety_output — runs AFTER reflect. Catches the cases where the
+#                   user's prompt was benign but the model produced
+#                   bad output — this happens with adversarial
+#                   prompt-injection attacks and with rare model
+#                   misalignment.
+#
+# Both nodes share the helper below. The role= argument controls
+# which speaker's content Llama Guard scores (it grades different
+# axes for user vs assistant turns).
+
+
+def _llama_guard_check(
+    role: Literal["user", "assistant"],
+    content: str,
+) -> tuple[str, list[str], int]:
+    """Score `content` for safety via vllm-llama-guard-3-8b.
+
+    Returns (verdict, categories, latency_ms):
+      verdict     "safe" | "unsafe" | "fail_open" | "fail_closed"
+      categories  list of S-codes that triggered the unsafe verdict
+                  (e.g. ["S1", "S10"]); empty otherwise
+      latency_ms  wall time for the round-trip
+
+    Failure mode (Llama Guard unreachable, malformed output, etc.):
+      SAFETY_FAIL_MODE=open   -> verdict="fail_open", treated as safe
+      SAFETY_FAIL_MODE=closed -> verdict="fail_closed", treated as unsafe
+    Either way the verdict string surfaces in telemetry so the operator
+    can audit how often the filter is actually firing vs degrading.
+    """
+    started = time.monotonic()
+
+    # Llama Guard's chat template auto-wraps the conversation in the
+    # safety-categories prompt. We just pass the raw user/assistant
+    # turn we want graded; vLLM + the model's tokenizer config handle
+    # the rest. Use the standard OpenAI-compat API for portability.
+    client = ChatOpenAI(
+        model=SAFETY_LLAMA_GUARD_MODEL,
+        base_url=SAFETY_LLAMA_GUARD_URL,
+        api_key="not-required",
+        temperature=0.0,
+        # Output is "safe" (4 tokens) or "unsafe\nS1,S2,..." (~30 tokens).
+        # 96 is generous; bumping wastes time on a guarantee we already
+        # have from the model's training.
+        max_tokens=96,
+        timeout=SAFETY_TIMEOUT_SECONDS,
+    )
+    msg = (
+        HumanMessage(content=content)
+        if role == "user"
+        else AIMessage(content=content)
+    )
+    try:
+        response = client.invoke([msg])
+        raw = (response.content or "").strip()
+    except Exception as e:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        log.warning("llama_guard call failed: %s (mode=%s)", e, SAFETY_FAIL_MODE)
+        verdict = "fail_open" if SAFETY_FAIL_MODE == "open" else "fail_closed"
+        return (verdict, [], elapsed_ms)
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    # Parse: first line is "safe" | "unsafe". Optional second line is
+    # a comma-separated S-code list. Be forgiving on whitespace/case.
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        log.warning("llama_guard returned empty body; treating per fail mode")
+        return ("fail_open" if SAFETY_FAIL_MODE == "open" else "fail_closed", [], elapsed_ms)
+    head = lines[0].lower()
+    if head == "safe":
+        return ("safe", [], elapsed_ms)
+    if head == "unsafe":
+        cats: list[str] = []
+        if len(lines) > 1:
+            cats = [
+                c.strip().upper()
+                for c in lines[1].split(",")
+                if c.strip()
+            ]
+        return ("unsafe", cats, elapsed_ms)
+    # Anything else means the model misbehaved (chat template
+    # mismatch, fine-tune drift, etc.). Treat as fail mode.
+    log.warning("llama_guard unparseable head=%r; treating per fail mode", head[:32])
+    return ("fail_open" if SAFETY_FAIL_MODE == "open" else "fail_closed", [], elapsed_ms)
+
+
+def _is_blocking(verdict: str, categories: list[str]) -> bool:
+    """Decide whether a verdict + category list should terminate the request.
+
+    "safe" / "skipped" / "fail_open" -> pass through.
+    "fail_closed"                    -> block (operator chose this posture).
+    "unsafe"                         -> block IFF any category is in the
+                                        configured block-list. If the
+                                        block-list is empty, any unsafe
+                                        verdict blocks regardless of
+                                        category — useful for "deny
+                                        everything Llama Guard flags".
+    """
+    if verdict == "fail_closed":
+        return True
+    if verdict != "unsafe":
+        return False
+    if not SAFETY_BLOCK_CATEGORIES:
+        return True  # block anything unsafe
+    return any(c in SAFETY_BLOCK_CATEGORIES for c in categories)
+
+
+def node_safety_input(state: AgentState) -> AgentState:
+    """Score the user's prompt; block early if Llama Guard flags it."""
+    if not SAFETY_FILTER_ENABLED:
+        return {
+            "safety_input_verdict": "skipped",
+            "safety_categories": [],
+            "safety_action": "passed",
+            "safety_input_ms": 0,
+        }
+
+    verdict, categories, ms = _llama_guard_check("user", state["prompt"])
+    log.info(
+        "safety_input verdict=%s categories=%s ms=%d",
+        verdict,
+        categories,
+        ms,
+    )
+
+    if _is_blocking(verdict, categories):
+        # Pre-populate the response so the conditional edge can route
+        # straight to END without execute ever firing. The downstream
+        # InvokeResponse converts this into the user-facing refusal.
+        return {
+            "safety_input_verdict": verdict,
+            "safety_categories": categories,
+            "safety_action": "blocked_input",
+            "safety_input_ms": ms,
+            "response": SAFETY_REFUSAL_MESSAGE,
+            # Skip-route bookkeeping so chat-ui can render a clean
+            # "blocked" badge: classifier didn't run, retrieve didn't
+            # run, nothing else has meaningful data here.
+            "route": "trivial",
+            "classifier_raw": "(safety-blocked)",
+        }
+
+    return {
+        "safety_input_verdict": verdict,
+        "safety_categories": categories,
+        "safety_action": "passed",
+        "safety_input_ms": ms,
+    }
+
+
+def node_safety_output(state: AgentState) -> AgentState:
+    """Score the model's draft answer; replace with refusal if unsafe."""
+    if not SAFETY_FILTER_ENABLED:
+        return {
+            "safety_output_verdict": "skipped",
+            "safety_output_ms": 0,
+        }
+
+    # If the input was already blocked, the response is already the
+    # refusal message — re-checking it is wasteful and would fail-open
+    # tautologically. Short-circuit.
+    if state.get("safety_action") == "blocked_input":
+        return {
+            "safety_output_verdict": "skipped",
+            "safety_output_ms": 0,
+        }
+
+    response = state.get("response", "") or ""
+    if not response:
+        # Empty response — nothing to score. Pass through; let the
+        # client deal with the empty body.
+        return {
+            "safety_output_verdict": "skipped",
+            "safety_output_ms": 0,
+        }
+
+    verdict, categories, ms = _llama_guard_check("assistant", response)
+    log.info(
+        "safety_output verdict=%s categories=%s ms=%d",
+        verdict,
+        categories,
+        ms,
+    )
+
+    if _is_blocking(verdict, categories):
+        # Preserve the existing safety_categories from the input check
+        # if they're more specific; otherwise overwrite. Output-block
+        # categories are typically a superset (model produced new
+        # hazard codes the input didn't have).
+        merged_cats = list(
+            dict.fromkeys((state.get("safety_categories") or []) + categories)
+        )
+        return {
+            "safety_output_verdict": verdict,
+            "safety_categories": merged_cats,
+            "safety_action": "blocked_output",
+            "safety_output_ms": ms,
+            "response": SAFETY_REFUSAL_MESSAGE,
+        }
+
+    return {
+        "safety_output_verdict": verdict,
+        "safety_output_ms": ms,
+    }
+
+
+def _route_after_safety_input(state: AgentState) -> Literal["classify", "__end__"]:
+    """Conditional edge: if input was blocked, terminate; else continue.
+
+    Same defense-in-depth pattern as _route_after_reflect — the cap is
+    re-checked here even though node_safety_input already pre-populated
+    state appropriately. If a future change to node_safety_input ever
+    produces a state with safety_action="blocked_input" but doesn't set
+    response, this edge still routes correctly.
+    """
+    if state.get("safety_action") == "blocked_input":
+        return END
+    return "classify"
 
 
 def node_classify(state: AgentState) -> AgentState:
@@ -773,6 +1037,60 @@ MAX_REASONING_CYCLES = int(os.environ.get("MAX_REASONING_CYCLES", "3"))
 REFLECT_MAX_TOKENS = 96
 REFLECT_TEMPERATURE = 0.0
 REFLECT_TIMEOUT_SECONDS = 15
+
+# --- Phase #4: content safety (Llama Guard 3 8B) ---------------------------
+#
+# Two filter points in the graph: safety_input runs BEFORE classify
+# (cheap path: a malicious prompt never pays for retrieve+execute) and
+# safety_output runs AFTER reflect (last line of defense: a clean prompt
+# with a bad output still gets blocked).
+#
+# SAFETY_FILTER_ENABLED is the master switch. When false, both safety
+# nodes pass through (return safety_action="disabled") without making
+# any HTTP call. Default false so the graph topology can land
+# independently of operator-side decisions about scaling up Llama Guard.
+# Flip to true via the langgraph-service Deployment env once the
+# vllm-llama-guard-3-8b pod is reachable.
+SAFETY_FILTER_ENABLED = os.environ.get("SAFETY_FILTER_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+SAFETY_LLAMA_GUARD_URL = os.environ.get(
+    "SAFETY_LLAMA_GUARD_URL",
+    "http://vllm-llama-guard-3-8b.llm.svc.cluster.local:8000/v1",
+)
+SAFETY_LLAMA_GUARD_MODEL = os.environ.get(
+    "SAFETY_LLAMA_GUARD_MODEL", "llama-guard-3-8b"
+)
+SAFETY_TIMEOUT_SECONDS = float(os.environ.get("SAFETY_TIMEOUT_SECONDS", "15"))
+
+# Fail-open vs fail-closed when Llama Guard is unreachable or returns
+# malformed output. fail-open = allow the request (safety filter degrades
+# to no-op on infra issues); fail-closed = block (safety > availability).
+# Default open for the lab — production deployments invert this.
+SAFETY_FAIL_MODE = os.environ.get("SAFETY_FAIL_MODE", "open").lower()  # "open" | "closed"
+
+# Hazard categories that trigger a block. Default = all 14 from Llama
+# Guard 3's taxonomy. Operators can narrow via env (e.g.
+# "S1,S4,S9,S10,S11" to block only the most severe). Empty string =
+# block any unsafe verdict regardless of category.
+SAFETY_BLOCK_CATEGORIES = set(
+    c.strip().upper()
+    for c in os.environ.get(
+        "SAFETY_BLOCK_CATEGORIES",
+        "S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11,S12,S13,S14",
+    ).split(",")
+    if c.strip()
+)
+
+# What we tell the user when their input/output gets blocked. Vague
+# rather than specific to avoid leaking which category triggered (a
+# probing attacker would otherwise iterate to find phrasings that pass).
+SAFETY_REFUSAL_MESSAGE = os.environ.get(
+    "SAFETY_REFUSAL_MESSAGE",
+    "I can't help with that. Please rephrase your request or ask about something else.",
+)
 
 # Bound on http_fetch result size. Larger than 50 KB starts straining
 # the model's 8K context (roughly 32 KB of text at most).
@@ -1257,22 +1575,39 @@ def _route_after_reflect(state: AgentState) -> Literal["retrieve", "__end__"]:
 
 
 def build_graph() -> StateGraph:
-    """Compile the five-node graph with a graph-level reasoning loop.
+    """Compile the seven-node graph with safety bookends + reasoning loop.
 
-    Linear path: START → classify → retrieve → ensure_warm → execute → reflect.
-    Conditional: reflect → retrieve (loop) OR reflect → END.
+    Linear path:
+      START → safety_input → classify → retrieve → ensure_warm
+            → execute → reflect → safety_output → END
+
+    Conditional edges:
+      safety_input → END (if blocked) or classify
+      reflect      → retrieve (loop, capped) or safety_output
 
     The retrieve node is cycle-aware: on first entry, query = prompt;
-    on re-entry from reflect, query = refined_query (set by reflect).
-    Chunks accumulate (deduped) across cycles. Cap is MAX_REASONING_CYCLES.
+    on re-entry from reflect, query = refined_query. Chunks accumulate
+    (deduped) across cycles. Cap is MAX_REASONING_CYCLES.
+
+    Safety nodes pass through (return safety_action="passed") when
+    SAFETY_FILTER_ENABLED is false, so the same graph topology applies
+    regardless of operator-side enablement decisions. This keeps Langfuse
+    + OTel traces consistent across enabled/disabled runs.
     """
     g: StateGraph = StateGraph(AgentState)
+    g.add_node("safety_input", node_safety_input)
     g.add_node("classify", node_classify)
     g.add_node("retrieve", node_retrieve)
     g.add_node("ensure_warm", node_ensure_warm)
     g.add_node("execute", node_execute)
     g.add_node("reflect", node_reflect)
-    g.add_edge(START, "classify")
+    g.add_node("safety_output", node_safety_output)
+    g.add_edge(START, "safety_input")
+    g.add_conditional_edges(
+        "safety_input",
+        _route_after_safety_input,
+        {"classify": "classify", END: END},
+    )
     g.add_edge("classify", "retrieve")
     g.add_edge("retrieve", "ensure_warm")
     g.add_edge("ensure_warm", "execute")
@@ -1280,8 +1615,9 @@ def build_graph() -> StateGraph:
     g.add_conditional_edges(
         "reflect",
         _route_after_reflect,
-        {"retrieve": "retrieve", END: END},
+        {"retrieve": "retrieve", END: "safety_output"},
     )
+    g.add_edge("safety_output", END)
     return g.compile()
 
 
@@ -1347,6 +1683,19 @@ class InvokeResponse(BaseModel):
     # loop?" questions and for Langfuse correlation.
     reasoning_cycles: int = 0
     reflection_log: list[str] = []
+    # Phase #4: content safety telemetry. action is the terminal
+    # disposition; verdicts are per-node Llama Guard outputs (or
+    # "skipped"/"disabled"/"fail_*" for non-flowing paths). categories
+    # is the union of S-codes that triggered any block (empty for safe
+    # or disabled flows). Surfacing latencies separately so chat-ui
+    # and Langfuse can split a slow request between the safety filter
+    # vs the model itself.
+    safety_action: str = "passed"
+    safety_input_verdict: str = "skipped"
+    safety_output_verdict: str = "skipped"
+    safety_categories: list[str] = []
+    safety_input_ms: int = 0
+    safety_output_ms: int = 0
 
 
 # --- Routes ----------------------------------------------------------------
@@ -1437,4 +1786,10 @@ def invoke(
         tool_calls_log=final_state.get("tool_calls_log", []),
         reasoning_cycles=final_state.get("cycles", 0),
         reflection_log=final_state.get("reflection_log", []),
+        safety_action=final_state.get("safety_action", "passed"),
+        safety_input_verdict=final_state.get("safety_input_verdict", "skipped"),
+        safety_output_verdict=final_state.get("safety_output_verdict", "skipped"),
+        safety_categories=final_state.get("safety_categories", []),
+        safety_input_ms=final_state.get("safety_input_ms", 0),
+        safety_output_ms=final_state.get("safety_output_ms", 0),
     )

@@ -150,3 +150,24 @@ spec:
       port: 8000
       targetPort: http
       protocol: TCP
+
+---
+# Matches the vllm-llama-guard-3-8b Deployment (deployment-models.yaml).
+# Used by langgraph-service as the content-safety classifier endpoint —
+# both safety_input and safety_output graph nodes call this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-llama-guard-3-8b
+  labels:
+    app: vllm-llama-guard-3-8b
+    vllm-model: llama-guard-3-8b
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-llama-guard-3-8b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP

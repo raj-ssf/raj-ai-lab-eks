@@ -872,3 +872,144 @@ spec:
           # on cold start is acceptable for a scale-to-zero workload.
           # Switch to a PVC if cold-start latency becomes a concern.
           emptyDir: { sizeLimit: 4Gi }
+
+---
+# Llama Guard 3 8B (FP16) on 1× NVIDIA L4 24GB (g6.xlarge).
+#
+# Used by langgraph-service as a pre/post content-safety filter. Llama
+# Guard 3 is a Llama-3-family classifier fine-tuned on Meta's hazard
+# taxonomy: 14 categories covering violent crimes, non-violent crimes,
+# sex-related crimes, child sexual exploitation, defamation, specialized
+# advice, privacy, intellectual property, indiscriminate weapons, hate,
+# suicide/self-harm, sexual content, elections, code-interpreter abuse.
+#
+# Inference pattern (from Meta's model card):
+#   POST /v1/chat/completions with messages=[...] (the conversation to
+#   score). Llama Guard's tokenizer ships a chat template that wraps
+#   the input in a safety-categories prompt and asks the model to
+#   produce 'safe' or 'unsafe\n<comma-separated S-codes>'. vLLM applies
+#   the chat template automatically, so the langgraph-service caller
+#   doesn't need to reconstruct the prompt format.
+#
+# Prerequisite (one-time):
+#   The model weights must be staged to S3 BEFORE this Deployment can
+#   start successfully. The model-sync init container does
+#   `aws s3 sync s3://.../llama-guard-3-8b/` and will fail-fast if the
+#   prefix is empty. Stage via a one-shot K8s Job (per the lab's
+#   no-laptop-staging policy) running:
+#     huggingface-cli download meta-llama/Llama-Guard-3-8B \
+#       --local-dir /tmp/lg && \
+#     aws s3 sync /tmp/lg s3://raj-ai-lab-eks-model-weights/llama-guard-3-8b/
+#   See the model-stage Job pattern in training/ for a template.
+#
+# Why a separate model (not folded into vllm-llama-8b's pod):
+#   Different chat template — Llama Guard's tokenizer config has a
+#   safety-categories template that conflicts with Llama 3.1 Instruct's
+#   default. vLLM picks one tokenizer per pod, so they need separate
+#   serving processes. Also: Llama Guard runs short prompts (~500 in,
+#   ~50 out) and benefits from low max-model-len, while the chat tier
+#   wants full 8K context. Different model = different tuning.
+#
+# Cost: $0.55/hr on g6.xlarge when up. Default replicas=0 (operator
+# scales up before a session that needs safety-filtering). Idle cost: $0.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-guard-3-8b
+  labels:
+    app: vllm-llama-guard-3-8b
+    vllm-model: llama-guard-3-8b
+spec:
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-llama-guard-3-8b
+  template:
+    metadata:
+      labels:
+        app: vllm-llama-guard-3-8b
+        vllm-model: llama-guard-3-8b
+    spec:
+      serviceAccountName: vllm
+      enableServiceLinks: false
+      # Llama Guard 3 8B FP16 fits in ~16 GB VRAM with 4K context;
+      # g6.xlarge's L4 24GB is the cheapest GPU that holds it
+      # comfortably. Karpenter picks from the gpu-experiments
+      # allowlist — same scheduling as bge-m3.
+      nodeSelector:
+        karpenter.sh/nodepool: gpu-experiments
+      tolerations:
+        - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
+        - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_REGION, value: us-west-2 }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-guard-3-8b/ }
+            - { name: MODEL_PATH, value: /model }
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws configure set default.s3.max_concurrent_requests 32
+              aws configure set default.s3.multipart_chunksize 128MB
+              aws s3 sync "$S3_URI" "$MODEL_PATH" --no-progress
+              ls -la "$MODEL_PATH"
+          resources:
+            requests: { cpu: "1", memory: "1Gi" }
+            limits:   { cpu: "2", memory: "2Gi" }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:placeholder
+          args:
+            - "--model"
+            - "/model"
+            - "--served-model-name"
+            - "llama-guard-3-8b"
+            - "--tensor-parallel-size"
+            - "1"
+            - "--dtype"
+            - "half"
+            # Llama Guard prompts are short by design — the chat
+            # template wraps input in ~500 tokens of safety categories
+            # plus the user input itself (~100-500 tokens for typical
+            # chat). 4096 is comfortable headroom; longer wastes KV
+            # cache memory we could devote to throughput.
+            - "--max-model-len"
+            - "4096"
+            - "--gpu-memory-utilization"
+            - "0.85"
+            - "--enforce-eager"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            # Deliberately NO --enable-lora, NO --enable-auto-tool-choice,
+            # NO --tool-call-parser — Llama Guard is a classifier, not
+            # a generative agent. Tool-call flags would confuse the
+            # safety-categories chat template.
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: HF_HUB_OFFLINE,       value: "1" }
+            - { name: TRANSFORMERS_OFFLINE, value: "1" }
+            - { name: OTEL_SERVICE_NAME,    value: vllm-llama-guard-3-8b }
+          resources:
+            requests: { nvidia.com/gpu: "1", cpu: "2", memory: "8Gi" }
+            limits:   { nvidia.com/gpu: "1", cpu: "3", memory: "20Gi" }
+          startupProbe:  { httpGet: { path: /health, port: http }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 60 }
+          readinessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
+          livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: shm,         mountPath: /dev/shm }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache-llama-guard-3-8b
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 2Gi }
