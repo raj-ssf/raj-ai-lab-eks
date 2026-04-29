@@ -3918,6 +3918,52 @@ class FeedbackStatsResponse(BaseModel):
     recent: list[dict]
 
 
+class SessionExportResponse(BaseModel):
+    """All per-(user, session_id) data this service holds.
+
+    Shape:
+      user, session_id        identity
+      memory_turns            list of turn dicts (prompt, response, ts)
+      memory_summary          long-term conversation summary string
+      cache_entries           list of cache entries with embeddings
+                              stripped (1024-dim float arrays are
+                              useless to users + minor signal leak)
+
+    Excluded from export (separate concerns):
+      Qdrant per-session chunks         in rag-service / Qdrant —
+                                         use rag-service's own export
+                                         path or qdrant API directly.
+      Langfuse traces                    in Langfuse — export via
+                                         Langfuse SDK or UI.
+      Feedback records                   user-scoped, not session-
+                                         scoped today; covered by a
+                                         future /user/me/export.
+    """
+    user: str
+    session_id: str
+    memory_turns: list[dict]
+    memory_summary: str
+    cache_entries: list[dict]
+    # Counts surfaced separately so callers can verify "we got
+    # everything" without iterating list lengths.
+    memory_turn_count: int
+    cache_entry_count: int
+
+
+class SessionDeleteResponse(BaseModel):
+    """Right-to-deletion confirmation.
+
+    deleted_keys is the total number of Redis keys actually deleted
+    (across memory turns key, memory summary key, cache index, and
+    each cache entry hash). Operator can sanity-check by calling
+    /session/<id>/export immediately after — should return empty
+    structures.
+    """
+    user: str
+    session_id: str
+    deleted_keys: int
+
+
 class InvokeRequest(BaseModel):
     prompt: str = Field(..., description="The user's natural-language prompt.")
     max_tokens: int = Field(default=512, ge=1, le=8192)
@@ -4600,4 +4646,189 @@ def feedback_stats(
 
     return FeedbackStatsResponse(
         user=user, total=total, up=up, down=down, recent=recent
+    )
+
+
+# --- /session export + delete (Phase #17) ----------------------------------
+#
+# GDPR/CCPA-grade right-to-deletion + right-to-export for per-(user,
+# session_id) data this service holds. Companion to Phase #16's PII
+# redaction — together they cover the data-handling story:
+#
+#   #16 prevents PII from being persisted in the first place
+#       (storage layers see redacted prompts only).
+#   #17 lets users see what IS persisted, and request its deletion.
+#
+# Auth: same Keycloak JWT as /invoke. Per-user namespacing in Redis
+# keys (`mem:<user>:*`, `cache:<user>:*`) means a malicious user can
+# only export/delete data under their own namespace; a forged
+# session_id submission lands in the calling user's keyspace.
+#
+# Excluded from these endpoints (separate concerns documented in the
+# response models):
+#   Qdrant per-session chunks         rag-service responsibility
+#   Langfuse traces                   Langfuse SDK/UI export
+#   User-level feedback records       future /user/me/* endpoints
+
+
+@app.get("/session/{session_id}/export", response_model=SessionExportResponse)
+def session_export(
+    session_id: str,
+    claims: Annotated[dict, Depends(require_jwt)],
+) -> SessionExportResponse:
+    """Return all per-(user, session) data held by this service.
+
+    Memory turns + summary, cache entries (with embeddings stripped).
+    Per-user namespacing means the calling user can only see their
+    own data; submitting another user's session_id returns empty
+    structures (their data is under a different Redis keyspace).
+    """
+    user = claims.get("preferred_username") or claims.get("sub") or "unknown"
+    redis_client = _get_redis()
+    if redis_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="session store unavailable",
+        )
+
+    import json as _json
+
+    try:
+        # Memory: turns list (LRANGE) + summary (GET) in one round-trip
+        pipe = redis_client.pipeline(transaction=False)
+        pipe.lrange(_memory_turns_key(user, session_id), 0, -1)
+        pipe.get(_memory_summary_key(user, session_id))
+        pipe.zrange(_cache_index_key(user, session_id), 0, -1)
+        results = pipe.execute()
+        raw_turns: list[str] = results[0] or []
+        summary: str = results[1] or ""
+        cache_entry_ids: list[str] = results[2] or []
+    except Exception as e:
+        log.error("session_export: redis op failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="session export failed",
+        )
+
+    memory_turns: list[dict] = []
+    for raw in raw_turns:
+        try:
+            memory_turns.append(_json.loads(raw))
+        except (_json.JSONDecodeError, TypeError):
+            continue
+
+    # Fetch cache entry hashes in one pipeline. Drop the embedding
+    # field from each — 1024 floats is useless data to a user and a
+    # minor signal leak (you could partially reverse-engineer what
+    # bge-m3's embedding represents).
+    cache_entries: list[dict] = []
+    if cache_entry_ids:
+        try:
+            pipe = redis_client.pipeline(transaction=False)
+            for eid in cache_entry_ids:
+                pipe.hgetall(_cache_entry_key(user, session_id, eid))
+            entries = pipe.execute()
+        except Exception as e:
+            log.warning("session_export: cache hgetall failed: %s", e)
+            entries = []
+        for entry in entries:
+            if not entry:
+                continue
+            entry.pop("embedding", None)
+            cache_entries.append(entry)
+
+    log.info(
+        "session_export user=%s session=%s turns=%d cache=%d",
+        user, session_id, len(memory_turns), len(cache_entries),
+    )
+
+    return SessionExportResponse(
+        user=user,
+        session_id=session_id,
+        memory_turns=memory_turns,
+        memory_summary=summary,
+        cache_entries=cache_entries,
+        memory_turn_count=len(memory_turns),
+        cache_entry_count=len(cache_entries),
+    )
+
+
+@app.delete("/session/{session_id}", response_model=SessionDeleteResponse)
+def session_delete(
+    session_id: str,
+    claims: Annotated[dict, Depends(require_jwt)],
+) -> SessionDeleteResponse:
+    """Atomically wipe all per-(user, session) data.
+
+    Deletes memory turns key, memory summary key, cache index key,
+    and every cache entry hash whose ID is in the index. Single
+    Redis pipeline with transaction=True so the delete either
+    completes fully or not at all (no partial-state risk where
+    memory's gone but cache lingers).
+
+    Right-to-deletion sanity check: after a successful 200, calling
+    /session/<id>/export should return empty structures
+    (memory_turns=[], cache_entries=[], memory_summary=""). If the
+    operator wants belt-and-braces verification, that's a one-line
+    follow-up curl.
+
+    NOT scoped within this endpoint:
+      - Qdrant chunks for this session_id (separate service).
+      - Langfuse traces (separate dashboard).
+      - User-level feedback records (would require a separate
+        /user/me/delete endpoint with admin-style scope).
+    """
+    user = claims.get("preferred_username") or claims.get("sub") or "unknown"
+    redis_client = _get_redis()
+    if redis_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="session store unavailable",
+        )
+
+    cache_index_key = _cache_index_key(user, session_id)
+
+    try:
+        # First fetch cache entry IDs so we know which entry hashes
+        # to delete. ZRANGE is non-mutating; safe to do outside the
+        # transaction.
+        cache_entry_ids: list[str] = redis_client.zrange(
+            cache_index_key, 0, -1
+        ) or []
+
+        # Build the full delete list:
+        #   memory:turns, memory:summary, cache:index, each cache:entry
+        keys_to_delete = [
+            _memory_turns_key(user, session_id),
+            _memory_summary_key(user, session_id),
+            cache_index_key,
+        ]
+        for eid in cache_entry_ids:
+            keys_to_delete.append(_cache_entry_key(user, session_id, eid))
+
+        # Atomic MULTI/EXEC delete — either all keys go or none do.
+        # Redis DEL on a non-existent key returns 0, not an error,
+        # so we can safely include keys that may or may not exist.
+        pipe = redis_client.pipeline(transaction=True)
+        if keys_to_delete:
+            pipe.delete(*keys_to_delete)
+        results = pipe.execute()
+        # results[0] is the integer count of keys actually deleted.
+        deleted_count = int(results[0]) if results else 0
+    except Exception as e:
+        log.error("session_delete: redis op failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="session delete failed",
+        )
+
+    log.info(
+        "session_delete user=%s session=%s deleted_keys=%d",
+        user, session_id, deleted_count,
+    )
+
+    return SessionDeleteResponse(
+        user=user,
+        session_id=session_id,
+        deleted_keys=deleted_count,
     )
