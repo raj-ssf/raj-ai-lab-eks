@@ -1,0 +1,20 @@
+# Phase #35: canary Service for argo-rollouts Istio trafficRouting.
+# Empty (no endpoints) in steady-state by design. Populated only
+# when a canary is in flight.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-service-canary
+  labels:
+    app: rag-service
+    role: canary
+spec:
+  type: ClusterIP
+  selector:
+    app: rag-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

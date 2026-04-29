@@ -1,0 +1,43 @@
+# Phase #35: rag-service background AnalysisTemplate (watchdog).
+#
+# Companion to analysistemplate.yaml. Same complementary pattern as
+# langgraph-service:
+#   step-gated:    "must prove healthy to advance"   (latency)
+#   background:    "abort if explicitly bad"          (HTTP errors)
+#
+# The watchdog metric here is HTTP 5xx rate on /retrieve, NOT
+# latency-fraction. Reason: the gated check already covers latency;
+# layering a second latency-flavored watchdog would double-count
+# the same signal. Watching for 5xx instead catches a different
+# class of regressions — panics, JSON serialization errors,
+# Bedrock throttling that surfaces as 500s — that the latency
+# fraction wouldn't necessarily flag (a panic is "fast" because
+# it returns immediately, ironically passing a P95 latency check).
+
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: rag-service-canary-error-watch-bg
+  labels:
+    app: rag-service
+spec:
+  metrics:
+    - name: retrieve-error-rate-watch
+      interval: 1m
+      # No `count` → runs continuously until rollout terminates.
+      failureLimit: 2
+      # Sustained 5xx rate above 10% on /retrieve fails the canary.
+      # Empty-result implicit pass via the len() clause.
+      failureCondition: len(result) > 0 && result[0] > 0.10
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          # /retrieve-specific filter via handler="/retrieve" so
+          # /healthz, /metrics, /search, /ingest 500s don't taint
+          # the canary verdict. /search is the legacy Bedrock-Titan
+          # path and shouldn't gate the canary; /ingest is admin-y
+          # and rarely traffic'd alongside canary deploys.
+          query: |
+            sum(rate(http_requests_total{job="rag-service",handler="/retrieve",status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total{job="rag-service",handler="/retrieve"}[5m])), 1e-9)

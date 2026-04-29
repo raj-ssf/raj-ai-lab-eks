@@ -1,23 +1,82 @@
-apiVersion: apps/v1
-kind: Deployment
+# Phase #35: rag-service converted to Argo Rollouts canary, mirror
+# of the langgraph-service Phase #30+#31 conversion. Replaces
+# deployment.yaml. Step-gated + background analysis runs against
+# the rag_* metrics introduced in Phase #24.
+#
+# Migration notes (same as langgraph-service):
+#   - Spec is identical to the prior Deployment except for:
+#       apiVersion + kind     (apps/v1 Deployment → argoproj.io/v1alpha1 Rollout)
+#       spec.replicas         (1 → 2; canary needs ≥2 replicas)
+#       spec.strategy         (RollingUpdate → canary with steps + analysis)
+#   - Pod template is byte-identical to deployment.yaml — same env,
+#     same Vault annotations, same probes, same volumes. The Vault
+#     Agent Injector annotations are particularly load-bearing:
+#     without them, pods don't get /vault/secrets/* mounted and
+#     rag-service's startup checks fail.
+#   - When ArgoCD reconciles this, it prunes the prior Deployment
+#     and creates the Rollout. Brief endpoint gap during the swap.
+#
+# Why replicas: 2 (was 1):
+#   Same rationale as langgraph — replica-percentage canary needs
+#   ≥2 replicas, and even with traffic-percentage canary (used
+#   here), the canary RS is sized as ceil(replicas × weight/100),
+#   so replicas=1 with setWeight 10 still gives 1 canary pod which
+#   handles ALL canary traffic alone. Two replicas keeps stable HA
+#   during canary.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
 metadata:
   name: rag-service
   labels:
     app: rag-service
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: rag-service
+  strategy:
+    canary:
+      canaryService: rag-service-canary
+      stableService: rag-service-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: rag-service-canary-vs
+            routes:
+              - primary
+      steps:
+        - setWeight: 10
+        - pause:
+            duration: 1m
+        - analysis:
+            templates:
+              - templateName: rag-service-canary-checks
+        - setWeight: 50
+        - pause:
+            duration: 1m
+        - analysis:
+            templates:
+              - templateName: rag-service-canary-checks
+      # Background watchdog — runs continuously throughout the
+      # canary, complements step-gated analysis. See
+      # analysistemplate-bg.yaml for the design rationale.
+      analysis:
+        templates:
+          - templateName: rag-service-canary-error-watch-bg
+        startingStep: 1
+      maxSurge: 1
+      maxUnavailable: 0
+      abortScaleDownDelaySeconds: 30
+  revisionHistoryLimit: 5
   template:
     metadata:
       labels:
         app: rag-service
       annotations:
-        # Vault Agent Injector: writes secrets to /vault/secrets/<name> in
-        # the rag-service container. Role 'rag-service' is bound to the
-        # rag/rag-service ServiceAccount in Vault's kubernetes auth backend
-        # (see vault-config.tf in raj-ai-lab-eks-infra).
+        # Vault Agent Injector annotations — required for Vault to
+        # inject /vault/secrets/* into the rag-service container.
+        # Role bindings live in raj-ai-lab-eks-infra/vault-config.tf.
         vault.hashicorp.com/agent-inject: "true"
         vault.hashicorp.com/role: "rag-service"
         vault.hashicorp.com/agent-inject-secret-demo: "secret/data/rag-service/demo"
@@ -26,15 +85,7 @@ spec:
           hello={{ .Data.data.hello }}
           rotation_note={{ .Data.data.rotation_note }}
           {{- end -}}
-        # Dynamic Postgres credentials from Vault's database secrets engine.
-        # Each render produces a NEW username/password with 1h TTL; the
-        # sidecar re-renders before expiry. rag-service doesn't consume
-        # this file yet — it's a proof-of-life for the dynamic-creds path.
         vault.hashicorp.com/agent-inject-secret-db-creds: "database/creds/rag-service-db"
-        # DB_HOST/DB_PORT/DB_NAME are also available as env vars on the
-        # container below (patched in by the infra overlay at apply time);
-        # included here in file form so anything that sources the file
-        # gets the full connection spec.
         vault.hashicorp.com/agent-inject-template-db-creds: |
           {{- with secret "database/creds/rag-service-db" -}}
           DB_USERNAME={{ .Data.username }}
@@ -45,18 +96,11 @@ spec:
       containers:
         - name: rag-service
           image: rag-service:dev   # rewritten by overlay's `images:` field
-          imagePullPolicy: Always 
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8000
           env:
-            # --- Cluster-config helpers (Phase 2 portability refactor) ---
-            # DOMAIN + KEYCLOAK_REALM are sourced from the cluster-config
-            # ConfigMap (raj-ai-lab-eks-infra/cluster-config-cm.tf) so
-            # forking this lab to a new account/domain doesn't require
-            # editing this YAML — change var.domain and the CM updates.
-            # Subsequent env entries reference $(DOMAIN) / $(KEYCLOAK_REALM)
-            # via K8s env-var expansion (resolved at container start).
             - name: DOMAIN
               valueFrom:
                 configMapKeyRef:
@@ -68,7 +112,7 @@ spec:
                   name: cluster-config
                   key: keycloak_realm
             - name: AWS_REGION
-              value: us-west-2     # IRSA doesn't inject this; boto3 needs it
+              value: us-west-2
             - name: BEDROCK_FAST_MODEL_ID
               value: us.amazon.nova-micro-v1:0
             - name: BEDROCK_SMART_MODEL_ID
@@ -85,13 +129,8 @@ spec:
               value: "1024"
             - name: RAG_DEFAULT_TOP_K
               value: "3"
-            # Hybrid LLM routing. Default 'bedrock' preserves the original
-            # behaviour — Bedrock Nova always serves /invoke, regardless of
-            # whether the vLLM path is up. Flip to 'auto' during demos to
-            # prefer self-hosted vLLM with Bedrock as the fallback, or 'vllm'
-            # to force self-hosted (fails hard if vLLM is down).
             - name: LLM_PROVIDER
-              value: bedrock   # bedrock | vllm | auto
+              value: bedrock
             - name: VLLM_URL
               value: http://vllm.llm.svc.cluster.local:8000
             - name: VLLM_MODEL_NAME
@@ -100,39 +139,18 @@ spec:
               value: "3"
             - name: VLLM_TIMEOUT_SECONDS
               value: "120"
-            # --- Phase 4: /retrieve endpoint -----------------------------
-            # /retrieve is the bge-m3-backed JWT-protected RAG path that
-            # langgraph-service's retrieve node calls. Keep the legacy
-            # Bedrock-Titan path on /search untouched.
-            #
-            # KEYCLOAK_ISSUER drives JWT validation. Same realm URL the
-            # other services use; rag-service trusts any valid token from
-            # this issuer and scopes Qdrant queries by the user claim.
             - name: KEYCLOAK_ISSUER
               value: https://keycloak.$(DOMAIN)/realms/$(KEYCLOAK_REALM)
-            # bge-m3 vLLM endpoint. Same Service that ingestion-service
-            # writes through, so query and document embeddings live in
-            # the same vector space.
             - name: EMBEDDING_URL
               value: http://vllm-bge-m3.llm.svc.cluster.local:8000
             - name: EMBEDDING_MODEL_NAME
               value: bge-m3
-            # Separate from the legacy QDRANT_COLLECTION (rag-docs / Titan
-            # vectors). DOCS_COLLECTION is the bge-m3 collection populated
-            # by ingestion-service.
             - name: DOCS_COLLECTION
               value: documents
             - name: RETRIEVE_DEFAULT_TOP_K
               value: "5"
-            # Langfuse LLM-observability. Host is cluster-internal so traces
-            # don't round-trip through the ingress. Public + Secret keys
-            # come from a K8s Secret provisioned by Terraform from tfvars
-            # (see langfuse-rag-creds.tf). If the Secret is missing or the
-            # keys are empty, the Langfuse SDK logs a warning and no-ops —
-            # the /invoke path keeps working without observability.
             - name: LANGFUSE_HOST
               value: http://langfuse-web.langfuse.svc.cluster.local:3000
-            # OpenTelemetry → Tempo OTLP gRPC receiver in the monitoring namespace.
             - name: OTEL_SERVICE_NAME
               value: rag-service
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
@@ -142,12 +160,6 @@ spec:
             - name: OTEL_EXPORTER_OTLP_INSECURE
               value: "true"
           envFrom:
-            # LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY from a K8s Secret
-            # provisioned by Terraform. optional=true so rag-service still
-            # starts if the Secret hasn't been created yet (e.g., Langfuse
-            # keys haven't been minted). Langfuse SDK gracefully degrades
-            # when keys are missing — it logs a warning and no-ops trace
-            # calls.
             - secretRef:
                 name: rag-service-langfuse
                 optional: true
@@ -184,8 +196,6 @@ spec:
             - name: tmp
               mountPath: /tmp
       volumes:
-        # Writable scratch dir — Python libs (portalocker via qdrant-client, tempfile
-        # callers, etc.) need a writable /tmp even though the rootfs is read-only.
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi

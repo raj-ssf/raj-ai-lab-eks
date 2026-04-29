@@ -1,0 +1,24 @@
+# Phase #35: stable Service for argo-rollouts Istio trafficRouting.
+# Mirror of langgraph-service-stable. argo-rollouts injects
+# rollouts-pod-template-hash into spec.selector at runtime so this
+# Service targets ONLY the stable RS's pods.
+#
+# Selector intentionally has only `app: rag-service`. Don't pre-set
+# rollouts-pod-template-hash here — argo-rollouts will inject it.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-service-stable
+  labels:
+    app: rag-service
+    role: stable
+spec:
+  type: ClusterIP
+  selector:
+    app: rag-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

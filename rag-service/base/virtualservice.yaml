@@ -1,0 +1,45 @@
+# Phase #35: VirtualService that argo-rollouts mutates to shift
+# traffic between rag-service-stable and rag-service-canary during
+# canary steps. Mirror of langgraph-service's VS.
+#
+# Scope: gateways: [mesh] limits this VS to in-mesh sidecar
+# traffic only. North-south path (rag.${domain} → Istio Gateway →
+# HTTPRoute → rag-service Service) is unaffected.
+#
+# Callers covered by this VS (east-west):
+#   ingestion-service → rag-service        (cross-ns: ingestion → rag)
+#   langgraph-service → rag-service        (cross-ns: langgraph → rag)
+#   eval Jobs (RAGAS pipeline) → rag-service
+# All hit the FQDN `rag-service.rag.svc.cluster.local`, so the VS
+# matching that host intercepts every east-west call.
+#
+# Initial weights (100/0) are steady-state. argo-rollouts updates
+# them at each canary step. ArgoCD Application has matching
+# ignoreDifferences entries on the weight JSON pointers (see
+# raj-ai-lab-eks-infra/argocd-apps.tf rag_service_app block) so
+# selfHeal doesn't fight the controller.
+
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: rag-service-canary-vs
+  labels:
+    app: rag-service
+spec:
+  hosts:
+    - rag-service.rag.svc.cluster.local
+  gateways:
+    - mesh
+  http:
+    - name: primary
+      route:
+        - destination:
+            host: rag-service-stable
+            port:
+              number: 80
+          weight: 100
+        - destination:
+            host: rag-service-canary
+            port:
+              number: 80
+          weight: 0

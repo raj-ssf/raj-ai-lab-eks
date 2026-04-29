@@ -3,7 +3,26 @@ kind: Kustomization
 
 resources:
   - serviceaccount.yaml
-  - deployment.yaml
+  # Phase #35: deployment.yaml removed — replaced by rollout.yaml
+  # (Argo Rollouts canary mirroring the langgraph-service Phase
+  # #30+#31 conversion).
+  - rollout.yaml
+  # Phase #35: AnalysisTemplates referenced by rollout.yaml.
+  # Gated check (latency-fraction) ties the canary gate to the
+  # Phase #29 SLO target. Background watchdog (5xx rate) catches
+  # error spikes between gated checkpoints.
+  - analysistemplate.yaml
+  - analysistemplate-bg.yaml
   - service.yaml
+  # Phase #35: stable + canary helper Services for argo-rollouts
+  # Istio trafficRouting. argo-rollouts injects rollouts-pod-
+  # template-hash into their selectors at runtime.
+  - service-stable.yaml
+  - service-canary.yaml
+  # Phase #35: mesh-only VirtualService routing east-west traffic
+  # (ingestion → rag, langgraph → rag, eval Jobs → rag) to weighted
+  # -stable/-canary destinations. argo-rollouts mutates the weights
+  # at each canary step.
+  - virtualservice.yaml
   - httproute.yaml
   - servicemonitor.yaml

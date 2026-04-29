@@ -1,0 +1,46 @@
+# Phase #35: rag-service step-gated AnalysisTemplate.
+#
+# Mirrors langgraph-canary-checks but for the rag_* metrics
+# introduced in Phase #24 — and ties the gate to the Phase #29
+# SLO target rather than HTTP success rate.
+#
+# Why latency-fraction over success-rate for rag-service:
+#   The Phase #29 SLO for rag-service is "95% of /retrieve calls
+#   complete in <= 2.5s". Using the same metric here means a
+#   canary that regresses on the SLO will also fail this gate —
+#   the canary check and the SLO speak the same language. If we
+#   used success-rate (5xx) instead, the canary could pass while
+#   silently increasing the SLO error budget consumption (slow
+#   responses are not 5xx).
+#
+# count: 4 + interval: 30s + 2 analysis steps = ~5min total cycle
+# (matches Phase #33 tuning of langgraph-service).
+
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: rag-service-canary-checks
+  labels:
+    app: rag-service
+spec:
+  metrics:
+    - name: retrieve-latency-fraction
+      interval: 30s
+      count: 4
+      failureLimit: 2
+      # Pass: 95% of /retrieve calls under 2.5s OR no traffic.
+      # The empty-result clause is what lets sparse-traffic windows
+      # pass — same lab-friendly default as langgraph's gate. The
+      # 2.5s threshold tracks the Phase #29 SLO target.
+      successCondition: len(result) == 0 || result[0] >= 0.95
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          # Fraction of /retrieve calls completed in <= 2.5s.
+          # le="2.5" exact-matches the bucket boundary defined in
+          # rag-service/app/main.py (Phase #24's bucket set:
+          # 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0).
+          query: |
+            sum(rate(rag_retrieve_duration_seconds_bucket{le="2.5"}[5m]))
+            /
+            clamp_min(sum(rate(rag_retrieve_duration_seconds_count[5m])), 1e-9)
