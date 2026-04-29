@@ -1,0 +1,13 @@
+# Minimal kustomization so ArgoCD can apply kustomize.patches against
+# this app. Added 2026-04-29 as part of the portability refactor:
+# argocd-apps.tf:hello_app now patches the HTTPRoute hostnames at
+# sync time, which requires kustomize mode (which requires this file).
+#
+# No overlays/ for hello — it's a single-env test app, so the source
+# tree is intentionally flat. If hello ever needs env-specific config,
+# split into base/ + overlays/<env>/ following the rag-service pattern.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
