@@ -3,5 +3,15 @@ kind: Kustomization
 
 resources:
   - serviceaccount.yaml
-  - deployment.yaml
+  # Phase #39: deployment.yaml replaced by rollout.yaml. NO
+  # AnalysisTemplate — ingestion-service has no Prometheus
+  # instrumentation, so the canary uses indefinite-pause steps
+  # that require manual `kubectl argo rollouts promote`.
+  # See rollout.yaml header for the design rationale.
+  - rollout.yaml
   - service.yaml
+  # Phase #39: helper Services + VirtualService for argo-rollouts
+  # Istio trafficRouting (mirror of langgraph/rag pattern).
+  - service-stable.yaml
+  - service-canary.yaml
+  - virtualservice.yaml

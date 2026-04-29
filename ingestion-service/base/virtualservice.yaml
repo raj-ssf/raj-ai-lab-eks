@@ -1,0 +1,34 @@
+# Phase #39: VirtualService that argo-rollouts mutates to shift
+# traffic during canary steps. Mirror of langgraph + rag VS.
+# Mesh-only scope (gateways: [mesh]) — ingestion-service has no
+# north-south HTTPRoute today (chat-ui calls it east-west only),
+# so there's nothing else to coordinate with.
+#
+# Caller covered: chat-ui → ingestion-service. The VS intercepts
+# ingestion-service.ingestion.svc.cluster.local and weights the
+# call between -stable and -canary.
+
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: ingestion-service-canary-vs
+  labels:
+    app: ingestion-service
+spec:
+  hosts:
+    - ingestion-service.ingestion.svc.cluster.local
+  gateways:
+    - mesh
+  http:
+    - name: primary
+      route:
+        - destination:
+            host: ingestion-service-stable
+            port:
+              number: 80
+          weight: 100
+        - destination:
+            host: ingestion-service-canary
+            port:
+              number: 80
+          weight: 0

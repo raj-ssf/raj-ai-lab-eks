@@ -1,0 +1,137 @@
+# Phase #39: ingestion-service converted to Argo Rollouts canary,
+# with a deliberate twist vs Phases #30 (langgraph) and #35 (rag).
+#
+# OPERATOR-DRIVEN CANARY (no automated PromQL analysis):
+#   ingestion-service has no prometheus_fastapi_instrumentator
+#   wired up in app/main.py and no ServiceMonitor in base/, so
+#   any AnalysisTemplate referencing http_request_duration_seconds
+#   would always return empty result. The empty-result clauses we
+#   used in langgraph/rag would let the canary pass without ever
+#   actually verifying anything — a meaningless gate.
+#
+#   Rather than ship a no-op analysis, this Rollout uses an
+#   indefinite pause step. Operator inspects the canary RS during
+#   the pause window (logs, direct curl with a JWT, smoke uploads)
+#   and promotes manually:
+#     kubectl argo rollouts promote ingestion-service -n ingestion
+#   To abort:
+#     kubectl argo rollouts abort ingestion-service -n ingestion
+#
+# Future phase: add prometheus_fastapi_instrumentator to
+# ingestion-service/app/main.py + servicemonitor.yaml in base/,
+# THEN add an AnalysisTemplate gating on /upload success rate
+# (5xx) and convert these steps to automated.
+#
+# Migration notes (same as langgraph/rag):
+#   - Pod template byte-identical to deployment.yaml
+#   - replicas 1 → 2 for canary realism
+#   - First-deploy of a Rollout skips canary (no prior version)
+#   - ArgoCD pruneOldDeployment + create-Rollout has a brief
+#     endpoint gap during the swap; acceptable for the lab.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: ingestion-service
+  labels:
+    app: ingestion-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ingestion-service
+  strategy:
+    canary:
+      canaryService: ingestion-service-canary
+      stableService: ingestion-service-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: ingestion-service-canary-vs
+            routes:
+              - primary
+      steps:
+        - setWeight: 25
+        # Indefinite pause — operator promotes manually after
+        # smoking the canary. With no analysis to gate on, this
+        # is the safety mechanism: the rollout doesn't auto-
+        # advance, so a forgotten canary just sits idle (and
+        # pages via Phase #37's RolloutPausedTooLong alert at
+        # the 30m mark to remind the operator).
+        - pause: {}
+        - setWeight: 75
+        - pause: {}
+        # Auto-promote to 100% only after the second manual
+        # promote past the 75% pause.
+      maxSurge: 1
+      maxUnavailable: 0
+      abortScaleDownDelaySeconds: 30
+  revisionHistoryLimit: 5
+  template:
+    metadata:
+      labels:
+        app: ingestion-service
+    spec:
+      serviceAccountName: ingestion-service
+      containers:
+        - name: ingestion-service
+          image: ingestion-service:placeholder
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: domain
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: keycloak_realm
+            - name: KEYCLOAK_ISSUER
+              value: https://keycloak.$(DOMAIN)/realms/$(KEYCLOAK_REALM)
+            - name: KEYCLOAK_AUDIENCE
+              value: ingestion-service
+            - name: EMBEDDING_URL
+              value: http://vllm-bge-m3.llm.svc.cluster.local:8000
+            - name: QDRANT_URL
+              value: http://qdrant.qdrant.svc.cluster.local:6333
+            - name: QDRANT_COLLECTION
+              value: documents
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo.monitoring.svc.cluster.local:4317
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: grpc
+            - name: OTEL_SERVICE_NAME
+              value: ingestion-service
+            - name: OTEL_TRACES_SAMPLER
+              value: parentbased_always_on
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
