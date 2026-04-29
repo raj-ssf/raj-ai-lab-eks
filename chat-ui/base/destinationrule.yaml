@@ -1,0 +1,52 @@
+# Phase #44: Istio DestinationRule with consistent-hash load
+# balancing on the Chainlit session cookie.
+#
+# Why session affinity matters for chat-ui:
+#   Chainlit uses cookie-based sessions (default cookie name
+#   `chainlit-session-id`) for token-by-token streaming and
+#   inter-message state. With multiple chat-ui replicas, default
+#   round-robin LB across the Service would route a single user's
+#   in-conversation requests to different RS pods, fragmenting the
+#   server-side session state.
+#
+#   consistentHash.httpCookie hashes the Service's connection target
+#   on the cookie value, so all requests carrying the SAME cookie
+#   value land on the SAME pod. Reconnects re-establish at the same
+#   target. The hash ring re-balances cleanly when pods come/go,
+#   minimizing session disruption.
+#
+# What this unlocks (future phases):
+#   - chat-ui scale beyond replicas=1 (current Phase #40 setting).
+#   - chat-ui canary instead of blueGreen — once affinity is live,
+#     a weighted-traffic canary stops fragmenting sessions because
+#     each session-cookie's hash maps deterministically to either
+#     stable or canary, not bouncing per-request. That conversion
+#     is Phase #44b candidate; for now blueGreen stays the strategy.
+#
+# Cookie name choice:
+#   Chainlit's default session cookie. Set CHAINLIT_COOKIE_NAME on
+#   the chat-ui pod env to override the cookie name in app.py if
+#   the framework default ever changes. The DR's cookie name MUST
+#   match what Chainlit actually emits — mismatch silently degrades
+#   to round-robin since the consistentHash falls back to source IP
+#   on missing cookie.
+#
+# ttl=0 means the cookie's TTL is whatever Chainlit's framework
+# decides, NOT a separate Istio-injected cookie. We're hashing on
+# the existing Chainlit cookie, not creating a sticky-session
+# cookie of our own.
+
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: chat-ui-session-affinity
+  labels:
+    app: chat-ui
+spec:
+  host: chat-ui.chat.svc.cluster.local
+  trafficPolicy:
+    loadBalancer:
+      consistentHash:
+        httpCookie:
+          name: chainlit-session-id
+          ttl: 0s

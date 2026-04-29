@@ -12,4 +12,9 @@ resources:
   # argo-rollouts pins its selector to the preview RS; operator
   # inspects via port-forward during the pause window.
   - service-preview.yaml
+  # Phase #44: Istio DestinationRule with consistent-hash LB on the
+  # Chainlit session cookie. Unlocks horizontal scale + traffic-
+  # weighted canary by ensuring same-cookie requests pin to the
+  # same pod.
+  - destinationrule.yaml
   - httproute.yaml
