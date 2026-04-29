@@ -15,6 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from langfuse import Langfuse
+from prometheus_client import Counter, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from fastembed import SparseTextEmbedding
@@ -290,6 +291,59 @@ app = FastAPI(title="rag-service", version="0.6.0", lifespan=lifespan)
 # FastAPI trace spans + Prometheus /metrics endpoint.
 FastAPIInstrumentor.instrument_app(app)
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+
+
+# --- Phase #24: custom Prometheus metrics ----------------------------------
+#
+# The Instrumentator above auto-instruments HTTP-level metrics. These
+# additional series expose the per-stage RAG telemetry — embed time,
+# Qdrant query time, rerank time, chunks-returned distribution, reranker
+# hit rate. Mirrors langgraph-service's Phase #14a naming convention so
+# future Grafana panels can use consistent prefixes (langgraph_*, rag_*).
+
+RAG_RETRIEVE_TOTAL = Counter(
+    "rag_retrieve_total",
+    "Total /retrieve calls.",
+)
+RAG_RETRIEVE_DURATION_SECONDS = Histogram(
+    "rag_retrieve_duration_seconds",
+    "End-to-end /retrieve duration (embed + Qdrant + rerank + serialize).",
+    buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+RAG_EMBED_DURATION_SECONDS = Histogram(
+    "rag_embed_duration_seconds",
+    "Time to compute dense + sparse embeddings of the query.",
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+RAG_QDRANT_DURATION_SECONDS = Histogram(
+    "rag_qdrant_duration_seconds",
+    "Time spent in Qdrant hybrid query (dense + sparse + RRF fusion).",
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+RAG_RERANK_DURATION_SECONDS = Histogram(
+    "rag_rerank_duration_seconds",
+    "Time spent in cross-encoder reranking (TEI bge-reranker).",
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+RAG_CHUNKS_RETURNED = Histogram(
+    "rag_chunks_returned",
+    "Distribution of chunk counts returned to caller.",
+    buckets=(0, 1, 2, 3, 5, 10, 20),
+)
+RAG_RERANKER_USED_TOTAL = Counter(
+    "rag_reranker_used_total",
+    "Reranker outcome — used (cross-encoder ran) or not (fallback to RRF).",
+    ["used"],
+)
+RAG_INGEST_TOTAL = Counter(
+    "rag_ingest_total",
+    "Total /ingest calls. Chunks are tracked in rag_ingest_chunks.",
+)
+RAG_INGEST_CHUNKS = Histogram(
+    "rag_ingest_chunks",
+    "Chunks-per-ingest distribution.",
+    buckets=(1, 5, 10, 20, 50, 100, 250, 500, 1000),
+)
 
 
 # --- Request / response models ---
@@ -667,6 +721,7 @@ def models():
 
 @app.post("/ingest", response_model=IngestResponse)
 def ingest(req: IngestRequest):
+    RAG_INGEST_TOTAL.inc()
     try:
         ensure_collection()
     except Exception as e:
@@ -697,6 +752,7 @@ def ingest(req: IngestRequest):
         chunk_ids.append(chunk_id)
 
     qdrant.upsert(collection_name=COLLECTION, points=points)
+    RAG_INGEST_CHUNKS.observe(len(chunks))
     log.info("ingested parent=%s chunks=%d chars=%d", parent_id, len(chunks), len(req.text))
     return IngestResponse(
         ids=chunk_ids,
@@ -731,18 +787,21 @@ def retrieve(
     """
     user = claims.get("preferred_username") or claims.get("sub") or "unknown"
 
+    RAG_RETRIEVE_TOTAL.inc()
     started = time.monotonic()
     # Encode the query in BOTH spaces. Dense via vllm-bge-m3 (HTTP),
     # sparse via in-process BM25 (CPU, ~ms). If dense embedding fails
     # we 502 immediately because pure-sparse retrieval gives notably
     # worse semantic recall — the lab is a RAG demo, not a keyword
     # search engine.
+    embed_started = time.monotonic()
     try:
         dense_vec = embed_query_bge_m3(req.query)
     except httpx.HTTPError as e:
         log.error("bge-m3 embed failed: %s", e)
         raise HTTPException(status_code=502, detail=f"embed failed: {e}")
     sparse_vec = embed_query_bm25(req.query)
+    RAG_EMBED_DURATION_SECONDS.observe(time.monotonic() - embed_started)
 
     qfilter = Filter(
         must=[
@@ -761,6 +820,7 @@ def retrieve(
     # closed (any Qdrant error → empty hits → "no context" surface).
     # reranker_used in the log line distinguishes the two paths post-hoc.
     pre_rerank_top_k = max(req.top_k, RETRIEVE_PRE_RERANK_TOP_K)
+    qdrant_started = time.monotonic()
     try:
         hits = qdrant.query_points(
             collection_name=DOCS_COLLECTION,
@@ -797,10 +857,15 @@ def retrieve(
         # to populate the new schema.
         log.warning("qdrant hybrid query failed (treating as 0 hits): %s", e)
         hits = []
+    RAG_QDRANT_DURATION_SECONDS.observe(time.monotonic() - qdrant_started)
 
+    rerank_started = time.monotonic()
     hits, reranker_used = rerank_chunks(req.query, hits, req.top_k)
+    RAG_RERANK_DURATION_SECONDS.observe(time.monotonic() - rerank_started)
+    RAG_RERANKER_USED_TOTAL.labels(used=str(reranker_used).lower()).inc()
 
-    elapsed_ms = int((time.monotonic() - started) * 1000)
+    elapsed_seconds = time.monotonic() - started
+    elapsed_ms = int(elapsed_seconds * 1000)
     chunks: list[RetrievedChunk] = []
     for h in hits:
         payload = h.payload or {}
@@ -812,6 +877,8 @@ def retrieve(
                 score=float(h.score),
             )
         )
+    RAG_CHUNKS_RETURNED.observe(len(chunks))
+    RAG_RETRIEVE_DURATION_SECONDS.observe(elapsed_seconds)
 
     log.info(
         "retrieve session=%s user=%s top_k=%d hits=%d hybrid=true reranker_used=%s ms=%d",
