@@ -53,6 +53,15 @@ spec:
             - name: LANGGRAPH_URL
               value: http://langgraph-service.langgraph.svc.cluster.local
 
+            # Phase #21: SSE streaming via /invoke/stream. Enables
+            # token-by-token UX + node-by-node progress events.
+            # Default true; flip to "false" only if SSE proves
+            # unreliable through some intermediate proxy (rare —
+            # Istio + the X-Accel-Buffering=no headers in
+            # langgraph-service are well-tested).
+            - name: STREAM_ENABLED
+              value: "true"
+
             # --- Phase 5: ingestion-service (uploads) --------------------
             # In-cluster Service URL — same mesh + AuthZ pattern as
             # LANGGRAPH_URL above. The chat-ui SA is allowed into the

@@ -56,6 +56,16 @@ INGESTION_URL = os.environ.get(
 # not the in-cluster Service URL.
 LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "https://langfuse.ekstest.com")
 
+# Phase #21: SSE streaming via /invoke/stream. When true, chat-ui
+# consumes Server-Sent Events from langgraph-service and renders
+# tokens + node-progress events progressively. When false, falls
+# back to the legacy synchronous /invoke + retroactive cl.Step
+# rendering — useful for debugging or when SSE through some
+# intermediate proxy proves unreliable.
+STREAM_ENABLED = os.environ.get("STREAM_ENABLED", "true").lower() in (
+    "1", "true", "yes",
+)
+
 # Polling cadence for the upload job state machine. Ingestion runs as
 # a FastAPI BackgroundTask so /upload returns 202 immediately; we
 # follow up with GET /jobs/{id} until state hits "done" or "failed".
@@ -357,6 +367,290 @@ async def _call_invoke(prompt: str, token: str, session_id: str) -> Dict[str, An
         return r.json()
 
 
+# --- Phase #21: SSE streaming -----------------------------------------------
+#
+# /invoke/stream returns text/event-stream with four event types:
+#   node_start  {"node": <name>}
+#   node_end    {"node": <name>, ...selected fields}
+#   token       {"content": <delta>}
+#   done        full InvokeResponse JSON
+#   error       {"status": int, "detail": str}
+#
+# Server format per event: a "event: <type>\n" line, one or more
+# "data: <json>\n" lines, then a blank line.
+#
+# Chainlit pattern for streaming: cl.Message().stream_token() drips
+# content into a single message bubble in real time. Steps open at
+# node_start, close + render output at node_end. Done event finalizes
+# the message + populates sources sidebar + Langfuse action.
+
+# Per-node Step type — drives Chainlit's icon rendering.
+_STEP_TYPE_BY_NODE = {
+    "budget_check":         "tool",
+    "input_validation":     "tool",
+    "safety_input":         "tool",
+    "pii_redact_input":     "tool",
+    "cache_lookup":         "retrieval",
+    "load_memory":          "retrieval",
+    "rewrite_query":        "llm",
+    "classify":             "llm",
+    "retrieve":             "retrieval",
+    "ensure_warm":          "tool",
+    "plan":                 "llm",
+    "execute":              "llm",
+    "reflect":              "llm",
+    "safety_output":        "tool",
+    "hallucination_check":  "llm",
+    "pii_redact_output":    "tool",
+    "cache_store":          "retrieval",
+    "save_memory":          "retrieval",
+}
+
+
+def _format_node_end(node: str, fields: Dict[str, Any]) -> str:
+    """Render the per-node step output as compact markdown.
+
+    Different nodes carry different interesting fields (cache_lookup
+    has cache_hit + similarity; classify has route; safety_input has
+    verdict + categories). Format each appropriately for the Chainlit
+    Step body.
+    """
+    if node == "budget_check":
+        return (
+            f"action=`{fields.get('budget_action')}` "
+            f"consumed={fields.get('budget_consumed')} "
+            f"remaining={fields.get('budget_remaining')}"
+        )
+    if node == "input_validation":
+        details = fields.get("input_validation_details", {}) or {}
+        return f"action=`{fields.get('input_validation_action')}` details={details}"
+    if node == "safety_input":
+        verdict = fields.get("safety_input_verdict")
+        cats = fields.get("safety_categories") or []
+        return f"verdict=`{verdict}` categories={cats}"
+    if node == "cache_lookup":
+        hit = fields.get("cache_hit")
+        sim = fields.get("cache_similarity", 0.0)
+        return f"hit=`{hit}` similarity={sim:.4f}"
+    if node == "classify":
+        return f"route=`{fields.get('route')}` raw=`{fields.get('classifier_raw', '')[:80]}`"
+    if node == "retrieve":
+        return (
+            f"chunks={fields.get('retrieve_count', 0)} "
+            f"in {fields.get('retrieve_ms', 0)}ms"
+        )
+    if node == "ensure_warm":
+        cold = fields.get("cold_start")
+        if cold:
+            return f"❄️ cold start, waited {fields.get('warm_wait_seconds', 0):.1f}s"
+        return "✅ already warm"
+    if node == "plan":
+        return f"action=`{fields.get('planner_action')}` steps={fields.get('plan_steps_count', 0)}"
+    if node == "execute":
+        return (
+            f"latency={fields.get('execute_latency_ms', 0)}ms "
+            f"tools={fields.get('tool_calls_log') or []}"
+        )
+    if node == "reflect":
+        return (
+            f"cycles={fields.get('cycles', 0)} "
+            f"needs_more={fields.get('needs_more_context', False)}"
+        )
+    if node == "safety_output":
+        return f"verdict=`{fields.get('safety_output_verdict')}` action=`{fields.get('safety_action')}`"
+    if node == "hallucination_check":
+        return (
+            f"action=`{fields.get('hallucination_action')}` "
+            f"verdict=`{fields.get('hallucination_verdict')}` "
+            f"confidence={fields.get('hallucination_confidence', 0):.2f}"
+        )
+    if node == "pii_redact_output":
+        ents = fields.get("pii_entities_found") or {}
+        return f"action=`{fields.get('pii_redact_action')}` entities={ents}"
+    return ""
+
+
+async def _stream_invoke(
+    prompt: str, token: str, session_id: str
+):
+    """Async generator yielding (event_type, payload_dict) from /invoke/stream.
+
+    Parses the SSE wire format (event: / data: lines, blank-line
+    delimiters). Each yielded tuple corresponds to one SSE frame.
+    """
+    async with httpx.AsyncClient(verify=False, timeout=600.0) as client:
+        async with client.stream(
+            "POST",
+            f"{LANGGRAPH_URL}/invoke/stream",
+            headers={
+                "authorization": f"Bearer {token}",
+                "content-type": "application/json",
+                "accept": "text/event-stream",
+            },
+            json={
+                "prompt":     prompt,
+                "max_tokens": 600,
+                "session_id": session_id,
+                "top_k":      5,
+            },
+        ) as resp:
+            resp.raise_for_status()
+            event_type: str = ""
+            data_lines: list = []
+            async for line in resp.aiter_lines():
+                if line.startswith("event: "):
+                    event_type = line[7:].strip()
+                elif line.startswith("data: "):
+                    data_lines.append(line[6:])
+                elif line == "":
+                    # Blank line = end of frame. Emit if both halves
+                    # are present.
+                    if event_type and data_lines:
+                        try:
+                            payload = json.loads("\n".join(data_lines))
+                            yield (event_type, payload)
+                        except json.JSONDecodeError:
+                            pass
+                    event_type = ""
+                    data_lines = []
+
+
+async def _on_message_stream(
+    prompt: str, token: str, session_id: str, t0: float
+) -> None:
+    """Stream-consume /invoke/stream and render progressively."""
+    final_data: Dict[str, Any] = {}
+    open_steps: Dict[str, Any] = {}
+    error_payload: Dict[str, Any] = {}
+
+    async with cl.Step(name="LangGraph router", type="run") as outer:
+        outer.input = prompt
+
+        # Empty assistant bubble we'll stream tokens into.
+        msg = cl.Message(content="")
+        await msg.send()
+
+        try:
+            async for ev_type, ev_data in _stream_invoke(prompt, token, session_id):
+                if ev_type == "node_start":
+                    node = ev_data.get("node", "")
+                    if not node:
+                        continue
+                    step = cl.Step(
+                        name=node,
+                        type=_STEP_TYPE_BY_NODE.get(node, "tool"),
+                        parent_id=outer.id,
+                    )
+                    await step.send()
+                    open_steps[node] = step
+
+                elif ev_type == "node_end":
+                    node = ev_data.get("node", "")
+                    if not node:
+                        continue
+                    step = open_steps.pop(node, None)
+                    if step is not None:
+                        step.output = _format_node_end(node, ev_data) or " "
+                        await step.update()
+
+                elif ev_type == "token":
+                    content = ev_data.get("content", "")
+                    if content:
+                        await msg.stream_token(content)
+
+                elif ev_type == "done":
+                    final_data = ev_data
+                    break
+
+                elif ev_type == "error":
+                    error_payload = ev_data
+                    break
+
+        except httpx.HTTPStatusError as e:
+            outer.is_error = True
+            outer.output = (
+                f"upstream returned {e.response.status_code}: "
+                f"{e.response.text[:200]}"
+            )
+            await cl.Message(content=f"❌ {outer.output}").send()
+            return
+        except Exception as e:
+            outer.is_error = True
+            outer.output = f"{type(e).__name__}: {e}"
+            await cl.Message(content=f"❌ {outer.output}").send()
+            return
+
+        if error_payload:
+            outer.is_error = True
+            outer.output = (
+                f"upstream error: {error_payload.get('detail', 'unknown')}"
+            )
+            await cl.Message(content=f"❌ {outer.output}").send()
+            return
+
+        # Some safe-block paths short-circuit before tokens flow —
+        # populate the message from final_data.response if the bubble
+        # is still empty.
+        if not msg.content and final_data.get("response"):
+            msg.content = final_data["response"]
+            await msg.update()
+
+        # Outer step summary line — rolls up the final state.
+        outer.output = (
+            f"route={final_data.get('route')}  "
+            f"retrieved={final_data.get('retrieve_count', 0)}  "
+            f"cold_start={final_data.get('cold_start', False)}  "
+            f"latency={final_data.get('execute_latency_ms', 0)}ms  "
+            f"total={int((time.time() - t0) * 1000)}ms  "
+            f"cache_hit={final_data.get('cache_hit', False)}"
+        )
+
+    # Sources sidebar + Langfuse action — same shape as the sync
+    # handler builds.
+    elements: list = [
+        cl.Text(
+            name="routing.json",
+            content=json.dumps(final_data, indent=2),
+            display="side",
+        ),
+    ]
+    if final_data.get("retrieve_count", 0) > 0:
+        sources_md_lines = ["# Sources used as RAG context", ""]
+        for i, c in enumerate(final_data.get("retrieved_chunks", []), start=1):
+            src = c.get("source", "?")
+            chunk_idx = c.get("chunk_index", 0)
+            score = c.get("score", 0.0)
+            text = c.get("text", "")
+            sources_md_lines.append(
+                f"## [{i}] `{src}` — chunk {chunk_idx} (score={score:.3f})\n\n{text}\n"
+            )
+        elements.append(
+            cl.Text(
+                name="sources.md",
+                content="\n".join(sources_md_lines),
+                display="side",
+            )
+        )
+
+    actions: list = []
+    trace_id = final_data.get("langfuse_trace_id")
+    if trace_id:
+        actions.append(
+            cl.Action(
+                name="view_in_langfuse",
+                payload={"trace_id": trace_id},
+                label="🔍 View in Langfuse",
+                tooltip="Open the matching trace in Langfuse",
+            )
+        )
+
+    # Attach elements + actions to the streamed message we already
+    # sent. Chainlit's msg.update() picks up the new fields.
+    msg.elements = elements
+    msg.actions = actions
+    await msg.update()
+
+
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     if message.content.strip().lower() in ("/upload", "upload"):
@@ -375,6 +669,14 @@ async def on_message(message: cl.Message) -> None:
     prompt = message.content
     session_id = _thread_id()
     t0 = time.time()
+
+    # Phase #21: route to streaming or sync handler. Streaming gives
+    # token-by-token UX + node progress as it happens; sync remains
+    # for fallback debugging (or if SSE ever proves unreliable through
+    # an intermediate proxy).
+    if STREAM_ENABLED:
+        await _on_message_stream(prompt, token, session_id, t0)
+        return
 
     # Outer step wraps the entire /invoke. Inside, we render the four
     # state-graph nodes as nested steps with their measured timings
