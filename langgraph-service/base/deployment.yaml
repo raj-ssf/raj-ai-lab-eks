@@ -289,7 +289,24 @@ spec:
             - name: PLANNER_MAX_STEPS
               value: "5"
 
-            # --- Phase #10: user feedback loop -------------------------
+            # --- Phase #15: A/B canary variant routing -----------------
+            # Per-tier env-driven canary. Set CANARY_<TIER>_MODEL +
+            # CANARY_<TIER>_FRACTION to route a fraction of that tier's
+            # traffic to an alternate model name (typically a
+            # fine-tuned variant served on the same vLLM pod). All
+            # default to no canary (fraction=0).
+            #
+            # Lab example: route 10% of trivial-tier traffic to the
+            # Alpaca-LoRA variant for A/B comparison via
+            # langgraph_variant_total{route,variant} metrics + the
+            # variant_label surfaced in InvokeResponse + feedback
+            # ratings.
+            #
+            # - name: CANARY_TRIVIAL_MODEL
+            #   value: llama-3.1-8b-alpaca
+            # - name: CANARY_TRIVIAL_FRACTION
+            #   value: "0.1"
+
             # /feedback endpoints are unconditionally available — no
             # master switch. They depend on langgraph-redis being up
             # (where feedback persists) and Langfuse being reachable

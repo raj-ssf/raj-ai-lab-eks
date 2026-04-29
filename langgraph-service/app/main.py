@@ -285,6 +285,57 @@ ROUTE_REGISTRY: dict[str, dict] = {
     },
 }
 
+
+# --- Phase #15: canary variant routing per tier ----------------------------
+#
+# Per-tier env-driven canary: route a configurable fraction of requests
+# to an alternate model name (typically a fine-tuned variant served on
+# the same vLLM pod). The lab's vllm-llama-8b serves both "llama-3.1-8b"
+# (base) and "llama-3.1-8b-alpaca" (LoRA) — natural pair for canary.
+#
+# Per request, after classify picks a tier, _select_variant flips a
+# weighted coin to decide stable vs canary. The chosen model_name is
+# recorded in state.variant_name + state.variant_label and used by
+# node_execute. Both /invoke responses and the new LG_VARIANT_TOTAL
+# Counter expose the variant label for downstream A/B analysis.
+#
+# Env config shape:
+#   CANARY_<TIER>_MODEL=<model_name>     # alternate served-model-name
+#   CANARY_<TIER>_FRACTION=<0.0-1.0>     # request fraction to canary
+#
+# Default fraction is 0.0 — no canary unless explicitly configured.
+# Set per tier: CANARY_TRIVIAL_MODEL=llama-3.1-8b-alpaca,
+# CANARY_TRIVIAL_FRACTION=0.1 to canary 10% of trivial traffic to
+# the LoRA-merged variant.
+
+CANARY_CONFIG: dict[str, dict] = {}
+for _tier in ROUTE_REGISTRY.keys():
+    _model = os.environ.get(f"CANARY_{_tier.upper().replace('-','_')}_MODEL", "").strip()
+    _frac_raw = os.environ.get(f"CANARY_{_tier.upper().replace('-','_')}_FRACTION", "0").strip()
+    try:
+        _frac = max(0.0, min(1.0, float(_frac_raw)))
+    except ValueError:
+        _frac = 0.0
+    if _model and _frac > 0.0:
+        CANARY_CONFIG[_tier] = {"model": _model, "fraction": _frac}
+
+
+def _select_variant(route: str) -> tuple[str, str]:
+    """Return (model_name, variant_label) for a routed-to tier.
+
+    variant_label is "stable" when the request goes to the tier's
+    default model_name, "canary" when the canary roll triggered. Used
+    for telemetry + downstream A/B analysis.
+    """
+    cfg = ROUTE_REGISTRY[route]
+    canary = CANARY_CONFIG.get(route)
+    if not canary:
+        return (cfg["model_name"], "stable")
+    import random as _random
+    if _random.random() < canary["fraction"]:
+        return (canary["model"], "canary")
+    return (cfg["model_name"], "stable")
+
 # --- Kubernetes client (in-cluster config) ----------------------------------
 
 # Loaded once at import time. Reads the projected serviceaccount token + CA
@@ -419,6 +470,15 @@ LG_REQUEST_TOTAL = Counter(
     "langgraph_requests_total",
     "Total /invoke requests by routed-to tier.",
     ["route"],
+)
+# Phase #15: per-tier per-variant breakdown for A/B canary analysis.
+# Separate Counter (rather than adding a label to LG_REQUEST_TOTAL)
+# preserves backwards-compat for existing dashboards while letting
+# new A/B-specific panels query this series.
+LG_VARIANT_TOTAL = Counter(
+    "langgraph_variant_total",
+    "Per-tier per-variant request count for A/B canary analysis.",
+    ["route", "variant"],
 )
 LG_SAFETY_ACTION_TOTAL = Counter(
     "langgraph_safety_action_total",
@@ -763,6 +823,15 @@ class AgentState(TypedDict, total=False):
     plan_steps_count: int
     planner_action: Literal["planned", "skipped", "fail_open"]
     plan_ms: int
+    # Phase #15: A/B canary routing.
+    #   variant_name: the model name node_execute actually used. Equal
+    #     to ROUTE_REGISTRY[route].model_name on stable requests; equal
+    #     to CANARY_<TIER>_MODEL when the canary roll triggered.
+    #   variant_label: "stable" or "canary". Surfaced in metrics +
+    #     InvokeResponse so downstream eval tooling can correlate
+    #     ratings, latencies, etc. by variant.
+    variant_name: str
+    variant_label: Literal["stable", "canary"]
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -3182,6 +3251,12 @@ def node_execute(state: AgentState) -> AgentState:
     for a follow-up question.
     """
     cfg = ROUTE_REGISTRY[state["route"]]
+    # Phase #15: pick stable vs canary variant for this request. Most
+    # requests get the tier's default model_name; CANARY_<TIER>_FRACTION
+    # of them go to the canary model. Recorded in state for telemetry +
+    # response surfacing.
+    variant_name, variant_label = _select_variant(state["route"])
+    LG_VARIANT_TOTAL.labels(route=state["route"], variant=variant_label).inc()
     final_prompt = _build_rag_prompt(state["prompt"], state.get("retrieved_chunks", []))
     started = time.monotonic()
 
@@ -3194,7 +3269,7 @@ def node_execute(state: AgentState) -> AgentState:
         # and returns the full response as before. No behavior change
         # for non-streaming callers.
         client = ChatOpenAI(
-            model=cfg["model_name"],
+            model=variant_name,  # Phase #15: stable or canary
             base_url=cfg["url"],
             api_key="not-required",
             max_tokens=state.get("max_tokens", 512),
@@ -3223,6 +3298,8 @@ def node_execute(state: AgentState) -> AgentState:
             "execute_latency_ms": elapsed_ms,
             "tool_iterations": 0,
             "tool_calls_log": [],
+            "variant_name": variant_name,
+            "variant_label": variant_label,
         }
 
     # Path A — agentic loop with tool calling.
@@ -3237,7 +3314,7 @@ def node_execute(state: AgentState) -> AgentState:
     # build up into a structured tool_calls field that LangChain
     # surfaces only when the turn finishes.
     client = ChatOpenAI(
-        model=cfg["model_name"],
+        model=variant_name,  # Phase #15: stable or canary
         base_url=cfg["url"],
         api_key="not-required",
         max_tokens=state.get("max_tokens", 512),
@@ -3336,7 +3413,7 @@ def node_execute(state: AgentState) -> AgentState:
                 AGENT_MAX_ITERATIONS,
             )
             no_tools_client = ChatOpenAI(
-                model=cfg["model_name"],
+                model=variant_name,  # Phase #15: same variant as the loop
                 base_url=cfg["url"],
                 api_key="not-required",
                 max_tokens=state.get("max_tokens", 512),
@@ -3365,6 +3442,8 @@ def node_execute(state: AgentState) -> AgentState:
         "execute_latency_ms": elapsed_ms,
         "tool_iterations": iterations,
         "tool_calls_log": tool_calls_log,
+        "variant_name": variant_name,
+        "variant_label": variant_label,
     }
 
 
@@ -3824,6 +3903,13 @@ class InvokeResponse(BaseModel):
     plan_text: str = ""
     plan_steps_count: int = 0
     plan_ms: int = 0
+    # Phase #15: A/B canary variant. variant_name is the actual model
+    # name node_execute used (may differ from the tier's default).
+    # variant_label is "stable" | "canary" — surfaced for downstream
+    # eval correlation. The /feedback endpoint can record variant
+    # alongside ratings to enable per-variant satisfaction analysis.
+    variant_name: str = ""
+    variant_label: str = "stable"
 
 
 # --- Routes ----------------------------------------------------------------
@@ -3887,6 +3973,8 @@ def _build_invoke_response_dict(
         "plan_text": final_state.get("plan_text", ""),
         "plan_steps_count": final_state.get("plan_steps_count", 0),
         "plan_ms": final_state.get("plan_ms", 0),
+        "variant_name": final_state.get("variant_name", ""),
+        "variant_label": final_state.get("variant_label", "stable"),
     }
 
 
@@ -4042,7 +4130,10 @@ _NODE_END_FIELDS = {
     "retrieve": ["retrieve_count", "retrieve_ms"],
     "ensure_warm": ["cold_start", "warm_wait_seconds"],
     "plan": ["planner_action", "plan_steps_count"],
-    "execute": ["execute_latency_ms", "tool_iterations", "tool_calls_log"],
+    "execute": [
+        "execute_latency_ms", "tool_iterations", "tool_calls_log",
+        "variant_name", "variant_label",
+    ],
     "reflect": ["cycles", "needs_more_context"],
     "safety_output": ["safety_output_verdict", "safety_action"],
     "hallucination_check": [
