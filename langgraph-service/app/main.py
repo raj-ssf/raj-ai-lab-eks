@@ -172,10 +172,18 @@ ROUTE_REGISTRY: dict[str, dict] = {
         "model_name": MODEL_TUNED_LORA_NAME,
         "deployment": DEPLOY_TRIVIAL,
         "always_on": True,
-        # Tools work for the LoRA-merged model too — the adapter
-        # modifies attention/projection weights but keeps the chat
-        # template's tool-call grammar intact.
-        "supports_tools": True,
+        # Tools intentionally DISABLED for the LoRA-merged tier.
+        # Alpaca LoRA was trained on instruction-following text only;
+        # it never saw Llama 3.1's native tool-call grammar
+        # (<|python_tag|>{...}<|eom_id|>). At inference, the LoRA-
+        # shifted distribution emits tool calls as plain JSON in the
+        # text response, which vLLM's llama3_json parser doesn't
+        # detect — calls go through as text, tool_calls_log is empty,
+        # and the user sees raw JSON in chat-ui. Verified empirically
+        # 2026-04-29 in the Phase T smoke. Re-enable only after a
+        # fine-tune that includes tool-call data (e.g., on the
+        # toolbench dataset).
+        "supports_tools": False,
     },
     "reasoning": {
         "url": f"{MODEL_REASONING_URL}/v1",
