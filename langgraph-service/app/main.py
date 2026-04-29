@@ -1,12 +1,14 @@
 """langgraph-service — FastAPI front-end for a LangGraph router agent.
 
-Eight-node state machine on /invoke (budget + safety bookends + reasoning loop):
+Eleven-node state machine on /invoke (budget + safety bookends + memory
++ query rewriting + reasoning loop):
 
-    START -> budget_check -> safety_input -> classify -> retrieve
-                          -> ensure_warm -> execute -> reflect
-                          -> safety_output -> END
-              |                  |                          ^         |
-              v                  v                          |_________|  (loop, capped)
+    START -> budget_check -> safety_input -> load_memory -> rewrite_query
+                          -> classify -> retrieve -> ensure_warm
+                          -> execute -> reflect -> safety_output
+                          -> save_memory -> END
+              |                  |                              ^      |
+              v                  v                              |______|  (loop, capped)
               END (over budget)  END (refused)
 
 - budget_check: per-user daily request budget enforced via Redis
@@ -18,6 +20,15 @@ Eight-node state machine on /invoke (budget + safety bookends + reasoning loop):
   categories intersect SAFETY_BLOCK_CATEGORIES, the graph short-
   circuits to END with a refusal response. No-op when
   SAFETY_FILTER_ENABLED=false.
+- load_memory: reads recent conversation turns + long-term summary
+  from Redis (keyed by user + session_id). No-op when
+  MEMORY_ENABLED=false or no session_id. Fail-OPEN on Redis errors.
+- rewrite_query: takes the raw prompt + conversation context and
+  produces a STANDALONE search query (resolves pronouns, preserves
+  technical terms). Sets state.refined_query so node_retrieve uses
+  it (same field as Phase T2's reflect node — different writers,
+  sequenced correctly). No-op when QUERY_REWRITE_ENABLED=false or
+  no conversation context (first turn).
 - classify: always-on Llama 3.1 8B answers a JSON-schema classification
   prompt categorizing the user's input as `trivial` / `tuned-lora` /
   `reasoning` / `hard`.
@@ -35,6 +46,10 @@ Eight-node state machine on /invoke (budget + safety bookends + reasoning loop):
   routes back to retrieve; otherwise routes to safety_output.
 - safety_output: Llama Guard 3 8B grades the model's draft. If unsafe,
   replaces `response` with the refusal message before END.
+- save_memory: appends the (prompt, response) turn to Redis memory.
+  Skips on safety-blocked or budget-blocked paths. Re-summarizes
+  every MEMORY_SUMMARIZE_AFTER_TURNS turns to bound recent-turns
+  list size.
 
 Every node emits a Langfuse span via the LangChain callback handler. The
 whole flow is also instrumented for OTel so traces appear in Tempo.
@@ -489,6 +504,26 @@ class AgentState(TypedDict, total=False):
     budget_action: Literal["passed", "exceeded", "disabled", "fail_open", "fail_closed"]
     budget_consumed: int
     budget_remaining: int
+    # Phase #6: conversational memory + query rewriting bookkeeping.
+    #   memory_summary: long-term summary of the conversation (3-4
+    #     sentences, regenerated every MEMORY_SUMMARIZE_AFTER_TURNS turns).
+    #   memory_recent_turns: last MEMORY_RECENT_TURNS turn dicts
+    #     ({prompt, response, ts}). Populated by node_load_memory; used
+    #     by node_rewrite_query for context resolution.
+    #   query_rewritten: True if rewrite ran AND produced a refined_query
+    #     different from the original prompt. False on disabled / no
+    #     conversation context / rewrite returning identity.
+    #   original_prompt: preserved across rewrite so /invoke can return
+    #     both the verbatim user input AND the standalone search query.
+    #   memory_load_ms / memory_save_ms / query_rewrite_ms: per-node
+    #     latencies for telemetry.
+    memory_summary: str
+    memory_recent_turns: list[dict]
+    query_rewritten: bool
+    original_prompt: str
+    memory_load_ms: int
+    memory_save_ms: int
+    query_rewrite_ms: int
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -896,6 +931,346 @@ def _route_after_safety_input(state: AgentState) -> Literal["classify", "__end__
     return "classify"
 
 
+# --- Memory + query rewriting (Phase #6) -----------------------------------
+#
+# The three memory nodes share one Redis client (the same _get_redis()
+# helper Phase #5 set up). They store conversation state under two keys
+# per (user, session_id):
+#
+#   mem:<user>:<session>:turns    Redis LIST of JSON turn dicts.
+#                                 LPUSH on save, LRANGE on load. Capped
+#                                 at MEMORY_RECENT_TURNS via LTRIM.
+#   mem:<user>:<session>:summary  Redis STRING with the long-term summary.
+#                                 Updated every MEMORY_SUMMARIZE_AFTER_TURNS
+#                                 turns by a Llama 8B summarization call.
+#
+# Both keys carry MEMORY_TTL_SECONDS (default 7d). Each load/save
+# refreshes the TTL — active conversations stay alive, idle sessions
+# self-clean.
+#
+# Failure modes (Redis unreachable, malformed data, etc.) all fail-OPEN
+# — memory degrades gracefully to "no context loaded" and the request
+# proceeds with raw prompt. Memory is enrichment, not the critical path.
+
+
+_QUERY_REWRITE_SYSTEM_PROMPT = """You are a search query rewriter for a chat assistant with RAG retrieval.
+
+Read the conversation history and the user's latest message, then output a STANDALONE search query that captures the user's intent without requiring conversation context.
+
+Rules:
+- If the latest message is already a clear standalone question, output it unchanged.
+- Replace pronouns ("it", "that", "this", "they") with what they refer to from the conversation.
+- Preserve specific terms verbatim: function names, file names, technical jargon, model names.
+- Output ONLY the rewritten query as a single line. No explanation, no quotes, no prefix."""
+
+
+_MEMORY_SUMMARIZE_SYSTEM_PROMPT = """You are a conversation summarizer. Produce a 3-4 sentence summary of the conversation below capturing:
+1. What the user is overall trying to accomplish.
+2. Key facts, names, or decisions established.
+3. Any preferences expressed (e.g. "user prefers concise answers", "user works in Python").
+
+Keep it terse — this is conversation memory, not a transcript. Output ONLY the summary text. No headers, no bullet list."""
+
+
+def node_load_memory(state: AgentState) -> AgentState:
+    """Read recent turns + summary for (user, session_id) from Redis."""
+    if not MEMORY_ENABLED:
+        return {
+            "memory_summary": "",
+            "memory_recent_turns": [],
+            "memory_load_ms": 0,
+        }
+    user = state.get("user", "unknown")
+    session_id = state.get("session_id")
+    if not session_id:
+        return {
+            "memory_summary": "",
+            "memory_recent_turns": [],
+            "memory_load_ms": 0,
+        }
+
+    started = time.monotonic()
+    redis_client = _get_redis()
+    if redis_client is None:
+        log.warning("load_memory: redis unavailable, fail-open")
+        return {
+            "memory_summary": "",
+            "memory_recent_turns": [],
+            "memory_load_ms": int((time.monotonic() - started) * 1000),
+        }
+
+    try:
+        # Pipelined LRANGE + GET in one round-trip
+        pipe = redis_client.pipeline(transaction=False)
+        pipe.lrange(_memory_turns_key(user, session_id), 0, MEMORY_RECENT_TURNS - 1)
+        pipe.get(_memory_summary_key(user, session_id))
+        results = pipe.execute()
+        raw_turns: list[str] = results[0] or []
+        summary: str = results[1] or ""
+    except Exception as e:
+        log.warning("load_memory: redis op failed: %s, fail-open", e)
+        return {
+            "memory_summary": "",
+            "memory_recent_turns": [],
+            "memory_load_ms": int((time.monotonic() - started) * 1000),
+        }
+
+    import json as _json
+    parsed_turns: list[dict] = []
+    for entry in raw_turns:
+        try:
+            parsed_turns.append(_json.loads(entry))
+        except (_json.JSONDecodeError, TypeError):
+            # Defensive — skip a corrupted entry rather than fail the
+            # whole load. Could happen if memory format ever changes.
+            continue
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    log.info(
+        "load_memory user=%s session=%s turns=%d summary_chars=%d ms=%d",
+        user, session_id, len(parsed_turns), len(summary), elapsed_ms,
+    )
+    return {
+        "memory_summary": summary,
+        "memory_recent_turns": parsed_turns,
+        "memory_load_ms": elapsed_ms,
+    }
+
+
+def node_rewrite_query(state: AgentState) -> AgentState:
+    """Rewrite the user prompt as a standalone search query.
+
+    Uses Llama 3.1 8B (the always-on classifier tier) at temp=0.
+    Sets state.refined_query so node_retrieve picks it up (the same
+    field Phase T2's reflect node uses on loop iterations — different
+    writers, sequenced correctly by graph topology).
+
+    Skips when:
+      - QUERY_REWRITE_ENABLED is false
+      - No conversation context (no recent turns AND no summary) — the
+        prompt IS already standalone, no rewrite would change it
+      - LLM call fails (fail-open, retrieve uses original prompt)
+    """
+    original_prompt = state.get("prompt", "")
+    if not QUERY_REWRITE_ENABLED:
+        return {
+            "original_prompt": original_prompt,
+            "query_rewritten": False,
+            "query_rewrite_ms": 0,
+        }
+
+    recent_turns = state.get("memory_recent_turns") or []
+    summary = state.get("memory_summary") or ""
+    if not recent_turns and not summary:
+        # First turn of a conversation — prompt IS the standalone query.
+        return {
+            "original_prompt": original_prompt,
+            "query_rewritten": False,
+            "query_rewrite_ms": 0,
+        }
+
+    # Build the user-facing prompt: summary (if any) + last few turns
+    # + the new message. Keep the recent turns short — only enough for
+    # pronoun resolution, not full transcript.
+    parts: list[str] = []
+    if summary:
+        parts.append(f"Conversation so far (summary): {summary}")
+    if recent_turns:
+        parts.append("Recent turns:")
+        # Memory list is newest-first (LPUSH); reverse for chronological
+        # order in the prompt.
+        for turn in reversed(recent_turns[-MEMORY_RECENT_TURNS:]):
+            user_msg = (turn.get("prompt") or "")[:200]
+            ai_msg = (turn.get("response") or "")[:200]
+            parts.append(f"  User: {user_msg}")
+            parts.append(f"  Assistant: {ai_msg}")
+    parts.append(f"\nLatest message: {original_prompt}")
+    parts.append("\nStandalone search query:")
+    user_msg_text = "\n".join(parts)
+
+    started = time.monotonic()
+    cfg_trivial = ROUTE_REGISTRY["trivial"]
+    client = ChatOpenAI(
+        model=cfg_trivial["model_name"],
+        base_url=cfg_trivial["url"],
+        api_key="not-required",
+        temperature=0.0,
+        max_tokens=QUERY_REWRITE_MAX_TOKENS,
+        timeout=QUERY_REWRITE_TIMEOUT_SECONDS,
+    )
+    try:
+        response = client.invoke([
+            SystemMessage(content=_QUERY_REWRITE_SYSTEM_PROMPT),
+            HumanMessage(content=user_msg_text),
+        ])
+        rewritten = (response.content or "").strip()
+    except Exception as e:
+        log.warning("rewrite_query: LLM call failed: %s, fail-open", e)
+        return {
+            "original_prompt": original_prompt,
+            "query_rewritten": False,
+            "query_rewrite_ms": int((time.monotonic() - started) * 1000),
+        }
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    # If the rewrite is empty or identical to the original, skip setting
+    # refined_query — no point in retrieve doing extra work for the same
+    # search string.
+    if not rewritten or rewritten == original_prompt.strip():
+        log.info("rewrite_query: identity (no rewrite needed) ms=%d", elapsed_ms)
+        return {
+            "original_prompt": original_prompt,
+            "query_rewritten": False,
+            "query_rewrite_ms": elapsed_ms,
+        }
+
+    log.info(
+        "rewrite_query rewrote=%r -> %r ms=%d",
+        original_prompt[:80], rewritten[:80], elapsed_ms,
+    )
+    return {
+        "original_prompt": original_prompt,
+        "query_rewritten": True,
+        "refined_query": rewritten,  # consumed by node_retrieve
+        "query_rewrite_ms": elapsed_ms,
+    }
+
+
+def node_save_memory(state: AgentState) -> AgentState:
+    """Append the new turn at the end of the graph.
+
+    Runs AFTER safety_output so we save what the user actually saw
+    (e.g. refusal text on safety block, not the unsafe draft). Skips
+    on safety-blocked paths AND budget-blocked paths so we don't
+    pollute the conversation history with failed attempts.
+
+    If the post-save turn count crosses MEMORY_SUMMARIZE_AFTER_TURNS,
+    re-summarize and update the summary key.
+    """
+    if not MEMORY_ENABLED:
+        return {"memory_save_ms": 0}
+    user = state.get("user", "unknown")
+    session_id = state.get("session_id")
+    if not session_id:
+        return {"memory_save_ms": 0}
+
+    # Don't save blocked attempts
+    if state.get("safety_action") in ("blocked_input", "blocked_output"):
+        return {"memory_save_ms": 0}
+    if state.get("budget_action") in ("exceeded", "fail_closed"):
+        return {"memory_save_ms": 0}
+
+    started = time.monotonic()
+    redis_client = _get_redis()
+    if redis_client is None:
+        log.warning("save_memory: redis unavailable, skipping")
+        return {"memory_save_ms": int((time.monotonic() - started) * 1000)}
+
+    import json as _json
+    turn = {
+        "prompt": state.get("original_prompt") or state.get("prompt") or "",
+        "response": state.get("response") or "",
+        "ts": time.time(),
+    }
+    turns_key = _memory_turns_key(user, session_id)
+    summary_key = _memory_summary_key(user, session_id)
+
+    try:
+        # LPUSH new turn at head, LTRIM to bounded length, set TTL.
+        # Single round-trip via pipeline.
+        pipe = redis_client.pipeline(transaction=False)
+        pipe.lpush(turns_key, _json.dumps(turn))
+        # Keep up to 2x MEMORY_RECENT_TURNS so summarization has more
+        # input than rewrite uses. Older entries get trimmed.
+        pipe.ltrim(turns_key, 0, MEMORY_RECENT_TURNS * 2 - 1)
+        pipe.expire(turns_key, MEMORY_TTL_SECONDS)
+        pipe.expire(summary_key, MEMORY_TTL_SECONDS)
+        pipe.llen(turns_key)
+        results = pipe.execute()
+        new_len = int(results[-1])
+    except Exception as e:
+        log.warning("save_memory: redis op failed: %s", e)
+        return {"memory_save_ms": int((time.monotonic() - started) * 1000)}
+
+    # Re-summarize every Nth turn. Cheap LLM call (Llama 8B, ~200 tokens
+    # in / 80 tokens out), runs in the request's tail latency. If you
+    # want it off the hot path, move to a background goroutine — the
+    # pattern would be: fire+forget a separate thread or async task that
+    # writes the summary key. For lab simplicity, inline.
+    if new_len > 0 and new_len % MEMORY_SUMMARIZE_AFTER_TURNS == 0:
+        _summarize_memory(redis_client, user, session_id, turns_key, summary_key)
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    log.info(
+        "save_memory user=%s session=%s turn_count=%d ms=%d",
+        user, session_id, new_len, elapsed_ms,
+    )
+    return {"memory_save_ms": elapsed_ms}
+
+
+def _summarize_memory(
+    redis_client,
+    user: str,
+    session_id: str,
+    turns_key: str,
+    summary_key: str,
+) -> None:
+    """Regenerate the long-term summary from all recent turns.
+
+    Best-effort — failures log + no-op (the next save will retry on
+    the same threshold). The previous summary stays valid until
+    overwritten.
+    """
+    import json as _json
+    try:
+        raw_turns = redis_client.lrange(turns_key, 0, -1) or []
+    except Exception as e:
+        log.warning("summarize_memory: lrange failed: %s", e)
+        return
+
+    parts: list[str] = []
+    for raw in reversed(raw_turns):  # chronological
+        try:
+            t = _json.loads(raw)
+            parts.append(f"User: {(t.get('prompt') or '')[:300]}")
+            parts.append(f"Assistant: {(t.get('response') or '')[:300]}")
+        except (_json.JSONDecodeError, TypeError):
+            continue
+    if not parts:
+        return
+
+    cfg_trivial = ROUTE_REGISTRY["trivial"]
+    client = ChatOpenAI(
+        model=cfg_trivial["model_name"],
+        base_url=cfg_trivial["url"],
+        api_key="not-required",
+        temperature=0.0,
+        max_tokens=192,  # 3-4 sentences fits comfortably
+        timeout=QUERY_REWRITE_TIMEOUT_SECONDS,
+    )
+    try:
+        response = client.invoke([
+            SystemMessage(content=_MEMORY_SUMMARIZE_SYSTEM_PROMPT),
+            HumanMessage(content="Conversation:\n" + "\n".join(parts)),
+        ])
+        new_summary = (response.content or "").strip()
+    except Exception as e:
+        log.warning("summarize_memory: LLM call failed: %s", e)
+        return
+
+    if not new_summary:
+        return
+    try:
+        redis_client.set(summary_key, new_summary, ex=MEMORY_TTL_SECONDS)
+        log.info(
+            "summarize_memory user=%s session=%s summary_chars=%d",
+            user, session_id, len(new_summary),
+        )
+    except Exception as e:
+        log.warning("summarize_memory: set failed: %s", e)
+
+
 def node_classify(state: AgentState) -> AgentState:
     """Use the always-on Llama 8B to label the prompt's tier."""
     cfg = ROUTE_REGISTRY["trivial"]
@@ -1293,6 +1668,62 @@ BUDGET_REFUSAL_MESSAGE = os.environ.get(
     "BUDGET_REFUSAL_MESSAGE",
     "Daily request budget exhausted. Try again after UTC midnight.",
 )
+
+# --- Phase #6: conversational memory + query rewriting --------------------
+#
+# Two coupled features that compound on each other:
+#
+#   load_memory:   reads recent conversation turns + long-term summary
+#                  from Redis (keyed per user + session_id).
+#   rewrite_query: takes the raw user prompt + conversation context and
+#                  produces a standalone search query — replaces pronouns,
+#                  resolves "it"/"that" against the conversation, preserves
+#                  technical terms verbatim. Sets state.refined_query so
+#                  node_retrieve uses it (the Phase T2 mechanism).
+#   save_memory:   appends the (prompt, response) turn at the end of the
+#                  graph, re-summarizes every N turns to bound the
+#                  recent-turns list size.
+#
+# Why per-(user, session) keying and not just per-session: prevents any
+# accidental cross-user leakage if two users somehow shared a session_id
+# (chat-ui generates UUIDs so it's unlikely, but the cost is one extra
+# string in the Redis key).
+#
+# 7-day TTL on memory keys gives a sensible idle-session expiry. Manual
+# right-to-deletion is `redis-cli --scan --pattern 'mem:<user>:*' | xargs
+# redis-cli del`.
+#
+# Reuses the same Redis client (_get_redis from Phase #5) — different
+# key prefix (mem: vs cost:), same connection pool.
+MEMORY_ENABLED = os.environ.get("MEMORY_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+MEMORY_RECENT_TURNS = int(os.environ.get("MEMORY_RECENT_TURNS", "5"))
+MEMORY_SUMMARIZE_AFTER_TURNS = int(
+    os.environ.get("MEMORY_SUMMARIZE_AFTER_TURNS", "10")
+)
+MEMORY_TTL_SECONDS = int(os.environ.get("MEMORY_TTL_SECONDS", str(7 * 86400)))
+MEMORY_TIMEOUT_SECONDS = float(os.environ.get("MEMORY_TIMEOUT_SECONDS", "2"))
+
+QUERY_REWRITE_ENABLED = os.environ.get("QUERY_REWRITE_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+QUERY_REWRITE_MAX_TOKENS = int(os.environ.get("QUERY_REWRITE_MAX_TOKENS", "96"))
+QUERY_REWRITE_TIMEOUT_SECONDS = float(
+    os.environ.get("QUERY_REWRITE_TIMEOUT_SECONDS", "10")
+)
+
+
+def _memory_turns_key(user: str, session_id: str) -> str:
+    return f"mem:{user}:{session_id}:turns"
+
+
+def _memory_summary_key(user: str, session_id: str) -> str:
+    return f"mem:{user}:{session_id}:summary"
 
 # Lazy-initialized at first use. Reused across requests via the same
 # connection-pooled client. redis-py is thread-safe for this usage.
@@ -1843,12 +2274,15 @@ def build_graph() -> StateGraph:
     g: StateGraph = StateGraph(AgentState)
     g.add_node("budget_check", node_budget_check)
     g.add_node("safety_input", node_safety_input)
+    g.add_node("load_memory", node_load_memory)
+    g.add_node("rewrite_query", node_rewrite_query)
     g.add_node("classify", node_classify)
     g.add_node("retrieve", node_retrieve)
     g.add_node("ensure_warm", node_ensure_warm)
     g.add_node("execute", node_execute)
     g.add_node("reflect", node_reflect)
     g.add_node("safety_output", node_safety_output)
+    g.add_node("save_memory", node_save_memory)
     g.add_edge(START, "budget_check")
     g.add_conditional_edges(
         "budget_check",
@@ -1858,8 +2292,12 @@ def build_graph() -> StateGraph:
     g.add_conditional_edges(
         "safety_input",
         _route_after_safety_input,
-        {"classify": "classify", END: END},
+        # Now routes to load_memory rather than directly to classify so
+        # the rewrite_query node has conversation context to work with.
+        {"classify": "load_memory", END: END},
     )
+    g.add_edge("load_memory", "rewrite_query")
+    g.add_edge("rewrite_query", "classify")
     g.add_edge("classify", "retrieve")
     g.add_edge("retrieve", "ensure_warm")
     g.add_edge("ensure_warm", "execute")
@@ -1869,7 +2307,12 @@ def build_graph() -> StateGraph:
         _route_after_reflect,
         {"retrieve": "retrieve", END: "safety_output"},
     )
-    g.add_edge("safety_output", END)
+    # safety_output → save_memory → END so the persisted turn is the
+    # text the user actually saw (refusal text on block, real answer
+    # otherwise). save_memory itself short-circuits on safety-blocked
+    # or budget-blocked paths so failed attempts don't pollute history.
+    g.add_edge("safety_output", "save_memory")
+    g.add_edge("save_memory", END)
     return g.compile()
 
 
@@ -1955,6 +2398,16 @@ class InvokeResponse(BaseModel):
     budget_action: str = "disabled"
     budget_consumed: int = 0
     budget_remaining: int = 0
+    # Phase #6: memory + query rewriting telemetry. query_rewritten
+    # is the standalone search query (set when rewrite ran AND
+    # produced something different from the original prompt; empty
+    # otherwise). memory_turn_count helps chat-ui render "you've
+    # had N turns in this session" widgets.
+    query_rewritten: str = ""
+    query_rewrite_ms: int = 0
+    memory_turn_count: int = 0
+    memory_load_ms: int = 0
+    memory_save_ms: int = 0
 
 
 # --- Routes ----------------------------------------------------------------
@@ -2054,4 +2507,12 @@ def invoke(
         budget_action=final_state.get("budget_action", "disabled"),
         budget_consumed=final_state.get("budget_consumed", 0),
         budget_remaining=final_state.get("budget_remaining", 0),
+        query_rewritten=(
+            final_state.get("refined_query", "") or ""
+            if final_state.get("query_rewritten") else ""
+        ),
+        query_rewrite_ms=final_state.get("query_rewrite_ms", 0),
+        memory_turn_count=len(final_state.get("memory_recent_turns") or []),
+        memory_load_ms=final_state.get("memory_load_ms", 0),
+        memory_save_ms=final_state.get("memory_save_ms", 0),
     )

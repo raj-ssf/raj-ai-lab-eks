@@ -173,6 +173,35 @@ spec:
             - name: BUDGET_FAIL_MODE
               value: open
 
+            # --- Phase #6: conversational memory + query rewriting -----
+            # Both default to false so existing /invoke behavior is
+            # unchanged on this commit. Flip to "true" once chat-ui
+            # passes session_id consistently and you've smoked the
+            # rewrite quality on real conversations. The feature
+            # depends on langgraph-redis being reachable; failure mode
+            # is graceful (no memory loaded, raw prompt used for
+            # retrieve) — the request never errors due to memory.
+            - name: MEMORY_ENABLED
+              value: "false"
+            # Recent turns the rewrite_query node sees as conversation
+            # context. 5 is enough for typical pronoun resolution; bump
+            # if users reference content from earlier in the session.
+            - name: MEMORY_RECENT_TURNS
+              value: "5"
+            # Re-summarize every Nth turn. 10 means once a conversation
+            # crosses 10 turns, the summary regenerates from the last
+            # 10 turns. Lower N = more LLM cost, fresher summary;
+            # higher N = stale summary risk on long conversations.
+            - name: MEMORY_SUMMARIZE_AFTER_TURNS
+              value: "10"
+            # 7-day TTL on memory keys. Idle sessions self-clean.
+            # Active sessions get TTL refresh on every save/load.
+            - name: MEMORY_TTL_SECONDS
+              value: "604800"
+
+            - name: QUERY_REWRITE_ENABLED
+              value: "false"
+
           envFrom:
             # Langfuse keys live in a Secret created by
             # raj-ai-lab-eks-infra/langgraph.tf, mirroring the
