@@ -828,12 +828,19 @@ spec:
           ports:
             - { name: http, containerPort: 8000 }
           resources:
-            # bge-reranker-v2-m3 fits in <2 GB VRAM. L4's 24 GB is
-            # massive overprovisioning — but the gpu-experiments
-            # NodePool is the only Ampere+ pool, and we'd rather not
-            # pay the autoscale overhead for a smaller cheaper instance.
-            requests: { nvidia.com/gpu: "1", cpu: "1", memory: "2Gi" }
-            limits:   { nvidia.com/gpu: "1", cpu: "2", memory: "4Gi" }
+            # The model is ~2.2 GB on disk; TEI loads it into host RAM
+            # before copying to GPU, which peaks at ~4-6 GB total
+            # (model + tokenizer + Rust + CUDA driver overhead). 4Gi
+            # limit was too tight — first deploy hit OOMKilled (exit
+            # 137) at the FlashBert init step. Bumped to 8Gi to give
+            # comfortable headroom.
+            #
+            # GPU-side: bge-reranker-v2-m3 fits in <2 GB VRAM. L4's 24
+            # GB is massive overprovisioning, but g6.xlarge is the
+            # cheapest Ampere+ instance — paying the GPU price for
+            # the smallest available is fine.
+            requests: { nvidia.com/gpu: "1", cpu: "1", memory: "4Gi" }
+            limits:   { nvidia.com/gpu: "1", cpu: "2", memory: "8Gi" }
           startupProbe:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 15
