@@ -338,6 +338,292 @@ async def _handle_upload() -> None:
             ).send()
 
 
+# -- /export + /delete-session (Phase #22) -----------------------------------
+#
+# UX-side companion to Phase #17's GDPR primitives. Two slash commands:
+#   /export           Fetch /session/<id>/export + /feedback/stats from
+#                     langgraph-service, format as a downloadable
+#                     markdown file via cl.File.
+#   /delete-session   Call DELETE /session/<id> on langgraph-service to
+#                     atomically wipe per-(user, session) data — memory
+#                     turns/summary + cache entries. Does NOT clear
+#                     conversation history rendered in the Chainlit
+#                     thread itself (that's the user's local UI state).
+
+
+async def _call_session_export(
+    token: str, session_id: str
+) -> Dict[str, Any]:
+    """GET /session/{session_id}/export. Raises on HTTP error."""
+    async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
+        r = await client.get(
+            f"{LANGGRAPH_URL}/session/{session_id}/export",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def _call_feedback_stats(token: str, limit: int = 50) -> Dict[str, Any]:
+    """GET /feedback/stats?limit=N. Returns {} on error (best-effort —
+    feedback is enrichment for the export, not the critical path)."""
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+            r = await client.get(
+                f"{LANGGRAPH_URL}/feedback/stats?limit={limit}",
+                headers={"authorization": f"Bearer {token}"},
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return {}
+
+
+async def _call_session_delete(
+    token: str, session_id: str
+) -> Dict[str, Any]:
+    """DELETE /session/{session_id}. Raises on HTTP error."""
+    async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
+        r = await client.delete(
+            f"{LANGGRAPH_URL}/session/{session_id}",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+def _format_export_markdown(
+    export: Dict[str, Any], stats: Dict[str, Any]
+) -> str:
+    """Render the export payload as a single human-readable markdown
+    document. Sections: header, memory summary, recent turns, cache
+    entries, recent feedback. Designed to be useful both as a
+    download (auditor reads it) and as a paste-into-chat reference
+    if the user wants to resume a conversation later."""
+    from datetime import datetime, timezone
+    import json as _json
+
+    user = export.get("user", "unknown")
+    session_id = export.get("session_id", "unknown")
+    captured_at = datetime.now(timezone.utc).isoformat()
+
+    lines: list[str] = []
+    lines.append("# Session export")
+    lines.append("")
+    lines.append(f"- **User**: `{user}`")
+    lines.append(f"- **Session ID**: `{session_id}`")
+    lines.append(f"- **Captured at**: {captured_at}")
+    lines.append(
+        f"- **Memory turns**: {export.get('memory_turn_count', 0)}"
+    )
+    lines.append(
+        f"- **Cache entries**: {export.get('cache_entry_count', 0)}"
+    )
+    if stats:
+        lines.append(
+            f"- **Feedback (all sessions)**: total={stats.get('total', 0)} "
+            f"up={stats.get('up', 0)} down={stats.get('down', 0)}"
+        )
+    lines.append("")
+
+    # Long-term summary
+    summary = export.get("memory_summary") or ""
+    lines.append("## Conversation summary")
+    lines.append("")
+    if summary:
+        lines.append(summary)
+    else:
+        lines.append("_(none yet — summary is regenerated every "
+                     "MEMORY_SUMMARIZE_AFTER_TURNS turns)_")
+    lines.append("")
+
+    # Recent turns
+    lines.append("## Recent turns")
+    lines.append("")
+    turns = export.get("memory_turns") or []
+    if not turns:
+        lines.append("_(no turns saved yet)_")
+    else:
+        # Memory list is newest-first (LPUSH); render chronologically
+        for turn in reversed(turns):
+            ts_raw = turn.get("ts", 0)
+            try:
+                ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc).isoformat()
+            except (TypeError, ValueError):
+                ts = "unknown"
+            lines.append(f"### {ts}")
+            lines.append("")
+            lines.append("**User:**")
+            lines.append("")
+            lines.append("```")
+            lines.append(turn.get("prompt", ""))
+            lines.append("```")
+            lines.append("")
+            lines.append("**Assistant:**")
+            lines.append("")
+            lines.append(turn.get("response", ""))
+            lines.append("")
+    lines.append("")
+
+    # Cache entries
+    lines.append("## Cache entries")
+    lines.append("")
+    cache_entries = export.get("cache_entries") or []
+    if not cache_entries:
+        lines.append("_(no cached responses for this session)_")
+    else:
+        for i, entry in enumerate(cache_entries, start=1):
+            lines.append(f"### #{i}")
+            lines.append("")
+            lines.append(f"**Prompt:** `{entry.get('prompt', '')[:200]}`")
+            lines.append("")
+            lines.append("**Response:**")
+            lines.append("")
+            lines.append(entry.get("response", ""))
+            lines.append("")
+    lines.append("")
+
+    # Feedback
+    lines.append("## Recent feedback")
+    lines.append("")
+    recent_fb = (stats or {}).get("recent") or []
+    if not recent_fb:
+        lines.append("_(no feedback submitted)_")
+    else:
+        for fb in recent_fb[:25]:
+            ts_raw = fb.get("ts", 0)
+            try:
+                ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc).isoformat()
+            except (TypeError, ValueError):
+                ts = "unknown"
+            rating = fb.get("rating", "?")
+            comment = (fb.get("comment") or "").strip()
+            cats = fb.get("categories") or []
+            lines.append(
+                f"- {ts} **rating:** `{rating}` "
+                f"`trace={fb.get('trace_id', '')[:16]}…`"
+                + (f" categories={cats}" if cats else "")
+                + (f"\n  > {comment}" if comment else "")
+            )
+    lines.append("")
+
+    # Raw JSON appendix — useful for programmatic consumers
+    lines.append("## Appendix: raw JSON")
+    lines.append("")
+    lines.append("### export")
+    lines.append("```json")
+    lines.append(_json.dumps(export, indent=2))
+    lines.append("```")
+    if stats:
+        lines.append("")
+        lines.append("### feedback_stats")
+        lines.append("```json")
+        lines.append(_json.dumps(stats, indent=2))
+        lines.append("```")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+async def _handle_export() -> None:
+    """Slash command: fetch + render the user's session as a download."""
+    token = _user_token()
+    if not token:
+        await cl.Message(content="Not authenticated. Refresh and log in again.").send()
+        return
+    session_id = _thread_id()
+    async with cl.Step(name="export", type="tool") as step:
+        step.input = f"session_id={session_id[:8]}…"
+        try:
+            export = await _call_session_export(token, session_id)
+            stats = await _call_feedback_stats(token, limit=50)
+        except httpx.HTTPStatusError as e:
+            step.is_error = True
+            step.output = (
+                f"upstream returned {e.response.status_code}: "
+                f"{e.response.text[:200]}"
+            )
+            await cl.Message(content=f"❌ {step.output}").send()
+            return
+        except Exception as e:
+            step.is_error = True
+            step.output = f"{type(e).__name__}: {e}"
+            await cl.Message(content=f"❌ {step.output}").send()
+            return
+
+        md = _format_export_markdown(export, stats)
+        step.output = (
+            f"exported memory_turns={export.get('memory_turn_count', 0)} "
+            f"cache_entries={export.get('cache_entry_count', 0)} "
+            f"feedback_total={(stats or {}).get('total', 0)}"
+        )
+
+    # Render the markdown both inline (preview) and as a downloadable file.
+    # cl.File takes content as bytes; encode UTF-8.
+    safe_session = "".join(c if c.isalnum() or c in "-_" else "_" for c in session_id)[:40]
+    filename = f"session-export-{safe_session}.md"
+    elements = [
+        cl.File(
+            name=filename,
+            content=md.encode("utf-8"),
+            display="inline",
+            mime="text/markdown",
+        ),
+    ]
+    preview_lines = md.splitlines()[:30]
+    preview = "\n".join(preview_lines)
+    if len(preview_lines) < len(md.splitlines()):
+        preview += "\n\n_(truncated — download the file for the full export)_"
+    await cl.Message(
+        content=(
+            f"📦 Session export ready. {export.get('memory_turn_count', 0)} memory "
+            f"turns + {export.get('cache_entry_count', 0)} cache entries.\n\n"
+            f"```markdown\n{preview}\n```"
+        ),
+        elements=elements,
+    ).send()
+
+
+async def _handle_delete_session() -> None:
+    """Slash command: atomic wipe of per-(user, session) data."""
+    token = _user_token()
+    if not token:
+        await cl.Message(content="Not authenticated. Refresh and log in again.").send()
+        return
+    session_id = _thread_id()
+    async with cl.Step(name="delete-session", type="tool") as step:
+        step.input = f"session_id={session_id[:8]}…"
+        try:
+            result = await _call_session_delete(token, session_id)
+        except httpx.HTTPStatusError as e:
+            step.is_error = True
+            step.output = (
+                f"upstream returned {e.response.status_code}: "
+                f"{e.response.text[:200]}"
+            )
+            await cl.Message(content=f"❌ {step.output}").send()
+            return
+        except Exception as e:
+            step.is_error = True
+            step.output = f"{type(e).__name__}: {e}"
+            await cl.Message(content=f"❌ {step.output}").send()
+            return
+
+        deleted = result.get("deleted_keys", 0)
+        step.output = f"deleted_keys={deleted}"
+
+    await cl.Message(
+        content=(
+            f"🗑️ Session data wiped. Deleted **{result.get('deleted_keys', 0)}** "
+            f"Redis keys for session `{session_id[:8]}…`. "
+            f"Memory + cache for this session are gone.\n\n"
+            f"_(Note: this does not clear the conversation history shown above "
+            f"in this thread — that's local UI state. Reload the page or start "
+            f"a new chat for a clean slate.)_"
+        ),
+    ).send()
+
+
 # -- Chat handler ------------------------------------------------------------
 
 async def _call_invoke(prompt: str, token: str, session_id: str) -> Dict[str, Any]:
@@ -653,8 +939,15 @@ async def _on_message_stream(
 
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
-    if message.content.strip().lower() in ("/upload", "upload"):
+    cmd = message.content.strip().lower()
+    if cmd in ("/upload", "upload"):
         await _handle_upload()
+        return
+    if cmd in ("/export", "export"):
+        await _handle_export()
+        return
+    if cmd in ("/delete-session", "/forget"):
+        await _handle_delete_session()
         return
 
     # Retrieve the Keycloak access_token from the User object's metadata
