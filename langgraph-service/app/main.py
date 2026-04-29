@@ -545,6 +545,7 @@ Output ONLY the single word. No explanation. No punctuation."""
 def _llama_guard_check(
     role: Literal["user", "assistant"],
     content: str,
+    user_context: Optional[str] = None,
 ) -> tuple[str, list[str], int]:
     """Score `content` for safety via vllm-llama-guard-3-8b.
 
@@ -553,6 +554,16 @@ def _llama_guard_check(
       categories  list of S-codes that triggered the unsafe verdict
                   (e.g. ["S1", "S10"]); empty otherwise
       latency_ms  wall time for the round-trip
+
+    user_context: when scoring an assistant turn (role="assistant"),
+      Llama Guard's chat template requires a USER turn before the
+      ASSISTANT turn — its safety prompt is "score the LAST agent
+      message in the conversation," and a conversation that starts
+      with the assistant has no "last agent" since there's no
+      preceding context. Sending only an AIMessage returns vLLM 500
+      (chat-template assertion failure). Pass the original user prompt
+      as user_context so the model sees the real exchange. Caller
+      passes state["prompt"] from node_safety_output.
 
     Failure mode (Llama Guard unreachable, malformed output, etc.):
       SAFETY_FAIL_MODE=open   -> verdict="fail_open", treated as safe
@@ -577,13 +588,21 @@ def _llama_guard_check(
         max_tokens=96,
         timeout=SAFETY_TIMEOUT_SECONDS,
     )
-    msg = (
-        HumanMessage(content=content)
-        if role == "user"
-        else AIMessage(content=content)
-    )
+    if role == "user":
+        msgs: list = [HumanMessage(content=content)]
+    else:
+        # Build a user→assistant conversation for the chat template.
+        # Use the actual prior user prompt if the caller supplied it;
+        # otherwise a generic placeholder still keeps the template
+        # well-formed (Llama Guard scores the LAST agent turn against
+        # the categories regardless of how informative the user turn
+        # was).
+        msgs = [
+            HumanMessage(content=user_context or "(prior user message not provided)"),
+            AIMessage(content=content),
+        ]
     try:
-        response = client.invoke([msg])
+        response = client.invoke(msgs)
         raw = (response.content or "").strip()
     except Exception as e:
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -827,7 +846,13 @@ def node_safety_output(state: AgentState) -> AgentState:
             "safety_output_ms": 0,
         }
 
-    verdict, categories, ms = _llama_guard_check("assistant", response)
+    # Pass the original prompt as user_context so Llama Guard's chat
+    # template sees a well-formed user→assistant conversation. Without
+    # this, vLLM 500s on the lone-assistant turn (caught in the Phase
+    # #4 activation smoke 2026-04-29).
+    verdict, categories, ms = _llama_guard_check(
+        "assistant", response, user_context=state.get("prompt"),
+    )
     log.info(
         "safety_output verdict=%s categories=%s ms=%d",
         verdict,
