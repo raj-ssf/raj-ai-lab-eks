@@ -390,10 +390,20 @@ class AgentState(TypedDict, total=False):
 # latency only on cold starts.
 CLASSIFIER_SYSTEM_PROMPT = """You are a routing classifier. Read the user's prompt and output exactly one word from this set:
 
-- trivial: factual recall, simple math, yes/no questions, very short answers
-- tuned-lora: instruction-following with explanation; "how do I...", "explain...", "what is the difference between...", tutorial-style requests where a verbose, structured answer is expected
-- reasoning: multi-step thinking, chain-of-thought, math word problems, logic puzzles
-- hard: complex tasks (long-form writing, code generation, deep analysis)
+- trivial: single-fact recall, single-step arithmetic, yes/no, short factual lookup. Answer fits in one sentence and needs no working out.
+- reasoning: multi-step thinking, chain-of-thought, math WORD problems (anything where the user describes a scenario and asks you to compute the answer through several steps), logic puzzles, deduction. If the prompt requires combining 2+ facts or doing 2+ calculations, this is reasoning — NOT trivial.
+- tuned-lora: instruction-following with explanation; "how do I...", "explain...", "what is the difference between...", tutorial-style requests where a verbose, structured answer is expected. Use this for explanations of concepts, NOT for math/logic problems.
+- hard: complex tasks (long-form writing, code generation, deep analysis, multi-paragraph essays)
+
+Examples:
+  Prompt: "What's the capital of France?" -> trivial
+  Prompt: "What is 2+2?" -> trivial
+  Prompt: "If a train leaves Chicago at 3pm going 60mph and another leaves NYC at 4pm going 80mph, when do they meet?" -> reasoning
+  Prompt: "If A implies B and B implies C, does A imply C?" -> reasoning
+  Prompt: "Explain how Kubernetes pods work." -> tuned-lora
+  Prompt: "How do I write a Python decorator?" -> tuned-lora
+  Prompt: "Write a 1000-word essay comparing capitalism and socialism." -> hard
+  Prompt: "Implement a thread-safe LRU cache in Go." -> hard
 
 Output ONLY the single word. No explanation. No punctuation."""
 
