@@ -25,3 +25,8 @@ opentelemetry-instrumentation-logging==0.50b0
 # OTel-instrumented httpx + jose interactions stay consistent across
 # the three services.
 python-jose[cryptography]==3.3.0
+
+# Hybrid search: BM25 sparse encoder for the query side. Companion to
+# ingestion-service's BM25 (must match version to use the same IDF
+# corpus). Pure-Python, CPU-only, ~30 MB install.
+fastembed>=0.4.0,<0.5.0

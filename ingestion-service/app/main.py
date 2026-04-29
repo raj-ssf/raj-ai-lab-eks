@@ -38,6 +38,7 @@ from fastapi import (
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
+from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient, models as qmodels
 
 from opentelemetry import trace
@@ -116,24 +117,55 @@ EMBEDDING_DIM = 1024
 # one per upload.
 QDRANT = QdrantClient(url=QDRANT_URL, prefer_grpc=False, https=False)
 
+# --- BM25 sparse encoder (module-level singleton, hybrid search) -------------
+#
+# Each chunk's text is encoded into BOTH dense (bge-m3 via vLLM) and
+# sparse (BM25 via fastembed) vectors. Qdrant stores both under named
+# slots in a single point; rag-service /retrieve does a single hybrid
+# query that fuses both rankings via Reciprocal Rank Fusion (RRF).
+#
+# fastembed downloads the BM25 model (~80 MB) on first use to a local
+# cache. Pure-Python, runs on CPU, single-shot init (~2 sec).
+#
+# `passage_embed` is the doc-side encoder; rag-service uses
+# `query_embed` for queries (different IDF treatment, recommended by
+# the BM25 spec).
+BM25 = SparseTextEmbedding(model_name="Qdrant/bm25")
+
 
 def _ensure_qdrant_collection() -> None:
     """Create the documents collection if it doesn't exist yet.
 
-    Idempotent — safe to call on every upload. Cosine distance + dense
-    vectors with bge-m3's 1024 dims. Payload schema is implicit (Qdrant
-    is schemaless on payload by default); session_id and user are the
-    fields we filter on at query time.
+    Idempotent — safe to call on every upload. Hybrid schema:
+      - "dense"  named vector slot, bge-m3's 1024 dims, cosine distance
+      - "sparse" named sparse vector slot for BM25 (lexical match)
+    Payload schema is implicit (Qdrant is schemaless on payload by
+    default); session_id and user are the fields we filter on at
+    query time.
+
+    Schema MIGRATION NOTE (post-hybrid-search refactor): this collection
+    schema is incompatible with the pre-hybrid (positional dense-only)
+    layout. If you find an existing `documents` collection from before
+    this change, drop it manually:
+      kubectl -n qdrant exec qdrant-0 -- \\
+        curl -X DELETE http://localhost:6333/collections/documents
+    Then this function recreates it on the next upload, and re-uploads
+    populate hybrid vectors.
     """
     if QDRANT.collection_exists(QDRANT_COLLECTION):
         return
-    log.info("creating qdrant collection", extra={"collection": QDRANT_COLLECTION})
+    log.info("creating qdrant collection (hybrid)", extra={"collection": QDRANT_COLLECTION})
     QDRANT.create_collection(
         collection_name=QDRANT_COLLECTION,
-        vectors_config=qmodels.VectorParams(
-            size=EMBEDDING_DIM,
-            distance=qmodels.Distance.COSINE,
-        ),
+        vectors_config={
+            "dense": qmodels.VectorParams(
+                size=EMBEDDING_DIM,
+                distance=qmodels.Distance.COSINE,
+            ),
+        },
+        sparse_vectors_config={
+            "sparse": qmodels.SparseVectorParams(),
+        },
     )
     # Index the session_id payload field so per-session retrieval
     # (rag-service /retrieve filters by session_id) is efficient — without
@@ -385,15 +417,36 @@ def _process_upload(
                 },
             )
 
-        # 5. Write to Qdrant. Lazy collection creation — first upload
-        # initializes it, subsequent uploads see it exists and skip.
+        # 5. Compute BM25 sparse vectors for the same chunks. Cheap
+        # (CPU only, ~ms per chunk) and runs sequentially in this
+        # background task — no need to batch at the network layer
+        # since fastembed runs in-process. The result is one
+        # SparseEmbedding per chunk, which we convert to Qdrant's
+        # SparseVector wire shape below.
+        job.state = "encoding-sparse"
+        sparse_vectors = list(BM25.passage_embed(chunks))
+
+        # 6. Write to Qdrant. Lazy collection creation — first upload
+        # initializes it (hybrid schema with dense + sparse named slots),
+        # subsequent uploads see it exists and skip.
         job.state = "writing"
         _ensure_qdrant_collection()
         ingested_at = datetime.utcnow().isoformat() + "Z"
         points = [
             qmodels.PointStruct(
                 id=str(uuid.uuid4()),
-                vector=embeddings[i],
+                # Vector as a dict of named slots (the hybrid schema
+                # declares both "dense" and "sparse"). Mismatched names
+                # cause a 400 from Qdrant at upsert time, so this dict
+                # has to match _ensure_qdrant_collection's vectors_config
+                # + sparse_vectors_config exactly.
+                vector={
+                    "dense": embeddings[i],
+                    "sparse": qmodels.SparseVector(
+                        indices=sparse_vectors[i].indices.tolist(),
+                        values=sparse_vectors[i].values.tolist(),
+                    ),
+                },
                 payload={
                     "text": chunks[i],
                     "source": filename,

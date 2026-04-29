@@ -17,13 +17,21 @@ from jose import JWTError, jwt
 from langfuse import Langfuse
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
+from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    Fusion,
+    FusionQuery,
     MatchValue,
+    NamedSparseVector,
+    NamedVector,
     PointStruct,
+    Prefetch,
+    SparseVector,
+    SparseVectorParams,
     VectorParams,
 )
 
@@ -500,6 +508,28 @@ def embed_query_bge_m3(text: str) -> list[float]:
     return body["data"][0]["embedding"]
 
 
+# --- BM25 sparse encoder (hybrid search) -------------------------------------
+#
+# Companion to ingestion-service's BM25 — same fastembed model so the
+# query and document IDF spaces match. The Qdrant/bm25 model auto-
+# downloads on first use (~80 MB) to a local cache.
+#
+# `query_embed` (here) ≠ `passage_embed` (ingestion). For BM25, query
+# encoding uses raw term frequencies without IDF scaling (the IDF was
+# baked into the doc-side vectors at ingest time). Mixing the wrong
+# method on either side breaks scoring.
+BM25 = SparseTextEmbedding(model_name="Qdrant/bm25")
+
+
+def embed_query_bm25(text: str) -> SparseVector:
+    """Encode the user query as a BM25 sparse vector for hybrid search."""
+    sv = next(iter(BM25.query_embed([text])))
+    return SparseVector(
+        indices=sv.indices.tolist(),
+        values=sv.values.tolist(),
+    )
+
+
 # --- Cross-encoder reranker (TEI /rerank endpoint) -------------------
 #
 # TEI exposes a /rerank endpoint that accepts {query, texts: [...]} and
@@ -702,11 +732,17 @@ def retrieve(
     user = claims.get("preferred_username") or claims.get("sub") or "unknown"
 
     started = time.monotonic()
+    # Encode the query in BOTH spaces. Dense via vllm-bge-m3 (HTTP),
+    # sparse via in-process BM25 (CPU, ~ms). If dense embedding fails
+    # we 502 immediately because pure-sparse retrieval gives notably
+    # worse semantic recall — the lab is a RAG demo, not a keyword
+    # search engine.
     try:
-        vec = embed_query_bge_m3(req.query)
+        dense_vec = embed_query_bge_m3(req.query)
     except httpx.HTTPError as e:
         log.error("bge-m3 embed failed: %s", e)
         raise HTTPException(status_code=502, detail=f"embed failed: {e}")
+    sparse_vec = embed_query_bm25(req.query)
 
     qfilter = Filter(
         must=[
@@ -715,27 +751,51 @@ def retrieve(
         ]
     )
 
-    # Two-stage retrieval (RAG completeness):
-    #   1. Dense top-N from Qdrant (N = RETRIEVE_PRE_RERANK_TOP_K, ~50)
-    #   2. Cross-encoder rerank → take top req.top_k (~5)
-    # The reranker call has a fail-open path; if it errors or is
-    # disabled (RERANKER_URL unset), we slice the dense top-N to
-    # req.top_k and return that — RAG keeps working, just without
-    # the rerank quality boost. reranker_used in the log line tells
-    # which code path served the request.
+    # Three-stage retrieval (RAG completeness, all three trio legs):
+    #   1. HYBRID: Qdrant fetches top-N by dense AND by sparse, fuses
+    #      with Reciprocal Rank Fusion (RRF) into a single ranked list
+    #   2. RERANK: cross-encoder re-scores the fused candidates using
+    #      query+text cross-attention
+    #   3. TOP-K: take the final req.top_k for prompt injection
+    # The reranker call has a fail-open path; the hybrid query is fail-
+    # closed (any Qdrant error → empty hits → "no context" surface).
+    # reranker_used in the log line distinguishes the two paths post-hoc.
     pre_rerank_top_k = max(req.top_k, RETRIEVE_PRE_RERANK_TOP_K)
     try:
         hits = qdrant.query_points(
             collection_name=DOCS_COLLECTION,
-            query=vec,
+            # Hybrid: two prefetch branches, fused server-side.
+            # `using` is the named-vector slot from the collection
+            # schema (must match ingestion-service's upsert names:
+            # "dense" + "sparse").
+            prefetch=[
+                Prefetch(
+                    query=dense_vec,
+                    using="dense",
+                    limit=pre_rerank_top_k,
+                    filter=qfilter,
+                ),
+                Prefetch(
+                    query=sparse_vec,
+                    using="sparse",
+                    limit=pre_rerank_top_k,
+                    filter=qfilter,
+                ),
+            ],
+            # RRF: combines rankings from both branches by summing
+            # 1/(k+rank_i) for each doc — robust to scale differences
+            # between cosine similarity (~[0,1]) and BM25 logits (~0-30).
+            query=FusionQuery(fusion=Fusion.RRF),
             limit=pre_rerank_top_k,
             query_filter=qfilter,
         ).points
     except Exception as e:
-        # Collection may not exist yet (no uploads in this session). Treat
-        # as zero hits rather than 502 — chat-ui still renders a useful
-        # "no context found" message.
-        log.warning("qdrant query failed (treating as 0 hits): %s", e)
+        # Collection may not exist yet (no uploads in this session) OR
+        # uses pre-hybrid schema (existing data from before the migration).
+        # Treat as zero hits rather than 502 — chat-ui still renders a
+        # useful "no context found" message and the user can re-upload
+        # to populate the new schema.
+        log.warning("qdrant hybrid query failed (treating as 0 hits): %s", e)
         hits = []
 
     hits, reranker_used = rerank_chunks(req.query, hits, req.top_k)
@@ -754,7 +814,7 @@ def retrieve(
         )
 
     log.info(
-        "retrieve session=%s user=%s top_k=%d hits=%d reranker_used=%s ms=%d",
+        "retrieve session=%s user=%s top_k=%d hits=%d hybrid=true reranker_used=%s ms=%d",
         req.session_id, user, req.top_k, len(chunks), reranker_used, elapsed_ms,
     )
 

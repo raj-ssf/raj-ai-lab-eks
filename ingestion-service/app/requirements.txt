@@ -38,3 +38,10 @@ langchain-text-splitters==0.3.2
 # only exposes 6333/HTTP — the gRPC port (6334) isn't in the chart's
 # default Service.
 qdrant-client==1.12.1
+
+# fastembed — pure-Python BM25 sparse-vector encoder for hybrid
+# search. Each chunk gets a sparse vector alongside the dense bge-m3
+# embedding; rag-service queries with both via Qdrant's prefetch+RRF
+# fusion. ~30 MB install, runs on CPU. Maintained by the Qdrant team
+# so first-class compatibility with this version of qdrant-client.
+fastembed>=0.4.0,<0.5.0
