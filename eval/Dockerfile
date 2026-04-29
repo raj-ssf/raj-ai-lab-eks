@@ -31,12 +31,21 @@ RUN apt-get update && \
 # Python deps:
 #   - lm-eval[api]: lm-evaluation-harness + the local-completions / openai
 #     model adapters (HTTP backends, no torch/vllm dep)
+#   - transformers>=4.45.0 explicit pin: lm-eval 0.4.7's hf_vlms.py
+#     module references transformers.AutoModelForVision2Seq at class-
+#     body load time, and that attribute was added to transformers in
+#     4.45 (Oct 2024). Without this pin, pip resolves an older
+#     transformers and every `lm_eval` invocation crashes on import
+#     with `AttributeError: module transformers has no attribute
+#     AutoModelForVision2Seq`. Affects API-only usage too because
+#     lm_eval/__init__.py forces the model-adapter package imports.
 #   - langfuse: SDK for emitting trace summaries (optional at runtime —
 #     the wrapper script no-ops if LANGFUSE_PUBLIC_KEY env isn't set)
 #   - boto3: programmatic S3 if the script needs it (awscli handles the
 #     bulk sync at the end)
 RUN pip install --no-cache-dir \
         "lm-eval[api]==0.4.7" \
+        "transformers>=4.45.0,<5.0" \
         langfuse==2.60.0 \
         boto3
 
