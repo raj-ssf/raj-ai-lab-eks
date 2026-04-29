@@ -3,7 +3,15 @@ kind: Kustomization
 
 resources:
   - serviceaccount.yaml
-  - deployment.yaml
+  # Phase #30: deployment.yaml removed — replaced by rollout.yaml
+  # (Argo Rollouts canary). The Rollout CRD has a Deployment-shaped
+  # template plus a strategy.canary block; everything else (probes,
+  # env, resources, securityContext) is identical.
+  - rollout.yaml
+  # Phase #30: AnalysisTemplate referenced by rollout.yaml's canary
+  # step. Queries Prometheus for /invoke success rate and pass/fails
+  # the canary at the checkpoint.
+  - analysistemplate.yaml
   - service.yaml
   - httproute.yaml
   - servicemonitor.yaml

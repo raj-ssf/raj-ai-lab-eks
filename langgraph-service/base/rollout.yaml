@@ -1,0 +1,293 @@
+# Phase #30: Replaces deployment.yaml. Argo Rollouts manages the
+# pod lifecycle now; canary steps + AnalysisTemplate gate promotion.
+#
+# Migration notes:
+#   - Spec is identical to the prior Deployment except for:
+#       apiVersion + kind            (apps/v1 Deployment → argoproj.io/v1alpha1 Rollout)
+#       spec.replicas                (1 → 2; canary needs ≥2)
+#       spec.strategy                (RollingUpdate → canary with steps)
+#   - When ArgoCD reconciles this commit it will:
+#       1. Prune the prior Deployment (kubectl delete deployment langgraph-service)
+#       2. Create the Rollout, which spawns ReplicaSets + Pods
+#     There IS a brief gap between (1) and (2) where the Service has
+#     no endpoints. For a lab that's acceptable; production migration
+#     would scale the Deployment to 0 manually first, then commit, to
+#     avoid the gap.
+#   - Service selector (app: langgraph-service) matches both stable
+#     and canary ReplicaSets simultaneously. With replica-percentage
+#     canary (no trafficRouting block), traffic distribution = pod-
+#     count proportion. Phase #31 will add Istio trafficRouting for
+#     true % traffic shifting decoupled from replica counts.
+#
+# Why replicas: 2 (was 1):
+#   - Replica-percentage canary needs ≥ 2 replicas. With 1 replica,
+#     setWeight 50 floors to 0, which means stable goes to 0 and
+#     canary takes over — that's a deploy, not a canary.
+#   - Lab cost impact: ~+256Mi memory + 100m CPU for the second pod.
+#     Tiny in absolute terms.
+#   - Bumping further (4+) would let the steps express finer-grained
+#     weights (25/50/75) for richer demos. Sticking at 2 for now.
+#
+# Strategy: canary, two steps:
+#   1. setWeight 50  — 1 of 2 pods is canary
+#   2. analysis      — runs langgraph-canary-checks AnalysisTemplate
+#                       (queries Prometheus for /invoke success rate)
+#   (no explicit final step; Rollout auto-promotes to 100% after
+#    analysis succeeds.)
+# First-deploy of a Rollout (no prior version) skips canary steps —
+# this is by design; you can't canary against nothing. So the very
+# first apply of this manifest is a single roll-out.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: langgraph-service
+  labels:
+    app: langgraph-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: langgraph-service
+  strategy:
+    canary:
+      # No trafficRouting block — replica-percentage canary. Traffic
+      # to canary pods is implicit via the existing Service selector
+      # matching both stable + canary ReplicaSets. Phase #31 swaps
+      # this for an Istio trafficRouting block.
+      steps:
+        - setWeight: 50
+        # Brief pause lets at least one /invoke call land on each
+        # ReplicaSet before analysis runs. Without this, analysis
+        # may run against zero canary samples → inconclusive →
+        # block promotion.
+        - pause:
+            duration: 2m
+        - analysis:
+            templates:
+              - templateName: langgraph-canary-checks
+        # Auto-promotes to 100% after the analysis step passes.
+      # Allow analysis to be inconclusive 3 times before aborting.
+      # In a low-traffic lab, queries can return empty for a window
+      # — failureLimit on the AnalysisTemplate metric handles the
+      # "actually bad" case.
+      analysis: {}
+      maxSurge: 1
+      maxUnavailable: 0
+      # Abort the rollout immediately on analysis failure (skip
+      # remaining retries). The AnalysisTemplate's failureLimit (3)
+      # gives the metric some grace; abortScaleDownDelaySeconds
+      # ensures the bad ReplicaSet is torn down promptly.
+      abortScaleDownDelaySeconds: 30
+  # On rollback, retain history so we can revert to the previous
+  # ReplicaSet. 5 is the chart default.
+  revisionHistoryLimit: 5
+  template:
+    metadata:
+      labels:
+        app: langgraph-service
+    spec:
+      serviceAccountName: langgraph-service
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: langgraph-service
+          image: langgraph-service:dev   # rewritten by overlay's `images:` block
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # --- Cluster-config helpers (Phase 2 portability refactor) ---
+            - name: DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: domain
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-config
+                  key: keycloak_realm
+            # --- Keycloak OIDC config -------------------------------
+            - name: KEYCLOAK_ISSUER
+              value: https://keycloak.$(DOMAIN)/realms/$(KEYCLOAK_REALM)
+            - name: KEYCLOAK_AUDIENCE
+              value: langgraph-service
+
+            # --- Model variant URLs ---------------------------------
+            - name: MODEL_TRIVIAL_URL
+              value: http://vllm-llama-8b.llm.svc.cluster.local:8000
+            - name: MODEL_REASONING_URL
+              value: http://vllm-deepseek-r1-70b.llm.svc.cluster.local:8000
+            - name: MODEL_HARD_URL
+              value: http://vllm.llm.svc.cluster.local:8000
+
+            # --- Deployment names for kubernetes-client scaling -----
+            - name: DEPLOY_TRIVIAL
+              value: vllm-llama-8b
+            - name: DEPLOY_REASONING
+              value: vllm-deepseek-r1-70b
+            - name: DEPLOY_HARD
+              value: vllm
+            - name: LLM_NAMESPACE
+              value: llm
+
+            # --- Phase 4: rag-service /retrieve --------------------
+            - name: RAG_SERVICE_URL
+              value: http://rag-service.rag.svc.cluster.local
+            - name: RAG_RETRIEVE_TIMEOUT_SECONDS
+              value: "30"
+            - name: RAG_TOP_K_DEFAULT
+              value: "5"
+
+            # --- Observability --------------------------------------
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo.monitoring.svc.cluster.local:4317
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: grpc
+            - name: OTEL_SERVICE_NAME
+              value: langgraph-service
+            - name: OTEL_TRACES_SAMPLER
+              value: parentbased_always_on
+
+            # --- Langfuse base URL (keys via envFrom below) ---------
+            - name: LANGFUSE_HOST
+              value: http://langfuse-web.langfuse.svc.cluster.local:3000
+
+            # --- Phase #4: content safety (Llama Guard 3 8B) -----------
+            - name: SAFETY_FILTER_ENABLED
+              value: "false"
+            - name: SAFETY_LLAMA_GUARD_URL
+              value: http://vllm-llama-guard-3-8b.llm.svc.cluster.local:8000/v1
+            - name: SAFETY_LLAMA_GUARD_MODEL
+              value: llama-guard-3-8b
+            - name: SAFETY_FAIL_MODE
+              value: open
+            - name: SAFETY_BLOCK_CATEGORIES
+              value: S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11,S12,S13,S14
+
+            # --- Phase #5: cost guardrails (Redis token bucket) --------
+            - name: BUDGET_ENABLED
+              value: "false"
+            - name: BUDGET_REDIS_URL
+              value: redis://langgraph-redis.langgraph.svc.cluster.local:6379/0
+            - name: BUDGET_REQUESTS_PER_DAY
+              value: "200"
+            - name: BUDGET_FAIL_MODE
+              value: open
+
+            # --- Phase #20: content-based input validation -------------
+            - name: VALIDATE_INPUT_ENABLED
+              value: "false"
+            - name: VALIDATE_INPUT_MAX_LENGTH
+              value: "16384"
+
+            # --- Phase #6: conversational memory + query rewriting -----
+            - name: MEMORY_ENABLED
+              value: "false"
+            - name: MEMORY_RECENT_TURNS
+              value: "5"
+            - name: MEMORY_SUMMARIZE_AFTER_TURNS
+              value: "10"
+            - name: MEMORY_TTL_SECONDS
+              value: "604800"
+
+            - name: QUERY_REWRITE_ENABLED
+              value: "false"
+
+            # --- Phase #7: semantic prompt cache -----------------------
+            - name: CACHE_ENABLED
+              value: "false"
+            - name: CACHE_EMBEDDINGS_URL
+              value: http://vllm-bge-m3.llm.svc.cluster.local:8000/v1
+            - name: CACHE_EMBEDDINGS_MODEL
+              value: bge-m3
+            - name: CACHE_SIMILARITY_THRESHOLD
+              value: "0.95"
+            - name: CACHE_MAX_ENTRIES_PER_SESSION
+              value: "20"
+            - name: CACHE_TTL_SECONDS
+              value: "86400"
+
+            # --- Phase #9: runtime hallucination detection -------------
+            - name: HALLUCINATION_CHECK_ENABLED
+              value: "false"
+            - name: HALLUCINATION_ACTION
+              value: flag
+            - name: HALLUCINATION_CONFIDENCE_THRESHOLD
+              value: "0.6"
+
+            # --- Phase #11: PII redaction at output -------------------
+            - name: PII_REDACT_OUTPUT_ENABLED
+              value: "false"
+            - name: PII_REDACT_ENTITY_TYPES
+              value: email,phone_us,ssn,credit_card,ipv4,aws_access_key
+            - name: PII_REDACT_INPUT_ENABLED
+              value: "false"
+
+            # --- Phase #13: plan-and-execute agent pattern -------------
+            - name: PLANNER_ENABLED
+              value: "false"
+            - name: PLANNER_MAX_STEPS
+              value: "5"
+
+            # --- Phase #19: per-tool rate limiting ---------------------
+            - name: TOOL_RATE_LIMIT_ENABLED
+              value: "false"
+
+            - name: FEEDBACK_TTL_SECONDS
+              value: "7776000"  # 90 days
+            - name: FEEDBACK_INDEX_MAX_ENTRIES
+              value: "500"
+
+          envFrom:
+            - secretRef:
+                name: langgraph-service-langfuse
+                optional: true
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}

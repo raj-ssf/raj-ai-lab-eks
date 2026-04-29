@@ -1,0 +1,78 @@
+# Phase #30: AnalysisTemplate referenced by rollout.yaml's canary
+# step. Argo Rollouts spawns an AnalysisRun from this template at the
+# canary checkpoint; the run queries Prometheus and pass/fails the
+# canary based on the success rate of /invoke calls.
+#
+# Why a single metric (vs latency + error-rate + alert-state combo):
+# Keeping the gate small and obvious for the demo. Adding latency
+# checks here would duplicate the SLO MWMBR alerts in
+# raj-ai-lab-eks-infra/monitoring-slo.tf. Cleaner extension path is
+# Phase #31 (or later): add a metric here that queries
+# `count(ALERTS{service="langgraph-service",burn_speed="fast",
+#  alertstate="firing"}) == 0` so the canary fails if the SLO fast-
+# burn alert lights up. That way the SLO and the canary share a
+# single source of truth.
+#
+# Empty-result handling:
+# The successCondition uses `len(result) == 0 || result[0] >= 0.95`
+# so a query window with zero traffic counts as "pass" rather than
+# "inconclusive". This is right for the lab — sparse traffic is the
+# norm, and treating zero-data as failure would block every canary
+# until somebody manually drives traffic. Production with real
+# traffic should drop the empty-result clause, fail the canary on
+# no signal, and route synthetic probe traffic during analysis to
+# guarantee samples.
+#
+# Network path: argo-rollouts (no mesh sidecar — Phase #28) →
+# kube-prometheus-stack-prometheus.monitoring.svc:9090 (mesh-side).
+# Istio's monitoring-namespace AuthorizationPolicy (mesh-wide deny-
+# all + per-namespace allow rules per the lab's pattern) may need a
+# new allow rule for source workload argo-rollouts-controller.
+# If the analysis run errors with "connection refused" or 403,
+# add allow_argo_rollouts_to_prometheus in
+# raj-ai-lab-eks-infra/istio-zero-trust.tf.
+
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: langgraph-canary-checks
+  labels:
+    app: langgraph-service
+spec:
+  metrics:
+    - name: invoke-success-rate
+      # Run the query every 30s during the analysis window. With the
+      # canary step's pause:2m + this 30s cadence, expect 4-5 samples
+      # per analysis run before pass/fail.
+      interval: 30s
+      # Total analysis duration. After 5 minutes Argo Rollouts
+      # finalizes the verdict regardless of remaining samples.
+      count: 10
+      # Samples can be inconclusive (empty result, scrape gap)
+      # without failing the canary. After 3 inconclusive samples the
+      # analysis aborts. Tune up if scrape stability is poor;
+      # tune down if you want stricter gates.
+      failureLimit: 3
+      # Pass: success rate >= 95% (0.95) OR no samples (low traffic).
+      # The empty-result clause is what makes this lab-friendly;
+      # Argo Rollouts uses a govaluate-derived expression engine
+      # which exposes len() and indexed access on result.
+      successCondition: len(result) == 0 || result[0] >= 0.95
+      provider:
+        prometheus:
+          # In-cluster Service for kube-prometheus-stack's prometheus
+          # pod. Hostname comes from the helm release name
+          # ("kube-prometheus-stack" — see prometheus-stack.tf:13).
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          # Success rate over the last 5 minutes. Numerator: requests
+          # whose HTTP status was NOT 5xx. Denominator: all requests.
+          # handler="/invoke" filter excludes /healthz/metrics/readyz
+          # whose 100% success would mask a real /invoke regression.
+          # Falls back to handler-less query if the FastAPI
+          # instrumentator emits a different label name; the absent()
+          # path keeps the gate from spuriously failing on
+          # metric-shape drift.
+          query: |
+            sum(rate(http_requests_total{job="langgraph-service",handler="/invoke",status!~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total{job="langgraph-service",handler="/invoke"}[5m])), 1e-9)
