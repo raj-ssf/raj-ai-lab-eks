@@ -90,6 +90,14 @@ MODEL_HARD_URL = os.environ.get(
 MODEL_TRIVIAL_NAME = os.environ.get("MODEL_TRIVIAL_NAME", "llama-3.1-8b")
 MODEL_REASONING_NAME = os.environ.get("MODEL_REASONING_NAME", "deepseek-r1-distill-llama-70b")
 MODEL_HARD_NAME = os.environ.get("MODEL_HARD_NAME", "llama-3.3-70b")
+# Fine-tuning F4.5: the Alpaca-tuned LoRA adapter is served by the SAME
+# vllm-llama-8b pod that hosts the trivial-tier base model. vLLM merges
+# the adapter in flight when called with this model name (see F3:
+# --enable-lora --lora-modules llama-3.1-8b-alpaca=/adapters/alpaca-lora).
+# So tuned-lora reuses MODEL_TRIVIAL_URL and DEPLOY_TRIVIAL — no separate
+# Deployment, no separate scaling. Effectively a "stylistic variant" of
+# the trivial tier, picked when verbose/instruction-style answers fit.
+MODEL_TUNED_LORA_NAME = os.environ.get("MODEL_TUNED_LORA_NAME", "llama-3.1-8b-alpaca")
 
 # Deployment names for the JIT-scale path (iteration 2c).
 DEPLOY_TRIVIAL = os.environ.get("DEPLOY_TRIVIAL", "vllm-llama-8b")
@@ -137,6 +145,17 @@ ROUTE_REGISTRY: dict[str, dict] = {
         "model_name": MODEL_TRIVIAL_NAME,
         "deployment": DEPLOY_TRIVIAL,
         "always_on": True,  # Llama 8B is the always-on tier; never JIT-scaled
+    },
+    "tuned-lora": {
+        # Reuses the trivial tier's vLLM pod and Deployment — the
+        # llama-3.1-8b-alpaca model name resolves to the LoRA adapter
+        # merged on top of the same Llama 3.1 8B base. always_on=True
+        # because there's no second pod to JIT-scale; if the trivial
+        # tier is up, this tier is up too.
+        "url": f"{MODEL_TRIVIAL_URL}/v1",
+        "model_name": MODEL_TUNED_LORA_NAME,
+        "deployment": DEPLOY_TRIVIAL,
+        "always_on": True,
     },
     "reasoning": {
         "url": f"{MODEL_REASONING_URL}/v1",
@@ -351,7 +370,7 @@ class AgentState(TypedDict, total=False):
     # can validate against Keycloak and read the user claim. NOT logged.
     auth_token: Optional[str]
     # Set by classify
-    route: Literal["trivial", "reasoning", "hard"]
+    route: Literal["trivial", "tuned-lora", "reasoning", "hard"]
     classifier_raw: str
     # Set by retrieve (Phase 4)
     retrieved_chunks: list[dict]   # list of {text, source, chunk_index, score}
@@ -372,6 +391,7 @@ class AgentState(TypedDict, total=False):
 CLASSIFIER_SYSTEM_PROMPT = """You are a routing classifier. Read the user's prompt and output exactly one word from this set:
 
 - trivial: factual recall, simple math, yes/no questions, very short answers
+- tuned-lora: instruction-following with explanation; "how do I...", "explain...", "what is the difference between...", tutorial-style requests where a verbose, structured answer is expected
 - reasoning: multi-step thinking, chain-of-thought, math word problems, logic puzzles
 - hard: complex tasks (long-form writing, code generation, deep analysis)
 
@@ -398,9 +418,12 @@ def node_classify(state: AgentState) -> AgentState:
 
     # Hardened parsing — model occasionally adds punctuation despite the
     # instruction. Fall back to "trivial" on any unparseable response so
-    # the cheap path handles ambiguous cases.
-    route: Literal["trivial", "reasoning", "hard"] = "trivial"
-    for candidate in ("hard", "reasoning", "trivial"):
+    # the cheap path handles ambiguous cases. Order matters for substring
+    # matching: check the most specific names first ("tuned-lora" before
+    # "reasoning"/"trivial"; "reasoning" before "trivial") to avoid the
+    # 'r' in "trivial" accidentally satisfying a "tuned-lora" target etc.
+    route: Literal["trivial", "tuned-lora", "reasoning", "hard"] = "trivial"
+    for candidate in ("tuned-lora", "hard", "reasoning", "trivial"):
         if candidate in raw:
             route = candidate  # type: ignore[assignment]
             break
