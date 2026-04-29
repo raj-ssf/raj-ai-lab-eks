@@ -1,0 +1,136 @@
+# Redis for Phase #5 cost guardrails — token bucket + daily reset.
+#
+# Why a dedicated Redis (not reusing argocd-redis or langfuse-redis):
+#   Coupling cost-control's lifecycle to ArgoCD's or Langfuse's would
+#   tie unrelated failure domains together — a Langfuse outage would
+#   also disable the budget filter, and a Redis-schema change in
+#   ArgoCD's chart would force a coordinated update here. A small
+#   dedicated instance in the langgraph namespace keeps the blast
+#   radius contained.
+#
+# Sizing:
+#   Memory: 64 MiB request / 128 MiB limit. Each user's daily counter
+#     is a 4-byte integer + key overhead — call it 200 bytes. 100k
+#     unique users = 20 MB. Lab traffic is single-digit users; this
+#     limit gives 6 orders of magnitude of headroom and the headroom
+#     itself costs almost nothing on the node.
+#   CPU: 100m request / 200m limit. Redis is single-threaded for
+#     command processing; one core is overkill but gives the kernel
+#     room to schedule TCP/IO without contending.
+#
+# Storage:
+#   emptyDir, NOT a PVC. The budget data is intentionally ephemeral —
+#   on pod restart, today's counters reset to zero. That's a small
+#   "amnesty" that's acceptable for a daily-bucket model and avoids
+#   the cost (EBS attach/detach) and complexity (RWO + node-affinity)
+#   of a PVC. Persistence would matter if budgets were per-month or
+#   per-week; for daily resets, restart-amnesty is on the order of
+#   the natural reset cadence.
+#
+# Security posture for the lab:
+#   No AUTH (default Redis is unauthenticated), plaintext in-cluster
+#   traffic. Acceptable here because (a) network is mesh-encrypted by
+#   Istio mTLS where applicable and (b) only langgraph-service in
+#   this namespace has reason to talk to it. For a multi-tenant
+#   cluster or a production deployment, add `--requirepass` via env
+#   from a Secret AND enable TLS via redis.conf.
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langgraph-redis
+  labels:
+    app.kubernetes.io/name: langgraph-redis
+    app.kubernetes.io/part-of: langgraph-service
+    app.kubernetes.io/component: budget-store
+spec:
+  replicas: 1
+  strategy:
+    # Recreate (not RollingUpdate) — pod restart resets today's
+    # counters anyway; better to fail fast and reset cleanly than
+    # carry partial state across an overlap.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: langgraph-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: langgraph-redis
+        app.kubernetes.io/part-of: langgraph-service
+        app.kubernetes.io/component: budget-store
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            # Bind to all interfaces (so the in-cluster Service can
+            # reach it). Default Redis bind is 127.0.0.1 only.
+            - "--bind"
+            - "0.0.0.0"
+            # Disable persistence — the in-pod RDB/AOF would only
+            # survive container restart, not pod restart, and we
+            # don't want disk I/O on the rate-limit hot path.
+            - "--save"
+            - ""
+            - "--appendonly"
+            - "no"
+            # Cap maxmemory at 100 MiB (just under the container
+            # limit) and use allkeys-lru on full — if a key explosion
+            # happens (bug, abuse), the oldest budget keys evict
+            # rather than the pod OOMKilling.
+            - "--maxmemory"
+            - "100mb"
+            - "--maxmemory-policy"
+            - "allkeys-lru"
+          ports:
+            - { name: redis, containerPort: 6379 }
+          resources:
+            requests: { cpu: "100m", memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "128Mi" }
+          startupProbe:
+            tcpSocket: { port: redis }
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 15
+          readinessProbe:
+            tcpSocket: { port: redis }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            # Use redis-cli PING for liveness — TCP-only would miss
+            # cases where Redis is wedged (e.g. RDB save freeze) but
+            # still accepting connections. PING is the canonical
+            # liveness check.
+            exec:
+              command: ["redis-cli", "PING"]
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 64Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: langgraph-redis
+  labels:
+    app.kubernetes.io/name: langgraph-redis
+    app.kubernetes.io/part-of: langgraph-service
+    app.kubernetes.io/component: budget-store
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: langgraph-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP

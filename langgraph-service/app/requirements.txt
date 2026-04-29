@@ -58,3 +58,9 @@ numexpr==2.10.2
 # OS-shipped tzdata which slim images often skip; pytz ships its own DB
 # so the tool works regardless of base image's tzdata presence.
 pytz==2024.2
+
+# redis-py for the Phase #5 cost-guardrails token bucket. The 5.x
+# line is the current LTS (Python sync + asyncio + cluster + Sentinel
+# all in one package). Pin exact for reproducibility; bump tracked
+# alongside any langgraph-service base-image refresh.
+redis==5.0.8

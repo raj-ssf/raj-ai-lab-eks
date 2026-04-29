@@ -7,3 +7,7 @@ resources:
   - service.yaml
   - httproute.yaml
   - servicemonitor.yaml
+  # Phase #5: dedicated Redis for the cost-guardrails token bucket.
+  # In-namespace, single-replica, no persistence — daily-bucket
+  # workload tolerates restart-amnesty.
+  - redis.yaml

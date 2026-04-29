@@ -149,6 +149,30 @@ spec:
             - name: SAFETY_BLOCK_CATEGORIES
               value: S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11,S12,S13,S14
 
+            # --- Phase #5: cost guardrails (Redis token bucket) --------
+            # Master switch defaults to "false" so a default deploy
+            # never rate-limits anyone — the langgraph-redis Service
+            # might exist but be unready at first sync, and we don't
+            # want fail-closed behavior surprise during initial roll.
+            # Flip to "true" once langgraph-redis pod is Ready.
+            - name: BUDGET_ENABLED
+              value: "false"
+            - name: BUDGET_REDIS_URL
+              value: redis://langgraph-redis.langgraph.svc.cluster.local:6379/0
+            # Per-user daily request cap. 200 is comfortable for a
+            # single-user lab demo (the implicit "200 prompts in a
+            # day" ceiling is way past what a human would actually
+            # send). Multi-user deployments should set this lower
+            # (e.g. 50) and consider per-tier multipliers later.
+            - name: BUDGET_REQUESTS_PER_DAY
+              value: "200"
+            # Fail-open in the lab — a Redis outage shouldn't break
+            # langgraph-service entirely. Production switches to
+            # "closed" when rate-limiting is a security posture
+            # concern (e.g. multi-tenant SaaS).
+            - name: BUDGET_FAIL_MODE
+              value: open
+
           envFrom:
             # Langfuse keys live in a Secret created by
             # raj-ai-lab-eks-infra/langgraph.tf, mirroring the

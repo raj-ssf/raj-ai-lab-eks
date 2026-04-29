@@ -1,14 +1,18 @@
 """langgraph-service — FastAPI front-end for a LangGraph router agent.
 
-Seven-node state machine on /invoke (safety bookends + reasoning loop):
+Eight-node state machine on /invoke (budget + safety bookends + reasoning loop):
 
-    START -> safety_input -> classify -> retrieve -> ensure_warm
-                          -> execute -> reflect -> safety_output -> END
-              |                            ^          |
-              |                            |__________|  (loop, capped)
-              v                            |
-              END (refused)                |
+    START -> budget_check -> safety_input -> classify -> retrieve
+                          -> ensure_warm -> execute -> reflect
+                          -> safety_output -> END
+              |                  |                          ^         |
+              v                  v                          |_________|  (loop, capped)
+              END (over budget)  END (refused)
 
+- budget_check: per-user daily request budget enforced via Redis
+  INCR + 48h TTL. Cheapest filter, runs first. If over the cap (or
+  Redis unreachable + BUDGET_FAIL_MODE=closed), short-circuits to
+  END with a budget-exhausted refusal. No-op when BUDGET_ENABLED=false.
 - safety_input: Llama Guard 3 8B grades the user's prompt against
   Meta's 14-category hazard taxonomy. If unsafe AND the violated
   categories intersect SAFETY_BLOCK_CATEGORIES, the graph short-
@@ -473,6 +477,18 @@ class AgentState(TypedDict, total=False):
     safety_action: Literal["passed", "blocked_input", "blocked_output", "disabled"]
     safety_input_ms: int
     safety_output_ms: int
+    # Phase #5: cost-guardrail bookkeeping.
+    #   budget_action: terminal disposition — "passed" | "exceeded" |
+    #     "disabled" | "fail_open" | "fail_closed". Drives the conditional
+    #     edge after node_budget_check.
+    #   budget_consumed: post-INCR total for the user this UTC day.
+    #     Sourced from Redis. 0 when filter disabled.
+    #   budget_remaining: BUDGET_REQUESTS_PER_DAY - budget_consumed,
+    #     surfaced so chat-ui can render a "X requests left today"
+    #     widget. Negative if the user just exceeded.
+    budget_action: Literal["passed", "exceeded", "disabled", "fail_open", "fail_closed"]
+    budget_consumed: int
+    budget_remaining: int
 
 
 # Classifier system prompt — short, direct, JSON-output. The trick is to
@@ -620,6 +636,126 @@ def _is_blocking(verdict: str, categories: list[str]) -> bool:
     if not SAFETY_BLOCK_CATEGORIES:
         return True  # block anything unsafe
     return any(c in SAFETY_BLOCK_CATEGORIES for c in categories)
+
+
+def node_budget_check(state: AgentState) -> AgentState:
+    """First-line cost guardrail. Increment Redis counter, gate on cap.
+
+    Redis pattern:
+      INCR cost:<user>:<YYYY-MM-DD> -> returns post-increment value
+      EXPIRE cost:<user>:<YYYY-MM-DD> 172800   (48h, idempotent)
+    The EXPIRE is set every call (cheap; a no-op if already set with
+    a longer TTL) to handle the edge where a key was created before
+    EXPIRE wiring landed and never got a TTL.
+
+    Returns budget_action of:
+      "disabled"     -> filter off (BUDGET_ENABLED false or limit 0)
+      "passed"       -> within budget; pass through
+      "exceeded"     -> over the cap; pre-populate response with
+                        BUDGET_REFUSAL_MESSAGE and short-circuit to END
+      "fail_open"    -> Redis unreachable, BUDGET_FAIL_MODE=open;
+                        treated as passed for routing
+      "fail_closed"  -> Redis unreachable, BUDGET_FAIL_MODE=closed;
+                        treated as exceeded for routing
+    """
+    if not BUDGET_ENABLED or BUDGET_REQUESTS_PER_DAY <= 0:
+        return {
+            "budget_action": "disabled",
+            "budget_consumed": 0,
+            "budget_remaining": 0,
+        }
+
+    user = state.get("user", "unknown")
+    redis_client = _get_redis()
+    if redis_client is None:
+        # Init failed earlier; honor fail mode.
+        action: Literal["fail_open", "fail_closed"] = (
+            "fail_open" if BUDGET_FAIL_MODE == "open" else "fail_closed"
+        )
+        log.warning("budget_check: redis client unavailable, action=%s", action)
+        if action == "fail_closed":
+            return {
+                "budget_action": "fail_closed",
+                "budget_consumed": -1,
+                "budget_remaining": 0,
+                "response": BUDGET_REFUSAL_MESSAGE,
+                "route": "trivial",
+                "classifier_raw": "(budget-fail-closed)",
+            }
+        return {
+            "budget_action": "fail_open",
+            "budget_consumed": -1,
+            "budget_remaining": BUDGET_REQUESTS_PER_DAY,
+        }
+
+    key = _budget_today_key(user)
+    try:
+        # Pipelined INCR + EXPIRE keeps the rate-limit hot path to a
+        # single round-trip. EXPIRE returns 1 on success, 0 if key
+        # didn't exist (impossible right after INCR) — we ignore the
+        # value either way.
+        pipe = redis_client.pipeline(transaction=False)
+        pipe.incr(key, amount=1)
+        pipe.expire(key, 60 * 60 * 48)  # 48h
+        results = pipe.execute()
+        consumed = int(results[0])
+    except Exception as e:
+        action = "fail_open" if BUDGET_FAIL_MODE == "open" else "fail_closed"
+        log.warning("budget_check: redis op failed: %s, action=%s", e, action)
+        if action == "fail_closed":
+            return {
+                "budget_action": "fail_closed",
+                "budget_consumed": -1,
+                "budget_remaining": 0,
+                "response": BUDGET_REFUSAL_MESSAGE,
+                "route": "trivial",
+                "classifier_raw": "(budget-fail-closed)",
+            }
+        return {
+            "budget_action": "fail_open",
+            "budget_consumed": -1,
+            "budget_remaining": BUDGET_REQUESTS_PER_DAY,
+        }
+
+    remaining = BUDGET_REQUESTS_PER_DAY - consumed
+    log.info(
+        "budget_check user=%s consumed=%d remaining=%d limit=%d",
+        user,
+        consumed,
+        remaining,
+        BUDGET_REQUESTS_PER_DAY,
+    )
+
+    if consumed > BUDGET_REQUESTS_PER_DAY:
+        # Over the cap. Pre-populate response and skip to END via the
+        # conditional edge below. Note the strict > (not >=) — the
+        # Nth request is the LAST allowed one, the (N+1)th is over.
+        return {
+            "budget_action": "exceeded",
+            "budget_consumed": consumed,
+            "budget_remaining": remaining,
+            "response": BUDGET_REFUSAL_MESSAGE,
+            "route": "trivial",
+            "classifier_raw": "(budget-exceeded)",
+        }
+
+    return {
+        "budget_action": "passed",
+        "budget_consumed": consumed,
+        "budget_remaining": remaining,
+    }
+
+
+def _route_after_budget_check(state: AgentState) -> Literal["safety_input", "__end__"]:
+    """Conditional edge: if budget exceeded or fail_closed, terminate.
+
+    Defense-in-depth pattern matches _route_after_safety_input — even
+    if a future edit produces an "exceeded" action without setting
+    response, this edge still routes correctly to END.
+    """
+    if state.get("budget_action") in ("exceeded", "fail_closed"):
+        return END
+    return "safety_input"
 
 
 def node_safety_input(state: AgentState) -> AgentState:
@@ -1091,6 +1227,91 @@ SAFETY_REFUSAL_MESSAGE = os.environ.get(
     "SAFETY_REFUSAL_MESSAGE",
     "I can't help with that. Please rephrase your request or ask about something else.",
 )
+
+# --- Phase #5: cost guardrails (Redis token bucket) ------------------------
+#
+# Per-user daily request budget. Each /invoke consumes 1 credit; the
+# user is rate-limited to BUDGET_REQUESTS_PER_DAY total credits per UTC
+# day. Backed by a Redis key per (user, date) with a 48h TTL — daily
+# rollover is automatic (a new day uses a new key, the previous day's
+# key expires on its own), no CronJob needed.
+#
+# Where this sits in the graph: node_budget_check is the FIRST node
+# after START, even before safety_input. Two reasons:
+#   1. Cheapest possible check (one Redis INCR), so it should be first.
+#   2. Abuse-prevention: an attacker probing the safety filter for
+#      false-positive boundaries would otherwise get unlimited free
+#      attempts. Charging upfront makes probing costly.
+# This does mean a legitimate user who hits a safety false-positive
+# still consumes a credit. Acceptable trade for the lab; an operator
+# who wants fairer-to-users posture can swap the order in build_graph.
+#
+# Default disabled — the BUDGET_REQUESTS_PER_DAY env defaults to 0
+# which the runner interprets as "filter is off, pass through every
+# request". Flip on by setting BUDGET_ENABLED=true in deployment.yaml
+# AND BUDGET_REQUESTS_PER_DAY to a positive integer.
+BUDGET_ENABLED = os.environ.get("BUDGET_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+BUDGET_REDIS_URL = os.environ.get(
+    "BUDGET_REDIS_URL", "redis://langgraph-redis.langgraph.svc.cluster.local:6379/0"
+)
+BUDGET_REQUESTS_PER_DAY = int(os.environ.get("BUDGET_REQUESTS_PER_DAY", "200"))
+BUDGET_TIMEOUT_SECONDS = float(os.environ.get("BUDGET_TIMEOUT_SECONDS", "2"))
+# Same fail-mode pattern as the safety filter. open = if Redis is
+# unreachable, allow the request (rate limiting degrades to no-op).
+# closed = block. Lab default is open; production sets closed.
+BUDGET_FAIL_MODE = os.environ.get("BUDGET_FAIL_MODE", "open").lower()
+BUDGET_REFUSAL_MESSAGE = os.environ.get(
+    "BUDGET_REFUSAL_MESSAGE",
+    "Daily request budget exhausted. Try again after UTC midnight.",
+)
+
+# Lazy-initialized at first use. Reused across requests via the same
+# connection-pooled client. redis-py is thread-safe for this usage.
+_REDIS_CLIENT: Optional["redis.Redis"] = None  # type: ignore[name-defined]
+
+
+def _get_redis():
+    """Return the lazy-initialized redis client, or None on connection failure.
+
+    None signals "treat as unavailable" — node_budget_check then
+    consults BUDGET_FAIL_MODE. We don't raise from import time because
+    Redis being briefly unavailable shouldn't crash the pod.
+    """
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        return _REDIS_CLIENT
+    try:
+        import redis as _redis_pkg
+        client = _redis_pkg.Redis.from_url(
+            BUDGET_REDIS_URL,
+            socket_timeout=BUDGET_TIMEOUT_SECONDS,
+            socket_connect_timeout=BUDGET_TIMEOUT_SECONDS,
+            decode_responses=True,
+        )
+        # Don't ping at construction — let the first INCR attempt
+        # discover unreachability and fall through to fail-mode. Saves
+        # a round-trip on every cold pod start.
+        _REDIS_CLIENT = client
+        return _REDIS_CLIENT
+    except Exception as e:
+        log.warning("redis client init failed: %s", e)
+        return None
+
+
+def _budget_today_key(username: str) -> str:
+    """Deterministic daily key. UTC date avoids local-zone surprises.
+
+    Form: cost:<username>:<YYYY-MM-DD>. The colon-delimited shape is
+    redis-cli-greppable (KEYS cost:raj:* shows raj's whole history)
+    and survives the 48h TTL window so an audit query at 4 AM UTC the
+    next day still sees yesterday's counter alongside today's.
+    """
+    from datetime import datetime, timezone
+    return f"cost:{username}:{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
 
 # Bound on http_fetch result size. Larger than 50 KB starts straining
 # the model's 8K context (roughly 32 KB of text at most).
@@ -1595,6 +1816,7 @@ def build_graph() -> StateGraph:
     + OTel traces consistent across enabled/disabled runs.
     """
     g: StateGraph = StateGraph(AgentState)
+    g.add_node("budget_check", node_budget_check)
     g.add_node("safety_input", node_safety_input)
     g.add_node("classify", node_classify)
     g.add_node("retrieve", node_retrieve)
@@ -1602,7 +1824,12 @@ def build_graph() -> StateGraph:
     g.add_node("execute", node_execute)
     g.add_node("reflect", node_reflect)
     g.add_node("safety_output", node_safety_output)
-    g.add_edge(START, "safety_input")
+    g.add_edge(START, "budget_check")
+    g.add_conditional_edges(
+        "budget_check",
+        _route_after_budget_check,
+        {"safety_input": "safety_input", END: END},
+    )
     g.add_conditional_edges(
         "safety_input",
         _route_after_safety_input,
@@ -1696,6 +1923,13 @@ class InvokeResponse(BaseModel):
     safety_categories: list[str] = []
     safety_input_ms: int = 0
     safety_output_ms: int = 0
+    # Phase #5: cost-guardrail telemetry. action drives chat-ui badge
+    # rendering (budget exhausted vs filter disabled vs passed). The
+    # remaining counter lets the UI render "X requests left today" so
+    # users see budget pressure before they hit the wall.
+    budget_action: str = "disabled"
+    budget_consumed: int = 0
+    budget_remaining: int = 0
 
 
 # --- Routes ----------------------------------------------------------------
@@ -1792,4 +2026,7 @@ def invoke(
         safety_categories=final_state.get("safety_categories", []),
         safety_input_ms=final_state.get("safety_input_ms", 0),
         safety_output_ms=final_state.get("safety_output_ms", 0),
+        budget_action=final_state.get("budget_action", "disabled"),
+        budget_consumed=final_state.get("budget_consumed", 0),
+        budget_remaining=final_state.get("budget_remaining", 0),
     )
