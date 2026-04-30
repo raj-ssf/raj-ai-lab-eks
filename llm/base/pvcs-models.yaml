@@ -9,10 +9,25 @@
 # AZ, the PVC binds will fail with FailedAttachVolume and the pod
 # stays Pending.
 #
-# Giant models (Llama 3.1 405B AWQ at ~230 GB) do NOT get a PVC here
-# — see pv-llama-405b.yaml for the S3 Mountpoint-backed alternative.
+# Giant models (Llama 3.1 405B AWQ at ~230 GB):
 #
-# Rough idle cost: 30 + 50 + 40 = 120 GiB × $0.08/GB-mo ≈ $9.60/mo.
+# Phase #52 (2026-04-29): added a gp3 PVC for the 405B alongside
+# the existing S3-mountpoint PV (pv-llama-405b.yaml). Trade-off
+# decision flipped in favor of the gp3 PVC for the remaining
+# ~2-month lab lifetime (cluster destruction planned end-of-June):
+#
+#   S3-mountpoint  ~$5.30/mo storage, ~6 min cold-start mmap
+#   gp3 PVC        ~$20/mo storage,   ~3 min cold-start (faster
+#                                     local SSD reads)
+#
+# Over 2 months that's ~$30 difference. Accepted for faster
+# cold-start during the remaining demo window. After cluster
+# teardown, both PVs are destroyed; the S3 source bucket is
+# untouched, so re-staging into a future cluster is a one-shot
+# Job re-run.
+#
+# Rough idle cost (PVC sum): 30 + 50 + 40 + 250 = 370 GiB ×
+# $0.08/GB-mo ≈ $29.60/mo.
 
 ---
 # Llama 3.1 8B Instruct (FP16) — 16 GB on disk, 30 GiB PVC leaves
@@ -117,3 +132,40 @@ spec:
   resources:
     requests:
       storage: 30Gi
+
+---
+# Phase #52: Llama 3.1 405B Instruct AWQ (4-bit quantized) — 204 GB
+# on disk across 47 safetensors shards. 250 GiB PVC matches the
+# capacity of the older S3-mountpoint PV (pv-llama-405b.yaml,
+# vllm-cache-llama-405b) so vllm-llama-405b can swap between the
+# two backings without reconfiguration.
+#
+# RWO not ROX (the older S3-mountpoint PVC was ROX because S3 has
+# inherently multi-reader semantics). gp3 EBS only supports RWO,
+# which is fine — the 405B Deployment runs replicas=1 with
+# strategy=Recreate, so single-mount is the only access pattern
+# we ever need.
+#
+# Initial population: a one-shot Job (NOT in this manifest) ran
+# `aws s3 sync s3://raj-ai-lab-eks-model-weights/
+# llama-3.1-405b-instruct-awq/ /model` mounted from this PVC.
+# After cluster teardown end-of-June, the source bucket persists;
+# re-staging in a future cluster is `kubectl apply` of a similar
+# Job.
+#
+# To swap vllm-llama-405b deployment from S3-mountpoint to gp3:
+# edit deployment-models.yaml — claimName from
+# vllm-cache-llama-405b to vllm-cache-llama-405b-gp3, drop the
+# readOnly: true, accessMode/access stays implicit-RWO.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-llama-405b-gp3
+  labels:
+    app: vllm
+    model: llama-3.1-405b-awq
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 250Gi
