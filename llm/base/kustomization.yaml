@@ -31,3 +31,9 @@ resources:
   - service.yaml
   - httproute.yaml
   - servicemonitor.yaml
+  # Phase #54: scheduled CronJobs pre-warm vllm-llama-8b at 9am
+  # Pacific, scale down at 2am Pacific. Closes the cold-start UX
+  # gap that Phase #53 left — #53 makes ensure_warm correct, but
+  # the wait is ~5-7 min for Karpenter cold-start. With #54, demo
+  # windows find the trivial tier already warm. Cost: ~$330/mo.
+  - prewarm-cronjobs.yaml

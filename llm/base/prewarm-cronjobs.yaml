@@ -1,0 +1,189 @@
+# Phase #54: scheduled pre-warming for vllm-llama-8b (the trivial
+# tier — always_on=True in langgraph-service's ROUTE_REGISTRY).
+#
+# Why this is needed:
+#   Phase #53 fixed the correctness bug where ensure_warm would
+#   return cold_start=False for always_on tiers without checking
+#   the cluster, leading to "no healthy upstream" 503s when
+#   Karpenter consolidated the GPU node down. After #53,
+#   ensure_warm correctly waits for the pod to be Ready, but the
+#   wait is ~5-7 minutes for Karpenter cold-start (provision node
+#   + image pull + model load). This is too long for a demo.
+#
+#   Phase #54 closes the UX gap: a CronJob scales the deployment
+#   up at 9am Pacific, down at 2am Pacific. Demo windows have a
+#   warm trivial tier; off-hours don't pay for idle GPU.
+#
+#   17-hour daily window (9am-2am PT) covers typical demo + late-
+#   night work. Cost: ~510 h/mo × $0.65/hr (g6.xlarge on-demand)
+#   ≈ $330/mo. Not free but bounded.
+#
+# Why not just keep replicas=1 always (option A in the original
+# decision tree)?
+#   24/7 = ~$465/mo. The $135/mo savings of the CronJob window
+#   is worth the small risk that an off-hours user hits a cold
+#   start (and gets the Phase #53 ensure_warm wait, no error).
+#
+# Scheduling notes:
+#   - CronJob.timeZone (K8s 1.27+, GA in 1.30) lets us specify
+#     America/Los_Angeles directly. EKS 1.34 supports it.
+#   - 9 AM PT spin-up → 16:00 UTC (PDT) / 17:00 UTC (PST). The
+#     timeZone field handles DST automatically.
+#   - 2 AM PT shutdown → 09:00 UTC (PDT) / 10:00 UTC (PST).
+#   - Cron entries use minute-hour-dom-month-dow.
+#
+# RBAC:
+#   The CronJob pods need patch on deployments/scale in the llm
+#   namespace. We bind a dedicated ServiceAccount (prewarm-sa) to
+#   a minimal Role rather than reusing langgraph-service's SA
+#   (which has broader permissions and lives in another namespace).
+#
+# Image: bitnami/kubectl is on the Kyverno catchall allowlist
+# (docker.io/bitnami/*). Pinned to a known stable version.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prewarm-sa
+  namespace: llm
+  labels:
+    app: vllm
+    phase: "54"
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prewarm-scaler
+  namespace: llm
+  labels:
+    app: vllm
+    phase: "54"
+rules:
+  # Read deployments + read/patch the scale subresource. Scoped
+  # to the trivial-tier deployment specifically — if we ever pre-
+  # warm other tiers, add their names to resourceNames.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+    resourceNames: ["vllm-llama-8b"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch", "update"]
+    resourceNames: ["vllm-llama-8b"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prewarm-scaler
+  namespace: llm
+  labels:
+    app: vllm
+    phase: "54"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prewarm-scaler
+subjects:
+  - kind: ServiceAccount
+    name: prewarm-sa
+    namespace: llm
+
+---
+# 9am Pacific — scale up. Karpenter provisions the g6.xlarge
+# GPU node, vLLM model-loads. ~5-7 min from this Job firing
+# until the pod is Ready and serving.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vllm-llama-8b-prewarm-up
+  namespace: llm
+  labels:
+    app: vllm
+    model: llama-3.1-8b
+    phase: "54"
+spec:
+  # 9:00 AM Pacific. timeZone field (K8s 1.27+) handles DST.
+  schedule: "0 9 * * *"
+  timeZone: America/Los_Angeles
+  # Don't allow concurrent runs — if a previous Job is somehow
+  # still running when 9 AM hits the next day, just skip.
+  concurrencyPolicy: Forbid
+  # Auto-clean Job records after 1 day so kubectl get cronjob
+  # output doesn't accumulate clutter.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400 # 1 day
+      template:
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: prewarm-sa
+          containers:
+            - name: scaler
+              image: bitnami/kubectl:1.30
+              command: ["/bin/sh", "-euxc"]
+              args:
+                - |
+                  # Idempotent: if already at replicas=1, this is a no-op.
+                  kubectl -n llm patch deployment vllm-llama-8b \
+                    --subresource=scale \
+                    --type=merge \
+                    -p '{"spec":{"replicas":1}}'
+                  kubectl -n llm get deployment vllm-llama-8b
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+
+---
+# 2am Pacific — scale down. Karpenter consolidates the GPU node
+# away after the pod terminates (consolidationPolicy: WhenEmpty).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vllm-llama-8b-prewarm-down
+  namespace: llm
+  labels:
+    app: vllm
+    model: llama-3.1-8b
+    phase: "54"
+spec:
+  # 2:00 AM Pacific.
+  schedule: "0 2 * * *"
+  timeZone: America/Los_Angeles
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: prewarm-sa
+          containers:
+            - name: scaler
+              image: bitnami/kubectl:1.30
+              command: ["/bin/sh", "-euxc"]
+              args:
+                - |
+                  kubectl -n llm patch deployment vllm-llama-8b \
+                    --subresource=scale \
+                    --type=merge \
+                    -p '{"spec":{"replicas":0}}'
+                  kubectl -n llm get deployment vllm-llama-8b
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
