@@ -903,10 +903,20 @@ async def _on_message_stream(
 
         except httpx.HTTPStatusError as e:
             outer.is_error = True
-            outer.output = (
-                f"upstream returned {e.response.status_code}: "
-                f"{e.response.text[:200]}"
-            )
+            # Streaming responses (httpx.AsyncClient.stream) require
+            # the body to be explicitly read before .text/.content
+            # is accessible. Touching e.response.text directly here
+            # raised httpx.ResponseNotRead and masked the real status
+            # code in the user-visible error message — caught during
+            # the Phase #45 canary smoke when langgraph-service
+            # returned 401. Calling aread() first unblocks .text;
+            # wrap in try/except so a transport-level failure (no
+            # body to read) still surfaces the status code.
+            try:
+                body = (await e.response.aread()).decode(errors="replace")[:200]
+            except Exception:
+                body = "<failed to read response body>"
+            outer.output = f"upstream returned {e.response.status_code}: {body}"
             await cl.Message(content=f"❌ {outer.output}").send()
             return
         except Exception as e:
