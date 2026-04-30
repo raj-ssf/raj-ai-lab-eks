@@ -176,6 +176,26 @@ spec:
             - name: RAG_TOP_K_DEFAULT
               value: "5"
 
+            # Phase #51: char budgets for RAG context to keep the
+            # /invoke prompt within model context windows.
+            #
+            # Why these defaults exist: vllm-llama-8b (the trivial
+            # tier) has an 8192-token context. With top_k=5 chunks
+            # each unfiltered ~4KB, the prompt previously hit
+            # 20K+ tokens and vLLM rejected with HTTP 400. The
+            # caps in _build_rag_prompt slice each chunk to
+            # RAG_MAX_CHUNK_CHARS and the total RAG context to
+            # RAG_MAX_CONTEXT_CHARS.
+            #
+            # Tune up if running on a tier with bigger context
+            # (70B / DeepSeek both have 32K) and you want richer
+            # retrieved context. Tune down if you're seeing
+            # context-length errors in node_execute logs.
+            - name: RAG_MAX_CHUNK_CHARS
+              value: "1500"
+            - name: RAG_MAX_CONTEXT_CHARS
+              value: "6000"
+
             # --- Observability --------------------------------------
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://tempo.monitoring.svc.cluster.local:4317

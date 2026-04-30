@@ -2522,6 +2522,35 @@ def node_ensure_warm(state: AgentState) -> AgentState:
     return {"cold_start": True, "warm_wait_seconds": elapsed}
 
 
+# Phase #51: char budgets for RAG context to keep prompt under model
+# context-window limits. Defaults sized for the trivial tier
+# (vllm-llama-8b at 8192-token context):
+#
+#   8192 tokens budget
+# - ~600   for max_tokens (response budget)
+# - ~300   for system prompt + plan injection + user question
+# - ~1500  margin for tool definitions injected by .bind_tools()
+# = ~5800 tokens left for RAG context ≈ 5800 chars at the 1-char-per-
+#   token approximation Llama tokenizers tend toward for English. We
+#   set RAG_MAX_CONTEXT_CHARS to 6000 — close to the budget but not
+#   so tight that a single long chunk pushes us over.
+#
+# Each individual chunk caps at RAG_MAX_CHUNK_CHARS (default 1500)
+# so a single very-long chunk doesn't crowd out the others. With
+# RETRIEVE_DEFAULT_TOP_K=5 chunks × 1500 chars = 7500 chars worst-
+# case, and the total cap (6000) further trims late chunks if
+# they'd exceed budget. Higher-ranked chunks (head of the list)
+# are preserved; trailing chunks dropped wholesale rather than
+# truncated mid-sentence.
+#
+# Tuning for larger-context tiers: a per-route override is the
+# right move when the 70B/DeepSeek tiers are running — they have
+# 32K+ context windows and can absorb the full unfiltered output.
+# For now a single global pair of caps keeps the change minimal.
+RAG_MAX_CHUNK_CHARS = int(os.environ.get("RAG_MAX_CHUNK_CHARS", "1500"))
+RAG_MAX_CONTEXT_CHARS = int(os.environ.get("RAG_MAX_CONTEXT_CHARS", "6000"))
+
+
 def _build_rag_prompt(prompt: str, chunks: list[dict]) -> str:
     """Format retrieved chunks as RAG context, then the user's question.
 
@@ -2532,11 +2561,34 @@ def _build_rag_prompt(prompt: str, chunks: list[dict]) -> str:
     the markup compact and survive even when filenames have spaces or
     special characters.
 
+    Phase #51: truncates per-chunk text and total context to fit
+    the model context window. Higher-ranked chunks (head of the
+    list — rag-service returns score-desc) are preserved; lower-
+    ranked chunks dropped if budget exhausted.
+
     Keeps the prompt model-agnostic — the same string works on Llama
     3.1 8B, 3.3 70B, and DeepSeek-R1 70B.
     """
     if not chunks:
         return prompt
+    # Phase #51: walk chunks in rank order (rag-service returns
+    # them score-desc), truncate each to RAG_MAX_CHUNK_CHARS, then
+    # accumulate until the total RAG_MAX_CONTEXT_CHARS budget is
+    # spent. ~80-char overhead per block accounts for the header
+    # line and separators. Late chunks get dropped wholesale; we
+    # don't truncate mid-block because Llama tokenizers don't
+    # gracefully handle abrupt cutoffs in the middle of source
+    # citations.
+    truncated: list[dict] = []
+    used_chars = 0
+    for c in chunks:
+        text = (c.get("text") or "")[:RAG_MAX_CHUNK_CHARS]
+        block_overhead = 80
+        if used_chars + len(text) + block_overhead > RAG_MAX_CONTEXT_CHARS and truncated:
+            break
+        truncated.append({**c, "text": text})
+        used_chars += len(text) + block_overhead
+    dropped = len(chunks) - len(truncated)
     # Each source includes the filename + chunk index so the LLM has
     # enough context to choose between near-duplicate sources from
     # different files. The bracketed [N] is what we ask the LLM to
@@ -2548,8 +2600,13 @@ def _build_rag_prompt(prompt: str, chunks: list[dict]) -> str:
             ci=c.get("chunk_index", 0),
             text=c.get("text", ""),
         )
-        for i, c in enumerate(chunks)
+        for i, c in enumerate(truncated)
     )
+    if dropped > 0:
+        context += (
+            f"\n\n(... {dropped} additional source(s) elided for "
+            f"prompt-length budget; lowest-ranked first ...)"
+        )
     return (
         "Answer the question using the numbered sources below. When a "
         "claim is supported by a source, cite it with [N] matching the "
