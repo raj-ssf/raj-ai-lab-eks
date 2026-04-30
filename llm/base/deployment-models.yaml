@@ -446,8 +446,27 @@ spec:
     spec:
       serviceAccountName: vllm
       enableServiceLinks: false
+      # Phase #54b (2026-04-29): nodeSelector loosened from
+      # `node.kubernetes.io/instance-type: p4d.24xlarge` to
+      # `workload: gpu-experiment` — a label set by the gpu-
+      # experiments Karpenter NodePool. Reason: p4d.24xlarge in
+      # us-west-2c hit AWS InsufficientInstanceCapacity during a
+      # smoke test. The NodePool's allowed instance-types include
+      # both p4d.24xlarge AND p5.48xlarge; with the pin lifted,
+      # Karpenter will pick whichever has spot capacity (p4d at
+      # ~$33/hr is preferred when available; p5 at ~$98/hr is
+      # the fallback). The 8-GPU resource request at the pod
+      # filters out smaller GPU instances in the NodePool's list
+      # (g6.xlarge, g6e.*) automatically — Karpenter only
+      # launches what fits the 8x nvidia.com/gpu requirement.
+      #
+      # vLLM args (--tensor-parallel-size=8, --max-model-len=8192,
+      # AWQ quantization) work identically on both p4d's 8x A100
+      # 40GB (320GB VRAM) and p5's 8x H100 80GB (640GB). Inference
+      # throughput is ~2-3x faster on p5 due to H100's improved
+      # FP16 / FP8 paths.
       nodeSelector:
-        node.kubernetes.io/instance-type: p4d.24xlarge
+        workload: gpu-experiment
       tolerations:
         - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
         - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
