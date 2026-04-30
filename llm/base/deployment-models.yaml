@@ -446,27 +446,31 @@ spec:
     spec:
       serviceAccountName: vllm
       enableServiceLinks: false
-      # Phase #54b (2026-04-29): nodeSelector loosened from
-      # `node.kubernetes.io/instance-type: p4d.24xlarge` to
-      # `workload: gpu-experiment` — a label set by the gpu-
-      # experiments Karpenter NodePool. Reason: p4d.24xlarge in
-      # us-west-2c hit AWS InsufficientInstanceCapacity during a
-      # smoke test. The NodePool's allowed instance-types include
-      # both p4d.24xlarge AND p5.48xlarge; with the pin lifted,
-      # Karpenter will pick whichever has spot capacity (p4d at
-      # ~$33/hr is preferred when available; p5 at ~$98/hr is
-      # the fallback). The 8-GPU resource request at the pod
-      # filters out smaller GPU instances in the NodePool's list
-      # (g6.xlarge, g6e.*) automatically — Karpenter only
-      # launches what fits the 8x nvidia.com/gpu requirement.
+      # Phase #54b: nodeSelector loosened from instance-type pin
+      # to `workload: gpu-experiment` so Karpenter picks whichever
+      # 8-GPU instance (p4d.24xlarge / p5.48xlarge) has capacity.
       #
-      # vLLM args (--tensor-parallel-size=8, --max-model-len=8192,
-      # AWQ quantization) work identically on both p4d's 8x A100
-      # 40GB (320GB VRAM) and p5's 8x H100 80GB (640GB). Inference
-      # throughput is ~2-3x faster on p5 due to H100's improved
-      # FP16 / FP8 paths.
+      # Phase #54d (2026-04-29): added pod-level AZ pin to
+      # us-west-2a because the deployment's PVC is now
+      # vllm-cache-llama-405b-gp3-usw2a (gp3 EBS in us-west-2a).
+      # Without this pin, Karpenter could place the pod in any AZ
+      # the gpu-experiments NodePool allows (Phase #54c widened
+      # that to all 4 us-west-2 AZs), and the gp3 PVC would
+      # FailedAttachVolume cross-AZ.
+      #
+      # To swap to the us-west-2c gp3 PVC instead (when us-west-2c
+      # capacity returns): change claimName below from
+      # vllm-cache-llama-405b-gp3-usw2a → vllm-cache-llama-405b-gp3
+      # AND topology.kubernetes.io/zone below from us-west-2a →
+      # us-west-2c. Both PVCs persist in the cluster for this swap.
+      #
+      # To fall back to S3-Mountpoint (multi-AZ, slow cold-start):
+      # change claimName to vllm-cache-llama-405b, drop the
+      # topology.kubernetes.io/zone pin, restore readOnly: true on
+      # the volumeMount.
       nodeSelector:
         workload: gpu-experiment
+        topology.kubernetes.io/zone: us-west-2a
       tolerations:
         - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
         - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
@@ -520,35 +524,31 @@ spec:
           readinessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
           livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
           volumeMounts:
-            # Phase #54c: readOnly: true restored alongside the
-            # claimName revert below — the S3-Mountpoint PV is
-            # ROX (ReadOnlyMany) at the volume level, and the
-            # readOnly flag here is the matching defense-in-depth.
-            - { name: model-cache, mountPath: /model, readOnly: true }
+            # Phase #54d: readOnly dropped — gp3 RWO doesn't
+            # enforce read-only at the volume layer. Same
+            # rationale as Phase #52b before the temporary #54c
+            # revert.
+            - { name: model-cache, mountPath: /model }
             - { name: shm,         mountPath: /dev/shm }
       volumes:
         - name: model-cache
           persistentVolumeClaim:
-            # Phase #54c (2026-04-29): reverted from
-            # vllm-cache-llama-405b-gp3 → vllm-cache-llama-405b
-            # (S3-Mountpoint, region-scoped). Reason: us-west-2c
-            # ran out of p4d.24xlarge AND p5.48xlarge capacity at
-            # exactly the moment we tried to take 405B for a ride.
-            # gp3 EBS is AZ-locked, so the gp3 PVC (us-west-2c)
-            # would have prevented Karpenter from launching in
-            # any other AZ. S3-Mountpoint is region-scoped so the
-            # pod can land in any us-west-2[a-d] AZ that has 8-GPU
-            # capacity. Cold-start regresses to ~6 min (S3 mmap)
-            # vs ~3 min (local NVMe), but availability matters
-            # more than cold-start speed when AWS is short on
-            # p4d/p5 in us-west-2c.
+            # Phase #54d (2026-04-29): pinned to the new
+            # us-west-2a gp3 PVC. AWS InsufficientInstanceCapacity
+            # for both p4d AND p5 in us-west-2c during the smoke
+            # made the original us-west-2c gp3 PVC unusable until
+            # capacity returns there. Phase #54d staged a sibling
+            # PVC in us-west-2a for the same model weights.
             #
-            # The gp3 PVC + populated 205 GiB of weights remain in
-            # cluster ($20/mo); to swap back when us-west-2c has
-            # capacity again, change claimName back to
-            # vllm-cache-llama-405b-gp3 + flip readOnly back to
-            # false. Both PVs persist in parallel.
-            claimName: vllm-cache-llama-405b
+            # Both gp3 PVCs persist in the cluster (~$40/mo
+            # combined, ~$80 over the lab's remaining 2 months).
+            # Operator can swap by editing claimName + the
+            # topology.kubernetes.io/zone selector above.
+            #
+            # See the nodeSelector comment above for the full
+            # claimName/zone-pin swap recipe + the S3-Mountpoint
+            # fallback path (vllm-cache-llama-405b, multi-AZ).
+            claimName: vllm-cache-llama-405b-gp3-usw2a
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 16Gi }
 

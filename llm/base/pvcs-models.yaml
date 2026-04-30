@@ -169,3 +169,44 @@ spec:
   resources:
     requests:
       storage: 250Gi
+
+---
+# Phase #54d: us-west-2a sibling of vllm-cache-llama-405b-gp3.
+#
+# Adds a second 250 GiB gp3 PVC in us-west-2a so the 405B
+# Deployment can land in either AZ (whichever has p4d/p5 capacity
+# at scale-up time). Prompted by AWS hitting Insufficient-
+# InstanceCapacity for both p4d.24xlarge AND p5.48xlarge in
+# us-west-2c during the Phase #54b smoke test, while AWS's error
+# message confirmed capacity was available in us-west-2a/b/d.
+#
+# Sibling PVC (vllm-cache-llama-405b-gp3, us-west-2c) stays so
+# we have a fast-path in either AZ. Combined with Phase #54c's
+# NodePool widening, the 405B Deployment can now use:
+#   - vllm-cache-llama-405b-gp3      + zone-pin us-west-2c (this PVC)
+#   - vllm-cache-llama-405b-gp3-usw2a + zone-pin us-west-2a (NEW)
+#   - vllm-cache-llama-405b           multi-AZ via S3-Mountpoint
+#                                    (slow cold-start fallback)
+# Operator picks via deployment-models.yaml's claimName + pod-zone.
+#
+# Cost: +$20/mo on top of the existing us-west-2c gp3. Total gp3-
+# 405B storage now ~$40/mo until lab teardown end-of-June ≈ $80
+# remaining. Accepted as the price of multi-AZ resilience for a
+# rare-use but expensive-to-fail workload.
+#
+# Initial population: a one-shot Job ran aws s3 sync from the same
+# S3 source bucket into this PVC (Phase #54d staging, completed
+# 2026-04-29 in 28 min). 205 GiB present, 47 shards.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-llama-405b-gp3-usw2a
+  labels:
+    app: vllm
+    model: llama-3.1-405b-awq
+    topology.kubernetes.io/zone: us-west-2a
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 250Gi
