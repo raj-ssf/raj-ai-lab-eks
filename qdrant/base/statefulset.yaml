@@ -67,20 +67,38 @@ spec:
         - name: qdrant
           image: qdrant/qdrant:v1.12.4
           imagePullPolicy: IfNotPresent
-          # Phase #76: explicit args to wire cluster bootstrap. ${HOSTNAME}
-          # is a pod-template substitution that resolves at startup to
-          # the pod's actual name (qdrant-0, qdrant-1, qdrant-2).
-          # --uri tells THIS pod how to identify itself in cluster
-          # announcements. --bootstrap points at qdrant-0's stable DNS
-          # for cluster join. qdrant-0's own --bootstrap == its own --uri,
-          # which qdrant detects and treats as "I'm the bootstrap leader."
+          # Phase #76: cluster-bootstrap args via shell wrapper.
+          #
+          # qdrant-0 is the cluster initializer — it must NOT pass
+          # --bootstrap (passing --bootstrap=self causes qdrant to
+          # eagerly gRPC-connect to itself before binding the local
+          # listener, panic'ing with "Failed to create timeout
+          # channel: transport error"). Other pods (qdrant-1+) pass
+          # --bootstrap pointing at qdrant-0's stable DNS for join.
+          #
+          # Same single container command for all pods, differentiated
+          # at runtime by $HOSTNAME (set by k8s to the pod name).
+          # Mirrors the conditional pattern in the official qdrant
+          # helm chart's entrypoint.
+          #
+          # Discovered Phase #76 third apply attempt: qdrant-0 + qdrant-1
+          # both crashed identically with the timeout-channel error —
+          # the ROOT cause was that BOTH were trying to bootstrap before
+          # the cluster's first node had a listener bound. Excluding
+          # --bootstrap on qdrant-0 lets it become the cluster's first
+          # node without the self-connection race.
           command:
             - sh
             - -c
             - |
-              exec ./entrypoint.sh \
-                --uri "http://${HOSTNAME}.qdrant.qdrant.svc.cluster.local:6335" \
-                --bootstrap "http://qdrant-0.qdrant.qdrant.svc.cluster.local:6335"
+              if [ "$HOSTNAME" = "qdrant-0" ]; then
+                exec ./entrypoint.sh \
+                  --uri "http://qdrant-0.qdrant.qdrant.svc.cluster.local:6335"
+              else
+                exec ./entrypoint.sh \
+                  --uri "http://${HOSTNAME}.qdrant.qdrant.svc.cluster.local:6335" \
+                  --bootstrap "http://qdrant-0.qdrant.qdrant.svc.cluster.local:6335"
+              fi
           ports:
             - name: http
               containerPort: 6333
