@@ -124,7 +124,15 @@ spec:
           serviceAccountName: prewarm-sa
           containers:
             - name: scaler
-              image: bitnami/kubectl:1.30
+              # Registry-qualified to match the Kyverno catchall
+              # allowlist's `docker.io/bitnami/*` glob exactly. Bare
+              # `bitnami/kubectl:1.30` gets denied at admission even
+              # though it's the SAME image — kustomize emits whatever
+              # is in the YAML literally, and Kyverno's NotIn check
+              # is a literal-string glob (no registry canonicalization).
+              # Same gotcha as vllm/langfuse — see the comments in
+              # raj-ai-lab-eks-infra/kyverno-policies-catchall.tf.
+              image: docker.io/bitnami/kubectl:1.30
               command: ["/bin/sh", "-euxc"]
               args:
                 - |
@@ -171,7 +179,15 @@ spec:
           serviceAccountName: prewarm-sa
           containers:
             - name: scaler
-              image: bitnami/kubectl:1.30
+              # Registry-qualified to match the Kyverno catchall
+              # allowlist's `docker.io/bitnami/*` glob exactly. Bare
+              # `bitnami/kubectl:1.30` gets denied at admission even
+              # though it's the SAME image — kustomize emits whatever
+              # is in the YAML literally, and Kyverno's NotIn check
+              # is a literal-string glob (no registry canonicalization).
+              # Same gotcha as vllm/langfuse — see the comments in
+              # raj-ai-lab-eks-infra/kyverno-policies-catchall.tf.
+              image: docker.io/bitnami/kubectl:1.30
               command: ["/bin/sh", "-euxc"]
               args:
                 - |
