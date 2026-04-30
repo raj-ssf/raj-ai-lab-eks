@@ -21,3 +21,12 @@ spec:
       port: 6334
       targetPort: grpc
       protocol: TCP
+    # Phase #76: P2P port for qdrant cluster consensus + replication.
+    # Each qdrant pod's Raft-based consensus ring talks here. Without
+    # this port exposed by the headless Service, qdrant-0 / qdrant-1 /
+    # qdrant-2 can't discover each other via the qdrant-N.qdrant.<ns>.svc
+    # DNS name needed for cluster membership.
+    - name: p2p
+      port: 6335
+      targetPort: p2p
+      protocol: TCP

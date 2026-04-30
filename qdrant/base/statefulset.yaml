@@ -1,3 +1,34 @@
+# Phase #76: qdrant 1 → 3 with cluster mode.
+#
+# Adds:
+#   - replicas: 1 → 3
+#   - QDRANT__CLUSTER__ENABLED=true (Raft consensus across pods)
+#   - --uri / --bootstrap args wired via the headless Service DNS so
+#     qdrant-0/1/2 discover each other dynamically
+#   - p2p containerPort 6335 (matches Service port 6335 added in
+#     service.yaml)
+#   - PodDisruptionBudget minAvailable=2 (separate manifest below)
+#
+# Bootstrap pattern: every pod runs identical args. qdrant-0 detects
+# "I AM the bootstrap target" by URI comparison and becomes the
+# initial leader. qdrant-1 + qdrant-2 join via the bootstrap call.
+# No conditional startup logic needed.
+#
+# Existing data: qdrant-0 keeps its PVC (storage-qdrant-0) and the
+# rag-service collection it currently holds. New pods get fresh PVCs
+# from the volumeClaimTemplate. To replicate existing data to new
+# nodes, run AFTER all 3 pods are Ready:
+#   kubectl -n qdrant exec qdrant-0 -- curl -X PATCH \
+#     http://localhost:6333/collections/<name> \
+#     -H 'Content-Type: application/json' \
+#     -d '{"replication_factor": 2}'
+# qdrant will copy the collection's points to a second node within
+# minutes (depending on collection size). For brand-new collections
+# created post-apply, set replication_factor at creation time.
+#
+# Cost: 3× 10Gi gp3 = 30Gi total EBS (~$3/mo at $0.10/Gi/mo). Plus
+# 2 extra qdrant pods × 512Mi memory baseline. Negligible vs lab
+# teardown date.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -6,7 +37,8 @@ metadata:
     app: qdrant
 spec:
   serviceName: qdrant          # must match the headless Service created in service.yaml
-  replicas: 1
+  replicas: 3
+  podManagementPolicy: OrderedReady   # default — qdrant-0 must be Ready before qdrant-1 starts
   selector:
     matchLabels:
       app: qdrant
@@ -18,15 +50,47 @@ spec:
       terminationGracePeriodSeconds: 30
       securityContext:
         fsGroup: 1000          # PVC file ownership for the non-root container user
+      # Phase #76: requiredDuringScheduling anti-affinity. Cluster
+      # consensus needs each pod on a different node — losing a node
+      # with 2 qdrant pods on it would lose Raft quorum (2/3) AND
+      # potentially both replicas of a sharded collection. Cluster has
+      # 3 static nodes across us-west-2{a,b,c}, so the constraint is
+      # satisfiable today.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: qdrant
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: qdrant
           image: qdrant/qdrant:v1.12.4
           imagePullPolicy: IfNotPresent
+          # Phase #76: explicit args to wire cluster bootstrap. ${HOSTNAME}
+          # is a pod-template substitution that resolves at startup to
+          # the pod's actual name (qdrant-0, qdrant-1, qdrant-2).
+          # --uri tells THIS pod how to identify itself in cluster
+          # announcements. --bootstrap points at qdrant-0's stable DNS
+          # for cluster join. qdrant-0's own --bootstrap == its own --uri,
+          # which qdrant detects and treats as "I'm the bootstrap leader."
+          command:
+            - sh
+            - -c
+            - |
+              exec ./entrypoint.sh \
+                --uri "http://${HOSTNAME}.qdrant.qdrant.svc.cluster.local:6335" \
+                --bootstrap "http://qdrant-0.qdrant.qdrant.svc.cluster.local:6335"
           ports:
             - name: http
               containerPort: 6333
             - name: grpc
               containerPort: 6334
+            # Phase #76: P2P port for cluster Raft consensus + data
+            # replication between qdrant pods. Matches the Service
+            # port added in service.yaml.
+            - name: p2p
+              containerPort: 6335
           env:
             - name: QDRANT__SERVICE__HTTP_PORT
               value: "6333"
@@ -39,6 +103,17 @@ spec:
             # AND survives pod restart.
             - name: QDRANT__STORAGE__SNAPSHOTS_PATH
               value: ./storage/snapshots
+            # Phase #76: cluster mode env vars.
+            - name: QDRANT__CLUSTER__ENABLED
+              value: "true"
+            - name: QDRANT__CLUSTER__P2P__PORT
+              value: "6335"
+            # Consensus tick — how often Raft sends heartbeats. 100ms
+            # is qdrant's default; making it explicit so future
+            # tuning (lower = faster failover, higher = less network
+            # chatter) is visible in this manifest.
+            - name: QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS
+              value: "100"
           resources:
             requests:
               cpu: 250m

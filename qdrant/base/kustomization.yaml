@@ -4,3 +4,7 @@ kind: Kustomization
 resources:
   - statefulset.yaml
   - service.yaml
+  # Phase #76: PodDisruptionBudget for the 3-pod cluster — minAvailable=2
+  # so voluntary disruptions (node drain, chart upgrade) can't take
+  # quorum below 2/3.
+  - pdb.yaml

@@ -1,0 +1,23 @@
+# Phase #76: PodDisruptionBudget for the qdrant cluster.
+#
+# Raft consensus needs ≥2 of 3 pods up for quorum. minAvailable=2
+# means K8s blocks voluntary evictions (node drains, chart upgrades,
+# Karpenter consolidation) that would take more than 1 pod down at
+# a time. Involuntary disruptions (node failure, OOM) are not gated
+# by PDB — only the voluntary path.
+#
+# Without this, a sequential node drain could evict qdrant-0 and
+# qdrant-1 in quick succession before qdrant-1 came back on a new
+# node, briefly leaving 1-of-3 pods up = no quorum = read-only mode
+# until quorum re-establishes.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: qdrant
+  labels:
+    app: qdrant
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: qdrant
