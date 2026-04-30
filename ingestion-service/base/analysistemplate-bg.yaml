@@ -1,0 +1,32 @@
+# Phase #46: background AnalysisTemplate (watchdog) for ingestion-
+# service. Mirror of rag-service's Phase #35 watchdog and langgraph-
+# service's Phase #34 — runs continuously throughout the canary,
+# fails the rollout on sustained 5xx error rate.
+#
+# Asymmetric to the gated check by design (same pattern as Phase
+# #34 / #35 split):
+#   gated:    successCondition  >= 0.95   "must prove healthy"
+#   bg:       failureCondition  >  0.10   "abort if explicitly bad"
+# failureCondition + len(result) > 0 keeps it silent on sparse
+# traffic — empty result evaluates to false (no failure),
+# preventing watchdog false-positives in the lab's low-traffic mode.
+
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: ingestion-canary-error-watch-bg
+  labels:
+    app: ingestion-service
+spec:
+  metrics:
+    - name: upload-error-rate-watch
+      interval: 1m
+      failureLimit: 2
+      failureCondition: len(result) > 0 && result[0] > 0.10
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(http_requests_total{job="ingestion-service",handler="/upload",status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total{job="ingestion-service",handler="/upload"}[5m])), 1e-9)

@@ -51,18 +51,30 @@ spec:
             routes:
               - primary
       steps:
+        # Phase #46: indefinite-pauses replaced with timed-pause +
+        # automated AnalysisRun. Now that Phase #43 added
+        # prometheus_fastapi_instrumentator + a ServiceMonitor,
+        # the canary can gate on /upload 5xx success rate instead
+        # of operator polling. Same shape as rag-service Phase #35.
         - setWeight: 25
-        # Indefinite pause — operator promotes manually after
-        # smoking the canary. With no analysis to gate on, this
-        # is the safety mechanism: the rollout doesn't auto-
-        # advance, so a forgotten canary just sits idle (and
-        # pages via Phase #37's RolloutPausedTooLong alert at
-        # the 30m mark to remind the operator).
-        - pause: {}
+        - pause:
+            duration: 1m
+        - analysis:
+            templates:
+              - templateName: ingestion-canary-checks
         - setWeight: 75
-        - pause: {}
-        # Auto-promote to 100% only after the second manual
-        # promote past the 75% pause.
+        - pause:
+            duration: 1m
+        - analysis:
+            templates:
+              - templateName: ingestion-canary-checks
+        # Auto-promote to 100% after the second analysis passes.
+      # Phase #46: background watchdog runs continuously alongside
+      # the gated steps (same Phase #34/#35 dual-analysis pattern).
+      analysis:
+        templates:
+          - templateName: ingestion-canary-error-watch-bg
+        startingStep: 1
       maxSurge: 1
       maxUnavailable: 0
       abortScaleDownDelaySeconds: 30

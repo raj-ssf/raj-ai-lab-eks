@@ -1,0 +1,51 @@
+# Phase #46: step-gated AnalysisTemplate for ingestion-service.
+# Now that Phase #43 added prometheus_fastapi_instrumentator + a
+# ServiceMonitor, the canary can gate on real metrics instead of
+# the Phase #39 indefinite-pause + manual-promote pattern.
+#
+# Note on first-run behavior:
+#   The ServiceMonitor exists but the live pods predate Phase #43's
+#   image — they don't expose /metrics yet. Until a fresh ingestion-
+#   service image is built (with the new requirements.txt
+#   prometheus_fastapi_instrumentator dep + main.py Instrumentator
+#   call) and ArgoCD updates the image tag, this AnalysisTemplate
+#   queries return empty result. The successCondition's empty-
+#   result clause (`len(result) == 0 || ...`) keeps the canary
+#   pass-through during this window — same lab-friendly default as
+#   langgraph + rag.
+#
+# Metric: 5xx error rate on /upload, mirror of rag-service's
+# Phase #35 background watchdog. /upload is the only meaningful
+# user-facing endpoint; /healthz and /metrics shouldn't gate the
+# canary.
+#
+# successCondition (rather than failureCondition like Phase #34's
+# background): step-gated checks want to PROVE healthy. Empty-
+# result-passes is intentional here for sparse-traffic windows.
+
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: ingestion-canary-checks
+  labels:
+    app: ingestion-service
+spec:
+  metrics:
+    - name: upload-success-rate
+      interval: 30s
+      count: 4
+      failureLimit: 2
+      # Pass: 95% non-5xx OR no traffic (lab default).
+      successCondition: len(result) == 0 || result[0] >= 0.95
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          # /upload-specific filter so /healthz / /metrics
+          # 200s don't dilute the signal. status!~"5.." treats
+          # 4xx (e.g. 401 from missing JWT, 422 from bad multipart)
+          # as success — those are caller bugs, not service
+          # regressions.
+          query: |
+            sum(rate(http_requests_total{job="ingestion-service",handler="/upload",status!~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total{job="ingestion-service",handler="/upload"}[5m])), 1e-9)

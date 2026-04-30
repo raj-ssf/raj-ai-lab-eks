@@ -9,15 +9,19 @@ resources:
   # that require manual `kubectl argo rollouts promote`.
   # See rollout.yaml header for the design rationale.
   - rollout.yaml
+  # Phase #46: AnalysisTemplates referenced by rollout.yaml.
+  # Step-gated check (upload-success-rate) + background watchdog
+  # (5xx error rate) — same Phase #34/#35 dual-analysis pattern as
+  # langgraph/rag. Replaces the Phase #39 indefinite-pause +
+  # operator-promote model.
+  - analysistemplate.yaml
+  - analysistemplate-bg.yaml
   - service.yaml
   # Phase #39: helper Services + VirtualService for argo-rollouts
   # Istio trafficRouting (mirror of langgraph/rag pattern).
   - service-stable.yaml
   - service-canary.yaml
   - virtualservice.yaml
-  # Phase #43: Prometheus ServiceMonitor. With the Instrumentator
-  # now wired up in app/main.py, http_request_duration_seconds /
-  # http_requests_total are scraped, enabling a future Phase #43b
-  # AnalysisTemplate to convert the Phase #39 indefinite-pause
-  # canary to automated.
+  # Phase #43: Prometheus ServiceMonitor. Required by Phase #46's
+  # AnalysisTemplates above (queries against http_requests_total).
   - servicemonitor.yaml
