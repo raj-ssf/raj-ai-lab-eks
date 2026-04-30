@@ -210,3 +210,40 @@ spec:
   resources:
     requests:
       storage: 250Gi
+
+---
+# Phase #54f (2026-04-30): third sibling PVC, us-west-2b. After
+# AWS InsufficientInstanceCapacity rotated through us-west-2c → 2a
+# → 2c again within an hour during the Phase #54b smoke test, the
+# decision was to populate gp3 PVCs in EVERY AZ the VPC supports
+# so the operator can swap to whichever AZ has p4d/p5 capacity at
+# any moment. With 3 PVCs (us-west-2a, b, c), at least 2 of 3 AZs
+# typically have capacity simultaneously per AWS's tonight error
+# messages.
+#
+# us-west-2d was attempted but the VPC has no private subnet in
+# us-west-2d (only AZ1, AZ2, AZ3 = us-west-2a, b, c per the VPC
+# tags). 3-AZ coverage is the maximum without VPC subnet
+# expansion; that's a Terraform infra change deferred until/if
+# us-west-2d capacity proves to matter.
+#
+# Total 405B storage cost (post #54f):
+#   vllm-cache-llama-405b           S3-Mountpoint  $5.30/mo
+#   vllm-cache-llama-405b-gp3       gp3 us-west-2c  $20/mo
+#   vllm-cache-llama-405b-gp3-usw2a gp3 us-west-2a  $20/mo
+#   vllm-cache-llama-405b-gp3-usw2b gp3 us-west-2b  $20/mo  (NEW)
+#                                       Total      ~$65/mo
+# Over remaining ~2 months until lab teardown end-of-June ≈ $130.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-llama-405b-gp3-usw2b
+  labels:
+    app: vllm
+    model: llama-3.1-405b-awq
+    topology.kubernetes.io/zone: us-west-2b
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 250Gi
