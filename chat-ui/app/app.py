@@ -156,6 +156,12 @@ async def oauth_callback(
     # user.metadata is serialized into the session JWT and accessible
     # later from any handler via cl.user_session.get("user").metadata.
     default_user.metadata["access_token"] = token
+    # Phase #47b: count accepted OAuth callbacks. Returning a User
+    # object means Chainlit will accept the auth; returning None
+    # rejects it (handled in the parent function's try/except below
+    # where we'd see Exception and mark rejected). For this happy
+    # path, the auth is accepted.
+    CHAT_OAUTH_TOTAL.labels(outcome="accepted").inc()
     return default_user
 
 
@@ -311,12 +317,16 @@ async def _handle_upload() -> None:
         # Submit
         try:
             job = await _post_upload(f, token, session_id)
+            # Phase #47b: success counter
+            CHAT_UPLOAD_TOTAL.labels(outcome="success").inc()
         except httpx.HTTPStatusError as e:
+            CHAT_UPLOAD_TOTAL.labels(outcome="error").inc()
             outer.is_error = True
             outer.output = f"upload submit failed: {e.response.status_code} {e.response.text[:200]}"
             await cl.Message(content=f"❌ {outer.output}").send()
             return
         except Exception as e:
+            CHAT_UPLOAD_TOTAL.labels(outcome="error").inc()
             outer.is_error = True
             outer.output = f"upload submit failed: {type(e).__name__}: {e}"
             await cl.Message(content=f"❌ {outer.output}").send()
@@ -858,6 +868,10 @@ async def _on_message_stream(
     open_steps: Dict[str, Any] = {}
     error_payload: Dict[str, Any] = {}
 
+    # Phase #47b: instrument outcome at each exit point. Total
+    # duration spans the entire SSE consumption + UI rendering.
+    invoke_started = time.monotonic()
+
     async with cl.Step(name="LangGraph router", type="run") as outer:
         outer.input = prompt
 
@@ -918,11 +932,17 @@ async def _on_message_stream(
                 body = "<failed to read response body>"
             outer.output = f"upstream returned {e.response.status_code}: {body}"
             await cl.Message(content=f"❌ {outer.output}").send()
+            # Phase #47b: HTTP-status error from langgraph-service.
+            CHAT_INVOKE_TOTAL.labels(outcome="error").inc()
+            CHAT_INVOKE_DURATION_SECONDS.observe(time.monotonic() - invoke_started)
             return
         except Exception as e:
             outer.is_error = True
             outer.output = f"{type(e).__name__}: {e}"
             await cl.Message(content=f"❌ {outer.output}").send()
+            # Phase #47b: non-HTTP exception (network/timeout/parse).
+            CHAT_INVOKE_TOTAL.labels(outcome="error").inc()
+            CHAT_INVOKE_DURATION_SECONDS.observe(time.monotonic() - invoke_started)
             return
 
         if error_payload:
@@ -931,6 +951,12 @@ async def _on_message_stream(
                 f"upstream error: {error_payload.get('detail', 'unknown')}"
             )
             await cl.Message(content=f"❌ {outer.output}").send()
+            # Phase #47b: SSE "error" event from langgraph-service.
+            # Distinct from HTTPStatusError above — here langgraph
+            # returned 200 OK at the HTTP layer but the graph itself
+            # surfaced an error via the SSE protocol.
+            CHAT_INVOKE_TOTAL.labels(outcome="error").inc()
+            CHAT_INVOKE_DURATION_SECONDS.observe(time.monotonic() - invoke_started)
             return
 
         # Some safe-block paths short-circuit before tokens flow —
@@ -995,6 +1021,12 @@ async def _on_message_stream(
     msg.actions = actions
     await msg.update()
 
+    # Phase #47b: success path. Reaching this line means we got
+    # through SSE consumption, hit "done", and rendered. Counters
+    # + duration land here.
+    CHAT_INVOKE_TOTAL.labels(outcome="success").inc()
+    CHAT_INVOKE_DURATION_SECONDS.observe(time.monotonic() - invoke_started)
+
 
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
@@ -1034,6 +1066,9 @@ async def on_message(message: cl.Message) -> None:
     # state-graph nodes as nested steps with their measured timings
     # AFTER the response returns (the call is synchronous, not streamed,
     # so we render retroactively rather than in real time).
+    # Phase #47b: counter wiring on the legacy non-streaming path
+    # too. Same outcome shape as the streaming path.
+    legacy_invoke_started = time.monotonic()
     async with cl.Step(name="LangGraph router", type="run") as outer:
         outer.input = prompt
         try:
@@ -1042,11 +1077,15 @@ async def on_message(message: cl.Message) -> None:
             outer.is_error = True
             outer.output = f"upstream returned {e.response.status_code}: {e.response.text[:200]}"
             await cl.Message(content=f"❌ {outer.output}").send()
+            CHAT_INVOKE_TOTAL.labels(outcome="error").inc()
+            CHAT_INVOKE_DURATION_SECONDS.observe(time.monotonic() - legacy_invoke_started)
             return
         except Exception as e:
             outer.is_error = True
             outer.output = f"{type(e).__name__}: {e}"
             await cl.Message(content=f"❌ {outer.output}").send()
+            CHAT_INVOKE_TOTAL.labels(outcome="error").inc()
+            CHAT_INVOKE_DURATION_SECONDS.observe(time.monotonic() - legacy_invoke_started)
             return
 
         retrieve_count = data.get("retrieve_count", 0)
@@ -1165,6 +1204,11 @@ async def on_message(message: cl.Message) -> None:
         elements=elements,
         actions=actions,
     ).send()
+
+    # Phase #47b: legacy non-streaming success counter. Reaching
+    # this line means the response message rendered without error.
+    CHAT_INVOKE_TOTAL.labels(outcome="success").inc()
+    CHAT_INVOKE_DURATION_SECONDS.observe(time.monotonic() - legacy_invoke_started)
 
 
 @cl.action_callback("view_in_langfuse")
