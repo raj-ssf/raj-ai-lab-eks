@@ -470,7 +470,14 @@ spec:
       # the volumeMount.
       nodeSelector:
         workload: gpu-experiment
-        topology.kubernetes.io/zone: us-west-2a
+        # AZ pin swapped 2026-04-29 22:30 → 23:31 from us-west-2a
+        # back to us-west-2c. AWS capacity rotated: at 22:30,
+        # us-west-2a had p4d/p5 capacity and us-west-2c didn't;
+        # by 23:31 AWS reported the inverse, with us-west-2b/c/d
+        # holding capacity. Both gp3 PVCs are populated, so the
+        # operator just edits this two-line block + the claimName
+        # below to swap. Tag-team AZs.
+        topology.kubernetes.io/zone: us-west-2c
       tolerations:
         - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
         - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
@@ -548,7 +555,7 @@ spec:
             # See the nodeSelector comment above for the full
             # claimName/zone-pin swap recipe + the S3-Mountpoint
             # fallback path (vllm-cache-llama-405b, multi-AZ).
-            claimName: vllm-cache-llama-405b-gp3-usw2a
+            claimName: vllm-cache-llama-405b-gp3
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 16Gi }
 
