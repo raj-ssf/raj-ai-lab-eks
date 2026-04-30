@@ -16,3 +16,12 @@ spec:
       port: 80
       targetPort: http
       protocol: TCP
+    # Phase #47: side port for prometheus_client's start_http_server
+    # /metrics endpoint. Chainlit doesn't expose its FastAPI app for
+    # in-process Instrumentator hookup, so we run metrics on a
+    # separate listener (8001) and scrape that. ServiceMonitor in
+    # base/servicemonitor.yaml selects this port by name.
+    - name: metrics
+      port: 8001
+      targetPort: 8001
+      protocol: TCP

@@ -1,0 +1,33 @@
+# Phase #47: ServiceMonitor scraping chat-ui's separate /metrics
+# port (8001). Selects port: metrics on the chat-ui Service.
+#
+# Why a side port: Chainlit's framework-managed FastAPI app isn't
+# directly accessible for prometheus_fastapi_instrumentator's
+# instrument_app() call. We run a parallel HTTP server in
+# app/app.py via prometheus_client.start_http_server(8001) and
+# scrape that. See the comment in chat-ui/app/app.py for the full
+# rationale.
+#
+# Series the ServiceMonitor will collect (from app/app.py manual
+# instrumentation):
+#   chat_invoke_total{outcome="success|error"}
+#   chat_invoke_duration_seconds_bucket
+#   chat_upload_total{outcome="success|error"}
+#   chat_oauth_total{outcome="accepted|rejected"}
+# Plus prometheus_client's defaults (process_*, python_*).
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: chat-ui
+  labels:
+    app: chat-ui
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: chat-ui
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

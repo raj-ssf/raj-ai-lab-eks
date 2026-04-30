@@ -1,9 +1,17 @@
+# Phase #45: chat-ui flipped from blueGreen → canary now that Phase
+# #44's DestinationRule with consistent-hash on the Chainlit session
+# cookie is in place. Same-cookie requests pin to the same pod →
+# safe to weight traffic across stable + canary.
+#
+# Original Phase #40 rationale (kept for archeology — explains the
+# constraint Phase #44 lifted):
+#
 # Phase #40: chat-ui converted to Argo Rollouts blueGreen, NOT
 # canary. Different strategy than langgraph (#30+#31), rag (#35),
 # and ingestion (#39) — and the strategy choice is forced by
 # Chainlit's session model.
 #
-# WHY blueGreen, NOT canary:
+# WHY blueGreen, NOT canary (PRE-Phase #44):
 #   Chainlit uses WebSockets for token-by-token streaming of /invoke
 #   responses. A weighted-traffic canary (Phase #31 pattern) would
 #   randomly route the WebSocket-upgrade request between stable and
@@ -61,23 +69,43 @@ spec:
     matchLabels:
       app: chat-ui
   strategy:
-    blueGreen:
-      # The Service users actually hit (existing chat-ui Service —
-      # the HTTPRoute backendRefs to it). argo-rollouts injects
-      # rollouts-pod-template-hash into spec.selector to pin it
-      # to whichever RS is currently "active".
-      activeService: chat-ui
-      # Separate Service that selects the "preview" (about-to-be-
-      # promoted) RS. Operators inspect this Service directly during
-      # the pause window. Created as chat-ui-preview.yaml.
-      previewService: chat-ui-preview
-      # Manual promote required. This is the safety mechanism since
-      # there's no analysis to gate on. Set to true to auto-promote
-      # after preview is healthy (skip the manual review window).
-      autoPromotionEnabled: false
-      # After promotion, keep the old stable RS up for 60s in case
-      # a fast rollback is needed. Then scale to 0.
-      scaleDownDelaySeconds: 60
+    # Phase #45: blueGreen → canary. Made safe by Phase #44's
+    # DestinationRule with consistent-hash on the Chainlit session
+    # cookie — same-cookie requests pin to the same pod, so a
+    # weighted-traffic canary (this strategy block) doesn't fragment
+    # in-conversation sessions across stable + canary RS.
+    #
+    # Without the Phase #44 hash, switching to canary would have
+    # split each user's session traffic randomly between two RS
+    # instances, corrupting Chainlit's server-side session state.
+    # The hash makes this safe.
+    #
+    # No analysis templates yet — chat-ui has no Prometheus
+    # instrumentation. Indefinite-pause canary like Phase #39
+    # ingestion-service: setWeight + pause + manual operator
+    # promote. When Phase #47 (Chainlit /metrics on a side port)
+    # lands, this strategy can swap pause for an analysis step.
+    canary:
+      canaryService: chat-ui-canary
+      stableService: chat-ui-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: chat-ui-canary-vs
+            routes:
+              - primary
+      steps:
+        - setWeight: 25
+        # Indefinite pause — operator inspects the canary RS, then
+        # promotes manually. Phase #37's RolloutPausedTooLong alert
+        # fires at 30m to remind a forgetful operator.
+        - pause: {}
+        - setWeight: 75
+        - pause: {}
+        # Auto-promote to 100% after the second manual promote.
+      maxSurge: 1
+      maxUnavailable: 0
+      abortScaleDownDelaySeconds: 30
   revisionHistoryLimit: 5
   template:
     metadata:
@@ -92,6 +120,10 @@ spec:
           ports:
             - name: http
               containerPort: 8000
+            # Phase #47: prometheus_client side server. The chat-ui
+            # Service exposes this via a port named "metrics".
+            - name: metrics
+              containerPort: 8001
           env:
             - name: DOMAIN
               valueFrom:

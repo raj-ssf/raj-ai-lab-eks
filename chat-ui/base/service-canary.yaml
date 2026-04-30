@@ -1,0 +1,20 @@
+# Phase #45: canary Service for argo-rollouts Istio trafficRouting.
+# Empty endpoints in steady-state. Populated only when a canary is
+# in flight.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-ui-canary
+  labels:
+    app: chat-ui
+    role: canary
+spec:
+  type: ClusterIP
+  selector:
+    app: chat-ui
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

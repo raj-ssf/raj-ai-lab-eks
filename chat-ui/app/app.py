@@ -25,9 +25,58 @@ from typing import Any, Dict, Optional
 
 import chainlit as cl
 import httpx
+from prometheus_client import Counter, Histogram, start_http_server
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 log = logging.getLogger("chat-ui")
+
+# Phase #47: Prometheus instrumentation on a side port.
+#
+# Chainlit doesn't expose its internal FastAPI app for clean
+# prometheus_fastapi_instrumentator hookup the way ingestion-service
+# / rag-service / langgraph-service do. Instead we run a separate
+# HTTP server on port 8001 (just /metrics) using prometheus_client's
+# start_http_server(). The chat-ui Service exposes both ports —
+# 8000 for the Chainlit UI/API + 8001 for /metrics — and a
+# ServiceMonitor scrapes 8001.
+#
+# Manual instrumentation only — we don't get auto HTTP-level series
+# like the FastAPI Instrumentator. The counters/histograms below
+# are wrapped around the call sites that matter (langgraph /invoke,
+# ingestion /upload) so canary AnalysisTemplates can later gate on
+# them in a future Phase #47b.
+CHAT_INVOKE_TOTAL = Counter(
+    "chat_invoke_total",
+    "Total /invoke calls from chat-ui to langgraph-service.",
+    ["outcome"],  # success | error
+)
+CHAT_INVOKE_DURATION_SECONDS = Histogram(
+    "chat_invoke_duration_seconds",
+    "End-to-end /invoke latency from chat-ui's perspective.",
+    buckets=(0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0),
+)
+CHAT_UPLOAD_TOTAL = Counter(
+    "chat_upload_total",
+    "Total /upload calls from chat-ui to ingestion-service.",
+    ["outcome"],  # success | error
+)
+CHAT_OAUTH_TOTAL = Counter(
+    "chat_oauth_total",
+    "Total OAuth callback events.",
+    ["outcome"],  # accepted | rejected
+)
+
+# Start the /metrics HTTP server. Port 8001, all interfaces. Idempotent
+# since chat-ui runs single-replica; multi-replica would still be fine
+# because each pod listens on its own pod IP.
+_METRICS_PORT = int(os.environ.get("METRICS_PORT", "8001"))
+try:
+    start_http_server(_METRICS_PORT)
+    log.info("prometheus /metrics server listening on :%d", _METRICS_PORT)
+except OSError as e:
+    # Port-in-use can happen on local hot-reload during dev; in-cluster
+    # the pod is fresh on every restart so this is purely defensive.
+    log.warning("metrics server failed to start: %s", e)
 
 # Chainlit 1.5+ ships Keycloak as a built-in OAuth provider — registered
 # automatically when OAUTH_KEYCLOAK_CLIENT_ID, OAUTH_KEYCLOAK_CLIENT_SECRET,

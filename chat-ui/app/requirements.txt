@@ -17,3 +17,11 @@ chainlit>=2.0.0,<3.0.0
 # the version in langgraph-service/rag-service for consistent behavior
 # (timeout, mTLS quirks, etc. are sensitive to httpx version).
 httpx==0.27.2
+
+# Phase #47: prometheus_client (NOT prometheus_fastapi_instrumentator
+# — Chainlit doesn't expose its FastAPI app for clean Instrumentator
+# hookup, so we run a separate /metrics server on a side port via
+# start_http_server() instead). Same series as Phase #14a/#24/#43
+# patterns at the lab — Counter, Histogram. Manual instrumentation
+# only.
+prometheus-client==0.21.0

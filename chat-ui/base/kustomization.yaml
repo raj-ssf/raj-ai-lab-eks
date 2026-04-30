@@ -3,18 +3,27 @@ kind: Kustomization
 
 resources:
   - serviceaccount.yaml
-  # Phase #40: deployment.yaml replaced by rollout.yaml using
-  # blueGreen strategy (NOT canary). Chainlit WebSocket streaming
-  # makes traffic-weighted canary unsafe — see rollout.yaml header.
+  # Phase #45: rollout.yaml strategy flipped from blueGreen to
+  # canary. Phase #44's consistent-hash DR makes weighted-traffic
+  # canary safe for Chainlit's session model.
   - rollout.yaml
   - service.yaml
-  # Phase #40: preview Service for the blueGreen strategy.
-  # argo-rollouts pins its selector to the preview RS; operator
-  # inspects via port-forward during the pause window.
-  - service-preview.yaml
+  # Phase #45: stable + canary helper Services for argo-rollouts
+  # Istio trafficRouting. Replace the Phase #40 service-preview.yaml
+  # (which was the blueGreen previewService).
+  - service-stable.yaml
+  - service-canary.yaml
+  # Phase #45: VirtualService consumed by argo-rollouts to mutate
+  # weights between -stable and -canary. Mesh-only scope today;
+  # widening to north-south is Phase #45b candidate.
+  - virtualservice.yaml
   # Phase #44: Istio DestinationRule with consistent-hash LB on the
-  # Chainlit session cookie. Unlocks horizontal scale + traffic-
-  # weighted canary by ensuring same-cookie requests pin to the
-  # same pod.
+  # Chainlit session cookie. Required by Phase #45's safe-canary
+  # design.
   - destinationrule.yaml
+  # Phase #47: ServiceMonitor for the chat-ui side-port /metrics
+  # listener (Chainlit's FastAPI isn't exposed for Instrumentator,
+  # so app/app.py runs prometheus_client.start_http_server(8001)
+  # in parallel).
+  - servicemonitor.yaml
   - httproute.yaml

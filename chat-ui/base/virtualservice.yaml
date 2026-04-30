@@ -1,0 +1,63 @@
+# Phase #45: VirtualService for the canary trafficRouting. Mirror
+# of langgraph/rag/ingestion VS pattern.
+#
+# Scope: gateways: [mesh] — applies only to in-mesh sidecar traffic.
+# The chat-ui north-south path goes through the Istio Gateway
+# (HTTPRoute → chat-ui Service); that path is NOT weighted by this
+# VS. For canary on browser traffic too, we'd need to add the
+# gateway to the gateways list AND ensure the consistent-hash
+# DestinationRule applies at the gateway side, OR use the
+# argo-rollouts Gateway API integration.
+#
+# Today's coverage:
+#   - east-west callers OF chat-ui: there are none in the lab today
+#     (chat-ui is a leaf — users hit it via north-south, no other
+#     in-mesh service calls it). So the practical effect of this VS
+#     is zero traffic-shifting until a future architecture change
+#     adds an in-mesh caller, OR we extend gateways to include the
+#     shared-gateway listener.
+#
+# Why we ship the VS anyway:
+#   The Rollout's strategy.canary.trafficRouting.istio block REQUIRES
+#   a VS to mutate. Without it, argo-rollouts fails at canary-step-
+#   advance time with "VirtualService not found". So this VS exists
+#   primarily to satisfy the controller's API contract, even though
+#   its real-world traffic-shifting effect is currently nil. When
+#   the gateways list is widened to include the shared-gateway
+#   listener (Phase #45b candidate), the VS becomes operationally
+#   meaningful.
+#
+# DestinationRule chat-ui-session-affinity (Phase #44) handles the
+# consistent-hash on chainlit-session-id cookie. The DR's host is
+# chat-ui.chat.svc.cluster.local — the apex Service, not the
+# -stable/-canary helpers. That's correct: argo-rollouts maps the
+# weighted destinations through to specific pod-template-hash labels,
+# but session affinity should be deterministic at the SERVICE level
+# so cookies hash the same way regardless of which RS is currently
+# serving. If the DR pointed at -stable specifically, sessions on
+# the canary RS would lose affinity.
+
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: chat-ui-canary-vs
+  labels:
+    app: chat-ui
+spec:
+  hosts:
+    - chat-ui.chat.svc.cluster.local
+  gateways:
+    - mesh
+  http:
+    - name: primary
+      route:
+        - destination:
+            host: chat-ui-stable
+            port:
+              number: 80
+          weight: 100
+        - destination:
+            host: chat-ui-canary
+            port:
+              number: 80
+          weight: 0
