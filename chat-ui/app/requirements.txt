@@ -1,17 +1,20 @@
-# Chainlit 2.x — version history skipped 1.4/1.5 entirely (1.3.2 →
-# 2.0.0 was the next stable). 2.x has Keycloak in the built-in OAuth
-# provider list, registered automatically when OAUTH_KEYCLOAK_*
-# env vars are set. 1.3.2 didn't and a runtime-appended custom
-# provider hit a route-registration vs decorator-check mismatch
-# (decorator's "any provider configured?" check passed, but HTTP
-# routes were enumerated from a hardcoded list, not runtime
-# providers — so /auth/oauth/keycloak/login fell through to SPA
-# and the browser looped).
+# Chainlit pinned exactly to 2.11.1 (was: chainlit>=2.0.0,<3.0.0).
 #
-# 2.x has minor API drift from 1.3 (cl.Action / cl.Step / data
-# layer); we pin to the major to absorb whatever breaks at runtime
-# in one bound. Pin exactly after first successful build.
-chainlit>=2.0.0,<3.0.0
+# Pin tightened after the Phase #45+#47 canary regression: a fresh
+# image build with the range pin resolved a different chainlit
+# minor version, which serialized session cookies in a format
+# subtly incompatible with the prior version. Existing browsers
+# carrying cookies issued by the OLD version's chainlit hit the
+# NEW version's deserializer and ended up with empty
+# user.metadata["access_token"] → chat-ui forwarded an empty
+# Bearer token to langgraph-service → langgraph returned 401.
+# All caught by the canary at 25% traffic share before going
+# 100%. Phase #45 paid for itself.
+#
+# Bumping chainlit is now an explicit decision, not pip's choice.
+# When ready to bump: change the pin, rebuild, push to canary,
+# observe.
+chainlit==2.11.1
 
 # Async HTTP client to call langgraph-service /invoke. Pinned to match
 # the version in langgraph-service/rag-service for consistent behavior
