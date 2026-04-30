@@ -250,6 +250,13 @@ ROUTE_REGISTRY: dict[str, dict] = {
         # to True via a deployment.yaml env override (per-tier flags
         # are in code; the master switch PLANNER_ENABLED gates all).
         "use_planner": False,
+        # Phase #51b: per-tier RAG context budget. Llama 3.1 8B has
+        # an 8192-token context window. After reserving ~600 for the
+        # response, ~300 for system prompt + plan + question, and
+        # ~1500 for tool definitions injected by .bind_tools(), ~5800
+        # tokens of headroom remain. At the ~1-char-per-token Llama
+        # ratio for English, 6000 chars fits with margin.
+        "rag_max_context_chars": 6000,
     },
     "tuned-lora": {
         # Reuses the trivial tier's vLLM pod and Deployment — the
@@ -274,6 +281,12 @@ ROUTE_REGISTRY: dict[str, dict] = {
         # toolbench dataset).
         "supports_tools": False,
         "use_planner": False,
+        # Same vLLM pod as trivial → same 8K context window. With
+        # tools DISABLED here, the ~1500 tool-definitions budget
+        # frees up — could push to 7500. Keeping at 6000 for now
+        # so trivial vs tuned-lora canary comparisons aren't
+        # confounded by different RAG-context lengths.
+        "rag_max_context_chars": 6000,
     },
     "reasoning": {
         "url": f"{MODEL_REASONING_URL}/v1",
@@ -285,6 +298,14 @@ ROUTE_REGISTRY: dict[str, dict] = {
         # helps most here. On by default at the tier level (still
         # gated by master PLANNER_ENABLED).
         "use_planner": True,
+        # DeepSeek-R1-Distill-Llama-70B-AWQ has a 32K context window
+        # (deployment-models.yaml: --max-model-len=32768). With tools
+        # disabled here we have far more headroom. 24000 chars ≈
+        # ~24K tokens for English — leaves ~8K for response + system
+        # prompt + extended reasoning trace (R1's <think>...</think>
+        # blocks can be lengthy). If reasoning calls hit context-
+        # length errors, drop to 18000.
+        "rag_max_context_chars": 24000,
     },
     "hard": {
         "url": f"{MODEL_HARD_URL}/v1",
@@ -294,6 +315,11 @@ ROUTE_REGISTRY: dict[str, dict] = {
         "supports_tools": False,  # 70B AWQ tier; tool support TBD
         # Hard tier serves long-form / complex tasks. Planning helps.
         "use_planner": True,
+        # Llama 3.3 70B AWQ has a 128K-capable architecture but our
+        # vLLM deployment caps --max-model-len at 32768 (matches the
+        # reasoning tier — see deployment.yaml). 24000 chars matches
+        # reasoning's budget for parity.
+        "rag_max_context_chars": 24000,
     },
 }
 
@@ -2523,35 +2549,37 @@ def node_ensure_warm(state: AgentState) -> AgentState:
 
 
 # Phase #51: char budgets for RAG context to keep prompt under model
-# context-window limits. Defaults sized for the trivial tier
-# (vllm-llama-8b at 8192-token context):
+# context-window limits.
 #
+# Phase #51b: per-tier RAG context caps via ROUTE_REGISTRY. The
+# global RAG_MAX_CONTEXT_CHARS env var below is a fallback default
+# used only when the caller doesn't pass a route, AND the per-tier
+# cap when ROUTE_REGISTRY[route]["rag_max_context_chars"] is unset.
+# In practice every tier sets it explicitly:
+#   trivial / tuned-lora : 6000  (Llama 3.1 8B  — 8K context)
+#   reasoning           : 24000 (DeepSeek-R1 70B — 32K context)
+#   hard                : 24000 (Llama 3.3 70B  — 32K context)
+#
+# Sizing math for the trivial tier (the original Phase #51 cap):
 #   8192 tokens budget
 # - ~600   for max_tokens (response budget)
 # - ~300   for system prompt + plan injection + user question
 # - ~1500  margin for tool definitions injected by .bind_tools()
 # = ~5800 tokens left for RAG context ≈ 5800 chars at the 1-char-per-
-#   token approximation Llama tokenizers tend toward for English. We
-#   set RAG_MAX_CONTEXT_CHARS to 6000 — close to the budget but not
-#   so tight that a single long chunk pushes us over.
+#   token approximation Llama tokenizers tend toward for English.
 #
 # Each individual chunk caps at RAG_MAX_CHUNK_CHARS (default 1500)
-# so a single very-long chunk doesn't crowd out the others. With
-# RETRIEVE_DEFAULT_TOP_K=5 chunks × 1500 chars = 7500 chars worst-
-# case, and the total cap (6000) further trims late chunks if
-# they'd exceed budget. Higher-ranked chunks (head of the list)
+# so a single very-long chunk doesn't crowd out the others. Higher-
+# ranked chunks (head of the list — rag-service returns score-desc)
 # are preserved; trailing chunks dropped wholesale rather than
 # truncated mid-sentence.
-#
-# Tuning for larger-context tiers: a per-route override is the
-# right move when the 70B/DeepSeek tiers are running — they have
-# 32K+ context windows and can absorb the full unfiltered output.
-# For now a single global pair of caps keeps the change minimal.
 RAG_MAX_CHUNK_CHARS = int(os.environ.get("RAG_MAX_CHUNK_CHARS", "1500"))
 RAG_MAX_CONTEXT_CHARS = int(os.environ.get("RAG_MAX_CONTEXT_CHARS", "6000"))
 
 
-def _build_rag_prompt(prompt: str, chunks: list[dict]) -> str:
+def _build_rag_prompt(
+    prompt: str, chunks: list[dict], route: Optional[str] = None
+) -> str:
     """Format retrieved chunks as RAG context, then the user's question.
 
     Format: each source block carries a numeric ID + filename + chunk
@@ -2566,25 +2594,36 @@ def _build_rag_prompt(prompt: str, chunks: list[dict]) -> str:
     list — rag-service returns score-desc) are preserved; lower-
     ranked chunks dropped if budget exhausted.
 
+    Phase #51b: when `route` is provided, uses ROUTE_REGISTRY[route]
+    ["rag_max_context_chars"] as the budget instead of the global
+    RAG_MAX_CONTEXT_CHARS env default. Bigger tiers get bigger budgets.
+    Falls back to the global default for callers that don't pass a
+    route (e.g., legacy callers, tests) — ensures backward compat.
+
     Keeps the prompt model-agnostic — the same string works on Llama
     3.1 8B, 3.3 70B, and DeepSeek-R1 70B.
     """
     if not chunks:
         return prompt
+    # Phase #51b: select the per-tier cap if a route was given,
+    # else fall back to the global env default.
+    cap = RAG_MAX_CONTEXT_CHARS
+    if route is not None:
+        cfg = ROUTE_REGISTRY.get(route, {})
+        cap = cfg.get("rag_max_context_chars", RAG_MAX_CONTEXT_CHARS)
     # Phase #51: walk chunks in rank order (rag-service returns
     # them score-desc), truncate each to RAG_MAX_CHUNK_CHARS, then
-    # accumulate until the total RAG_MAX_CONTEXT_CHARS budget is
-    # spent. ~80-char overhead per block accounts for the header
-    # line and separators. Late chunks get dropped wholesale; we
-    # don't truncate mid-block because Llama tokenizers don't
-    # gracefully handle abrupt cutoffs in the middle of source
-    # citations.
+    # accumulate until the per-tier budget `cap` is spent. ~80-char
+    # overhead per block accounts for the header line and separators.
+    # Late chunks get dropped wholesale; we don't truncate mid-block
+    # because Llama tokenizers don't gracefully handle abrupt cutoffs
+    # in the middle of source citations.
     truncated: list[dict] = []
     used_chars = 0
     for c in chunks:
         text = (c.get("text") or "")[:RAG_MAX_CHUNK_CHARS]
         block_overhead = 80
-        if used_chars + len(text) + block_overhead > RAG_MAX_CONTEXT_CHARS and truncated:
+        if used_chars + len(text) + block_overhead > cap and truncated:
             break
         truncated.append({**c, "text": text})
         used_chars += len(text) + block_overhead
@@ -3776,7 +3815,12 @@ def node_execute(state: AgentState) -> AgentState:
     # response surfacing.
     variant_name, variant_label = _select_variant(state["route"])
     LG_VARIANT_TOTAL.labels(route=state["route"], variant=variant_label).inc()
-    final_prompt = _build_rag_prompt(state["prompt"], state.get("retrieved_chunks", []))
+    # Phase #51b: pass the route so _build_rag_prompt picks the
+    # tier-specific RAG context budget. Reasoning + hard tiers
+    # absorb 24K chars; trivial + tuned-lora cap at 6K.
+    final_prompt = _build_rag_prompt(
+        state["prompt"], state.get("retrieved_chunks", []), route=state["route"]
+    )
     started = time.monotonic()
 
     if not cfg.get("supports_tools"):
