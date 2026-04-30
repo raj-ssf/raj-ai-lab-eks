@@ -49,10 +49,13 @@
 #   RolloutPausedTooLong fires at 30m if a preview is forgotten.
 #
 # Migration notes:
-#   - replicas stays at 1 (Chainlit's session affinity expectation
-#     means scaling up needs sticky sessions, which is a separate
-#     Phase. blueGreen works fine at replicas=1: 1 stable pod +
-#     1 preview pod simultaneously during a deploy.
+#   - replicas at 3 (Phase #56). Phase #44's consistent-hash DR
+#     pins each session to one pod across the 3 replicas, so no
+#     session-state fragmentation. Single-pod failure no longer
+#     takes the chat UI down.
+#     (Originally said replicas=1 because Chainlit's session model
+#     would have fragmented across multiple pods; Phase #44 fixed
+#     that, and Phase #56 cashed it in.)
 #   - Pod template byte-identical to deployment.yaml.
 #   - First-deploy of a Rollout skips the blueGreen pause (no prior
 #     version to preview against).
@@ -64,7 +67,18 @@ metadata:
   labels:
     app: chat-ui
 spec:
-  replicas: 1
+  # Phase #56: 1 → 3 replicas for HA. Made safe by Phase #44's
+  # DestinationRule with consistent-hash on the chainlit-session-id
+  # cookie — same-session requests pin to the same pod across the 3
+  # replicas, so Chainlit's per-pod session state isn't fragmented.
+  # Single-pod failure no longer takes the chat UI down.
+  #
+  # Canary math under setWeight 25: ceil(3 × 0.25) = 1 canary pod
+  # alongside 3 stable pods (4 total during canary), drops back to 3
+  # post-promote. setWeight 75: ceil(3 × 0.75) = 3 canary alongside
+  # 3 stable (6 total — temporary surge during canary, fine on g6
+  # Karpenter capacity).
+  replicas: 3
   selector:
     matchLabels:
       app: chat-ui
