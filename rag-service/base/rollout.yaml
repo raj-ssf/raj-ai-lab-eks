@@ -168,7 +168,14 @@ spec:
             # 5xx watchdog (rag-service-canary-error-watch-bg).
             # Datestamp value; future bumps update the date.
             - name: CANARY_SMOKE_MARKER
-              value: "2026-04-29"
+              # Phase #49 ROLLBACK DRILL — value bumped from
+              # "2026-04-29" → "2026-04-29-rollback-drill" to force
+              # a new pod-template-hash. argo-rollouts spawns a
+              # canary RS that runs against the tripwire-broken
+              # AnalysisTemplate (analysistemplate.yaml has a
+              # failureCondition: 1==1 that always trips), and the
+              # rollout aborts on first measurement.
+              value: "2026-04-29-rollback-drill"
           envFrom:
             - secretRef:
                 name: rag-service-langfuse

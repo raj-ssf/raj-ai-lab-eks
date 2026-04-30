@@ -33,6 +33,22 @@ spec:
       # pass — same lab-friendly default as langgraph's gate. The
       # 2.5s threshold tracks the Phase #29 SLO target.
       successCondition: len(result) == 0 || result[0] >= 0.95
+      # Phase #49 ROLLBACK DRILL TRIPWIRE — TEMPORARY:
+      # failureCondition that always evaluates true. The AnalysisRun
+      # will fail on its first measurement, regardless of actual
+      # query result. This deliberately breaks the gated check so
+      # we can validate the failure path end-to-end:
+      #   AnalysisRun phase=Failed
+      #   → Rollout phase=Degraded
+      #   → Phase #37's RolloutDegraded + RolloutAnalysisRunFailed
+      #     alerts fire in Prometheus
+      #   → kubectl argo rollouts undo rag-service -n rag rolls
+      #     back to the prior stable RS without user impact (VS
+      #     keeps routing to the unaffected old stable pods
+      #     throughout)
+      # Phase #49b restores the original (removes this line) once
+      # the drill is observed.
+      failureCondition: 1 == 1
       provider:
         prometheus:
           address: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
