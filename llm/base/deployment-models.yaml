@@ -520,19 +520,35 @@ spec:
           readinessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
           livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
           volumeMounts:
-            # Phase #52b: readOnly dropped — gp3 RWO doesn't
-            # enforce read-only at the volume layer like the old
-            # ROX S3-mountpoint did. vLLM doesn't write to /model
-            # in normal operation, but flipping read-only here is
-            # purely advisory and can mask legitimate diagnostic
-            # writes during debug sessions.
-            - { name: model-cache, mountPath: /model }
+            # Phase #54c: readOnly: true restored alongside the
+            # claimName revert below — the S3-Mountpoint PV is
+            # ROX (ReadOnlyMany) at the volume level, and the
+            # readOnly flag here is the matching defense-in-depth.
+            - { name: model-cache, mountPath: /model, readOnly: true }
             - { name: shm,         mountPath: /dev/shm }
       volumes:
         - name: model-cache
           persistentVolumeClaim:
-            # Phase #52b: was vllm-cache-llama-405b (S3 Mountpoint).
-            claimName: vllm-cache-llama-405b-gp3
+            # Phase #54c (2026-04-29): reverted from
+            # vllm-cache-llama-405b-gp3 → vllm-cache-llama-405b
+            # (S3-Mountpoint, region-scoped). Reason: us-west-2c
+            # ran out of p4d.24xlarge AND p5.48xlarge capacity at
+            # exactly the moment we tried to take 405B for a ride.
+            # gp3 EBS is AZ-locked, so the gp3 PVC (us-west-2c)
+            # would have prevented Karpenter from launching in
+            # any other AZ. S3-Mountpoint is region-scoped so the
+            # pod can land in any us-west-2[a-d] AZ that has 8-GPU
+            # capacity. Cold-start regresses to ~6 min (S3 mmap)
+            # vs ~3 min (local NVMe), but availability matters
+            # more than cold-start speed when AWS is short on
+            # p4d/p5 in us-west-2c.
+            #
+            # The gp3 PVC + populated 205 GiB of weights remain in
+            # cluster ($20/mo); to swap back when us-west-2c has
+            # capacity again, change claimName back to
+            # vllm-cache-llama-405b-gp3 + flip readOnly back to
+            # false. Both PVs persist in parallel.
+            claimName: vllm-cache-llama-405b
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 16Gi }
 
