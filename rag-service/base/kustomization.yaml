@@ -26,3 +26,5 @@ resources:
   - virtualservice.yaml
   - httproute.yaml
   - servicemonitor.yaml
+  # Phase #67: HPA scales rag-service 2 → 5 replicas on CPU.
+  - hpa.yaml

@@ -34,3 +34,5 @@ resources:
   # In-namespace, single-replica, no persistence — daily-bucket
   # workload tolerates restart-amnesty.
   - redis.yaml
+  # Phase #67: HPA scales langgraph-service 2 → 5 replicas on CPU.
+  - hpa.yaml

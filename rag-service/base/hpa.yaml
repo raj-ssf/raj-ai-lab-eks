@@ -1,0 +1,66 @@
+# Phase #67: HPA for rag-service.
+#
+# Scales 2 → 5 replicas based on average CPU utilization across
+# stable + canary RS. minReplicas matches the floor set in
+# rollout.yaml (replicas: 2) so the HPA can't scale BELOW our
+# canary-safety baseline (canary needs ≥2 to keep stable HA).
+#
+# CPU is the right metric here — rag-service is FastAPI plus
+# embedding-call orchestration, which is CPU-bound when
+# concurrent retrieval requests fan out to Qdrant. Memory is
+# stable across load (no in-process caching beyond stdlib LRU).
+#
+# Phase #66 prerequisite: until the general-purpose Karpenter
+# NodePool was added, scale-up beyond static-node capacity would
+# leave new pods Pending. With #66 landed, Karpenter spawns CPU
+# nodes on demand.
+#
+# scaleTargetRef.kind = Rollout: Argo Rollouts implements the
+# scale subresource since 1.0. HPA writes to Rollout.spec.replicas;
+# the rollouts controller reconciles canary/stable RS counts.
+#
+# Behavior: 60s scale-UP stabilization (react fast to sustained
+# load but ignore single spikes), 5min scale-DOWN stabilization
+# (don't terminate pods on a brief lull). policies cap scale
+# events to keep churn bounded.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-service
+  labels:
+    app: rag-service
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: rag-service
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min

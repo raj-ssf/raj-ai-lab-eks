@@ -1,0 +1,57 @@
+# Phase #67: HPA for langgraph-service.
+#
+# Scales 2 → 5 replicas based on average CPU. minReplicas matches
+# rollout.yaml (replicas: 2) — canary requires ≥2 stable replicas.
+#
+# CPU is the load-correlated signal: langgraph orchestrates LLM
+# calls through redis-backed conversation memory; CPU climbs with
+# concurrent /invoke requests doing graph-state serialization +
+# redis I/O. Memory is roughly stable per session (~30MB).
+#
+# scaleTargetRef.kind = Rollout (Argo Rollouts implements scale
+# subresource). HPA writes to Rollout.spec.replicas.
+#
+# Behavior tuning identical to rag-service for consistency
+# across services in the same call graph (chat → langgraph → rag);
+# different decay constants would create coordination noise.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: langgraph-service
+  labels:
+    app: langgraph-service
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: langgraph-service
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min

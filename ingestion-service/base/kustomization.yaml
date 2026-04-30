@@ -25,3 +25,7 @@ resources:
   # Phase #43: Prometheus ServiceMonitor. Required by Phase #46's
   # AnalysisTemplates above (queries against http_requests_total).
   - servicemonitor.yaml
+  # Phase #67: HPA scales ingestion-service 2 → 4 replicas on CPU.
+  # Tighter ceiling than rag/langgraph (4 vs 5) because ingestion
+  # is bursty/asymmetric — see hpa.yaml header for rationale.
+  - hpa.yaml

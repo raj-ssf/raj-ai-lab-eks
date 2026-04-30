@@ -1,0 +1,60 @@
+# Phase #67: HPA for ingestion-service.
+#
+# Scales 2 → 4 replicas based on average CPU. Tighter ceiling than
+# rag/langgraph (4 vs 5) because ingestion is bursty/asymmetric:
+# document upload triggers a heavy chunk + embed + qdrant-write
+# pipeline that spikes CPU briefly then drops to idle. We want
+# scale-up for genuine bulk-ingest events but a hard cap so a
+# single oversized PDF can't drive all 5 max-replica slots.
+#
+# minReplicas: 2 from rollout.yaml. CPU request 200m (vs 100m for
+# rag/langgraph) means utilization hits target faster — good for
+# this workload because we WANT scale-up under burst.
+#
+# scaleTargetRef.kind = Rollout (same Argo Rollouts pattern).
+#
+# Behavior: shorter scale-DOWN stabilization (180s vs 300s for
+# rag/langgraph). Ingestion bursts end abruptly and we want pods
+# to release back to the pool sooner so we don't pay for idle
+# capacity post-burst.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ingestion-service
+  labels:
+    app: ingestion-service
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: ingestion-service
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 180
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min

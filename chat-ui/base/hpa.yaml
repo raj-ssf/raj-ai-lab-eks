@@ -1,0 +1,73 @@
+# Phase #67: HPA for chat-ui.
+#
+# Scales 3 → 6 replicas based on average CPU. minReplicas: 3 to
+# match the floor set in rollout.yaml (Phase #56 bumped 1→3 for
+# session-state HA via Phase #44's consistent-hash DR). Going
+# below 3 would shrink the consistent-hash ring mid-flight and
+# could re-pin sessions across pod restarts.
+#
+# CPU correlates with concurrent users: each WebSocket-connected
+# Chainlit session holds modest CPU (~20m steady-state) but
+# spikes during message-arrival, JSON-render, and stream-token
+# burst. Aggregate utilization across 3 pods is the right scale
+# signal.
+#
+# DestinationRule consistent-hash safety:
+# Phase #44's chainlit-session-id cookie hash means sessions pin
+# to the same pod via the hash ring. When HPA scales UP, NEW
+# sessions hash across the larger ring (some land on new pods,
+# some on existing); EXISTING sessions stay on their original
+# pod (cookie unchanged → same hash → same pod). Safe.
+# When HPA scales DOWN, sessions on the removed pod's hash slot
+# get re-hashed to a surviving pod. Chainlit's client-side
+# reconnect rebuilds session state from langgraph-redis (same
+# safety net as the Phase #45 blueGreen→canary migration). Brief
+# stutter, no data loss.
+#
+# scaleTargetRef.kind = Rollout (Phase #45 canary).
+#
+# Behavior: same 60s up / 5min down as rag/langgraph. chat-ui is
+# user-facing so we DON'T want aggressive scale-down — keeping
+# warm capacity for the next session burst is preferred over
+# squeezing the last bit of cost savings.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chat-ui
+  labels:
+    app: chat-ui
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: chat-ui
+  minReplicas: 3
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min

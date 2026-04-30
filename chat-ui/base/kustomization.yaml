@@ -27,3 +27,8 @@ resources:
   # in parallel).
   - servicemonitor.yaml
   - httproute.yaml
+  # Phase #67: HPA scales chat-ui 3 → 6 replicas on CPU. minReplicas
+  # stays at 3 (Phase #56 floor); consistent-hash DR (Phase #44)
+  # makes scale-up/down safe for Chainlit's session model. See
+  # hpa.yaml header for the ring-rebalance reasoning.
+  - hpa.yaml
