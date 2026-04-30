@@ -401,19 +401,28 @@ spec:
 # SOTA open-weight flagship. AWQ-quantized ~230 GB distributes across
 # 8× 40GB A100s at TP=8 (~29 GB per GPU + KV cache).
 #
-# Storage model: S3 Mountpoint, not a local PVC. The vllm-cache-llama-405b
-# PVC binds to the statically-provisioned vllm-405b-s3mp PV (see
-# pv-llama-405b.yaml) which mounts s3://.../llama-3.1-405b-instruct-awq/
-# as a read-only filesystem at /model. No init-container aws s3 sync
-# step — the S3 Mountpoint mount IS the model source.
+# Storage model (Phase #52b, 2026-04-29): switched FROM S3 Mountpoint
+# TO a gp3 PVC populated by a one-shot Phase #52a staging Job. The
+# old vllm-cache-llama-405b PVC + vllm-405b-s3mp PV
+# (pv-llama-405b.yaml) remain in the repo as the historical
+# alternative; this Deployment now mounts vllm-cache-llama-405b-gp3
+# (pvcs-models.yaml) which holds the same 205 GiB of safetensors
+# pre-loaded on local EBS.
 #
-# Cold start: ~6 min (weights fault in from S3 during vLLM's layer
-# load). Subsequent pod restarts replay the same cost (no between-pod
-# caching). For repeat-demos within a single session, keep the pod up.
+# Trade-off chosen for the lab's remaining 2-month lifetime
+# (cluster destruction planned end-of-June):
+#   gp3 PVC      ~$20/mo storage,  ~3 min cold-start (local NVMe)
+#   S3 Mountpoint ~$5.30/mo storage, ~6 min cold-start (mmap'd S3)
+# Net cost over 2 months: ~$30 extra storage in exchange for 3 min
+# faster cold-start. Worth it given expected demo cadence.
+#
+# To revert to S3 Mountpoint: change claimName below back to
+# vllm-cache-llama-405b. Both PVs persist in the cluster, so the
+# revert is a one-line edit + re-sync, no data movement.
 #
 # CAUTION: p4d.24xlarge is ~$32.77/hr. A full demo cycle (90s provision
-# + 6 min cold-start + 5 min inference + 30s consolidate ≈ 13 min) is
-# ~$7. The variant intentionally uses p4d instead of p5 ($98/hr) unless
+# + 3 min cold-start + 5 min inference + 30s consolidate ≈ 10 min) is
+# ~$5.50. The variant intentionally uses p4d instead of p5 ($98/hr) unless
 # you override the nodeSelector — A100 is plenty for this workload.
 apiVersion: apps/v1
 kind: Deployment
@@ -442,8 +451,12 @@ spec:
       tolerations:
         - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
         - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
-      # No init container — the S3 Mountpoint PVC provides /model
-      # directly. vLLM reads weights through the mount on first access.
+      # No init container — the gp3 PVC was pre-populated by the
+      # Phase #52a staging Job (a one-shot kubectl apply, not in
+      # this manifest). vLLM reads weights from local EBS at pod
+      # start. If the PVC is ever destroyed, re-stage with
+      # /tmp/job-stage-405b.yaml or the Phase #52a recipe in the
+      # pvcs-models.yaml header.
       containers:
         - name: vllm
           image: vllm/vllm-openai:placeholder
@@ -477,19 +490,30 @@ spec:
           resources:
             requests: { nvidia.com/gpu: "8", cpu: "16", memory: "128Gi" }
             limits:   { nvidia.com/gpu: "8", cpu: "64", memory: "400Gi" }
-          # Longer startup grace than other variants — 405B via S3
-          # Mountpoint needs ~6 min to fault in all weights. 120 ×
-          # 10s = 20 min window before the kubelet gives up.
+          # Longer startup grace than other variants. Phase #52b
+          # cut cold-start from ~6 min (S3 Mountpoint mmap) to ~3
+          # min (local NVMe reads from gp3 PVC). Keeping the
+          # generous 20-min budget anyway — vLLM's safetensors
+          # load + 8-GPU KV-cache warmup can spike past 5 min on
+          # an unfavorable hardware draw, and a stuck startup is
+          # worse than a generous timeout.
           startupProbe:  { httpGet: { path: /health, port: http }, initialDelaySeconds: 60, periodSeconds: 10, failureThreshold: 120 }
           readinessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
           livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
           volumeMounts:
-            - { name: model-cache, mountPath: /model, readOnly: true }
+            # Phase #52b: readOnly dropped — gp3 RWO doesn't
+            # enforce read-only at the volume layer like the old
+            # ROX S3-mountpoint did. vLLM doesn't write to /model
+            # in normal operation, but flipping read-only here is
+            # purely advisory and can mask legitimate diagnostic
+            # writes during debug sessions.
+            - { name: model-cache, mountPath: /model }
             - { name: shm,         mountPath: /dev/shm }
       volumes:
         - name: model-cache
           persistentVolumeClaim:
-            claimName: vllm-cache-llama-405b
+            # Phase #52b: was vllm-cache-llama-405b (S3 Mountpoint).
+            claimName: vllm-cache-llama-405b-gp3
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 16Gi }
 
