@@ -2487,10 +2487,23 @@ def node_ensure_warm(state: AgentState) -> AgentState:
     converts it to a 502 with the underlying message.
     """
     cfg = ROUTE_REGISTRY[state["route"]]
-    if cfg["always_on"]:
-        return {"cold_start": False, "warm_wait_seconds": 0.0}
-
     deploy = cfg["deployment"]
+    # Phase #53: dropped the early-return for cfg["always_on"] (was
+    # at this exact spot). The flag was a static config promise ("we
+    # intend to keep this tier hot") that the cluster reality doesn't
+    # honor: Karpenter's WhenEmpty consolidation scales the GPU node
+    # down whenever the deployment is at replicas=0 OR when no GPU
+    # workload is using the node, which can leave the trivial tier
+    # cold despite always_on=True. Skipping ensure_warm in that state
+    # caused user-visible "no healthy upstream" 503s (incident
+    # 2026-04-29 — chat-ui canary error then plain unhealthy upstream).
+    #
+    # The fix: every tier — including always_on — runs the same
+    # check-and-wait flow. The available>=1 fast-path below handles
+    # the warm case in ~50ms (one kubectl read), so the cost when the
+    # tier IS actually warm is small. always_on is now an annotation
+    # of intent (used by docs / future scheduled-warming logic in
+    # Phase #54), not a runtime short-circuit.
     log.info("ensure_warm checking", extra={"deployment": deploy, "route": state["route"]})
 
     started = time.monotonic()
