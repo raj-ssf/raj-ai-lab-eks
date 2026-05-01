@@ -45,7 +45,9 @@ metadata:
     app.kubernetes.io/name: adversarial-eval
     app.kubernetes.io/component: red-team-regression
 spec:
-  backoffLimit: 0
+  # Phase #82c: 0 → 2 so istio-cni-repair-controller can self-heal
+  # Karpenter+Istio races. See ragas-eval.yaml for full reasoning.
+  backoffLimit: 2
   ttlSecondsAfterFinished: 3600
   template:
     metadata:

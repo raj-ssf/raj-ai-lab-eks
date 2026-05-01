@@ -37,7 +37,27 @@ metadata:
     app.kubernetes.io/name: ragas-eval
     app.kubernetes.io/component: rag-regression-gate
 spec:
-  backoffLimit: 0
+  # Phase #82c: bumped 0 → 2 so the istio-cni-repair-controller
+  # (Phase #66 fallout commit raj-ai-lab-eks-infra:5cd4d35) has
+  # room to self-heal on Karpenter+Istio race. Sequence on a fresh
+  # node:
+  #   t=0    Pod scheduled to fresh g6.xlarge (Karpenter-spawned)
+  #   t=5s   istio-validation init container fails (iptables not
+  #          yet bound; istio-cni-node DaemonSet still starting)
+  #   t=20s  istio-cni-node Ready, starts repair-controller daemon
+  #   t=20s  repair-controller detects the broken pod, deletes it
+  #   t=20s  Job creates retry pod (allowed by backoffLimit=2)
+  #   t=22s  retry pod scheduled on now-warm node, istio-validation
+  #          succeeds, ragas-eval container starts
+  # Without backoffLimit=2, the first failure terminates the Job
+  # permanently regardless of repair-controller's intervention.
+  # With it, ONE retry is enough; we observed self-healing on a
+  # 12m-old failed Job earlier (would have succeeded with retry).
+  #
+  # 2 retries (not 1) because the repair-controller's poll interval
+  # can occasionally exceed the next Job retry's window — a second
+  # retry buffers against that race-within-a-race.
+  backoffLimit: 2
   ttlSecondsAfterFinished: 3600
   template:
     metadata:

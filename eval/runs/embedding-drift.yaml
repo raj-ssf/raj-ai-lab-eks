@@ -55,7 +55,9 @@ metadata:
     app.kubernetes.io/name: embedding-drift
     app.kubernetes.io/component: drift-detection
 spec:
-  backoffLimit: 0
+  # Phase #82c: 0 → 2 so istio-cni-repair-controller can self-heal
+  # Karpenter+Istio races. See ragas-eval.yaml for full reasoning.
+  backoffLimit: 2
   ttlSecondsAfterFinished: 3600
   template:
     metadata:
