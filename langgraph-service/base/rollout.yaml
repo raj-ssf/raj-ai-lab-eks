@@ -226,7 +226,15 @@ spec:
             - name: BUDGET_ENABLED
               value: "false"
             - name: BUDGET_REDIS_URL
-              value: redis://langgraph-redis.langgraph.svc.cluster.local:6379/0
+              # Phase #75b: cut over from the old single-pod
+              # langgraph-redis Deployment to the Sentinel-aware
+              # langgraph-redis-ha cluster (3-pod StatefulSet from
+              # raj-ai-lab-eks-infra/langgraph-redis.tf, Phase #75a).
+              # Connections route to the current master automatically;
+              # Sentinel handles failover transparently behind the
+              # Service endpoint. Auto-failover within ~10s on master
+              # loss — no client reconfiguration required.
+              value: redis://langgraph-redis-ha.langgraph.svc.cluster.local:6379/0
             - name: BUDGET_REQUESTS_PER_DAY
               value: "200"
             - name: BUDGET_FAIL_MODE

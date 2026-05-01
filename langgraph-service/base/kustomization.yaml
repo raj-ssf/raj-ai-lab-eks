@@ -30,9 +30,14 @@ resources:
   - virtualservice.yaml
   - httproute.yaml
   - servicemonitor.yaml
-  # Phase #5: dedicated Redis for the cost-guardrails token bucket.
-  # In-namespace, single-replica, no persistence — daily-bucket
-  # workload tolerates restart-amnesty.
-  - redis.yaml
+  # Phase #75b: redis.yaml removed — replaced by the Bitnami Redis
+  # HA chart (3-pod Sentinel-mode StatefulSet) in
+  # raj-ai-lab-eks-infra/langgraph-redis.tf (Phase #75a).
+  # The original Phase #5 design (single-pod emptyDir Deployment,
+  # restart-amnesty for the cost-bucket) was upgraded because
+  # langgraph-redis ALSO holds Chainlit conversation memory, which
+  # is user-visible state worth preserving across pod restarts.
+  # langgraph-service rollout.yaml's BUDGET_REDIS_URL now points at
+  # langgraph-redis-ha:6379 (the Sentinel-aware Service).
   # Phase #67: HPA scales langgraph-service 2 → 5 replicas on CPU.
   - hpa.yaml
