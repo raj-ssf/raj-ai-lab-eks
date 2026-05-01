@@ -3903,6 +3903,16 @@ def node_execute(state: AgentState) -> AgentState:
     # tools are available. Without this, Llama 3.1 8B sometimes
     # ignores the tools= field and answers from the chat-template
     # default of "be a helpful assistant".
+    #
+    # 2026-05-01 hardening: explicit "don't use tools for greetings"
+    # rule. The Llama 3.1 8B model was looping on get_current_time +
+    # http_fetch when prompted with "Hi" — calling tools repeatedly
+    # without converging on a final answer, hitting the 25-step
+    # recursion limit. The added rule makes the agent answer simple
+    # social messages directly without tool exploration. (Also paired
+    # with bumping recursion_limit 25 → 50 in the GRAPH.invoke /
+    # astream_events config blocks so genuine multi-tool flows have
+    # more headroom.)
     messages: list[BaseMessage] = [
         SystemMessage(
             content=(
@@ -3911,7 +3921,13 @@ def node_execute(state: AgentState) -> AgentState:
                 "time-aware questions, http_fetch when the user references a URL, "
                 "and search_session_docs when the user references documents they "
                 "uploaded earlier. Otherwise, answer directly from your own "
-                "knowledge or the provided context."
+                "knowledge or the provided context.\n\n"
+                "Do NOT use tools for simple greetings (\"hi\", \"hello\", "
+                "\"thanks\", \"how are you\") or open-ended social messages — "
+                "respond conversationally without any tool calls. Only call a "
+                "tool when the user's request actually requires the specific "
+                "capability that tool provides. Once you have enough information "
+                "to answer, stop calling tools and give the final answer."
             )
         ),
     ]
@@ -4795,7 +4811,12 @@ def invoke(
         "top_k": req.top_k,
         "auth_token": auth_token,
     }
-    config: dict = {}
+    # 2026-05-01: recursion_limit raised from default 25 → 50 to give
+    # genuine multi-tool flows more headroom. Paired with the system-
+    # prompt addition (above, in the agent execute node) telling the
+    # model not to call tools for simple greetings — that's the real
+    # fix; this is the safety net for legitimate multi-step queries.
+    config: dict = {"recursion_limit": 50}
     trace_id: Optional[str] = None
     if _LANGFUSE_CB is not None:
         # v3 SDK takes per-request attribution via metadata — the keys
@@ -4808,13 +4829,11 @@ def invoke(
         # even if the trace export later fails.
         import uuid as _uuid
         trace_id = _uuid.uuid4().hex
-        config = {
-            "callbacks": [_LANGFUSE_CB],
-            "metadata": {
-                "langfuse_user_id": user,
-                "langfuse_tags": ["langgraph-service"],
-                "langfuse_trace_id": trace_id,
-            },
+        config["callbacks"] = [_LANGFUSE_CB]
+        config["metadata"] = {
+            "langfuse_user_id": user,
+            "langfuse_tags": ["langgraph-service"],
+            "langfuse_trace_id": trace_id,
         }
     try:
         final_state: AgentState = GRAPH.invoke(initial, config=config)
@@ -4975,18 +4994,17 @@ async def invoke_stream(
         "top_k": req.top_k,
         "auth_token": auth_token,
     }
-    config: dict = {}
+    # Same recursion_limit bump as the /invoke handler above.
+    config: dict = {"recursion_limit": 50}
     trace_id: Optional[str] = None
     if _LANGFUSE_CB is not None:
         import uuid as _uuid
         trace_id = _uuid.uuid4().hex
-        config = {
-            "callbacks": [_LANGFUSE_CB],
-            "metadata": {
-                "langfuse_user_id": user,
-                "langfuse_tags": ["langgraph-service", "stream"],
-                "langfuse_trace_id": trace_id,
-            },
+        config["callbacks"] = [_LANGFUSE_CB]
+        config["metadata"] = {
+            "langfuse_user_id": user,
+            "langfuse_tags": ["langgraph-service", "stream"],
+            "langfuse_trace_id": trace_id,
         }
 
     async def event_stream():
