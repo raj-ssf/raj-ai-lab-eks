@@ -194,6 +194,33 @@ DEPLOY_REASONING = os.environ.get("DEPLOY_REASONING", "vllm-deepseek-r1-70b")
 DEPLOY_HARD = os.environ.get("DEPLOY_HARD", "vllm")
 LLM_NAMESPACE = os.environ.get("LLM_NAMESPACE", "llm")
 
+# --- Phase #81e: distilled student tier (trivial-fast) -------------------
+#
+# Behind a feature flag. The underlying vllm-llama-1b-distilled
+# Deployment (Phase #81d) is at replicas=0 until Phase #81c's
+# distillation training run uploads an adapter to S3. Without that
+# adapter, scaling the Deployment up fails in the adapter-sync
+# init container. So this code path stays OFF until the operator
+# sets DISTILLED_TIER_ENABLED=true.
+#
+# When enabled, the classifier still emits "trivial" / "tuned-lora"
+# / "reasoning" / "hard" — the routing layer remaps "trivial" →
+# "trivial-fast" probabilistically (TRIVIAL_FAST_FRACTION). This
+# canary-style rollout lets us A/B the distilled student's quality
+# against the 8B baseline before fully cutting over.
+#
+# After distillation quality is validated (Phase #81f), set
+# TRIVIAL_FAST_FRACTION=1.0 to route 100% of trivial traffic to
+# the cheap tier.
+DISTILLED_TIER_ENABLED = os.environ.get("DISTILLED_TIER_ENABLED", "false").lower() == "true"
+TRIVIAL_FAST_FRACTION = float(os.environ.get("TRIVIAL_FAST_FRACTION", "0.0"))
+MODEL_TRIVIAL_FAST_URL = os.environ.get(
+    "MODEL_TRIVIAL_FAST_URL",
+    "http://vllm-llama-1b-distilled.llm.svc.cluster.local:8000",
+)
+MODEL_TRIVIAL_FAST_NAME = os.environ.get("MODEL_TRIVIAL_FAST_NAME", "llama-3.2-1b-distilled")
+DEPLOY_TRIVIAL_FAST = os.environ.get("DEPLOY_TRIVIAL_FAST", "vllm-llama-1b-distilled")
+
 # Inference parameters. The classifier prompt benefits from low temperature
 # (deterministic output). Execute calls inherit the user's max_tokens.
 CLASSIFIER_TEMPERATURE = 0.0
@@ -322,6 +349,62 @@ ROUTE_REGISTRY: dict[str, dict] = {
         "rag_max_context_chars": 24000,
     },
 }
+
+
+# Phase #81e: trivial-fast tier — added conditionally to ROUTE_REGISTRY
+# when DISTILLED_TIER_ENABLED is true. Keeping it out of the registry
+# entirely when disabled means _select_variant + node_classify can't
+# accidentally route there if the canary fraction is misconfigured.
+if DISTILLED_TIER_ENABLED:
+    ROUTE_REGISTRY["trivial-fast"] = {
+        "url": f"{MODEL_TRIVIAL_FAST_URL}/v1",
+        "model_name": MODEL_TRIVIAL_FAST_NAME,
+        "deployment": DEPLOY_TRIVIAL_FAST,
+        # always_on=False because the Deployment defaults to
+        # replicas=0 (Phase #81d). When DISTILLED_TIER_ENABLED is
+        # true, the operator should ALSO have scaled the Deployment
+        # to replicas=1 (or wired an HPA min=1). ensure_warm
+        # handles the JIT-scale path if it's at 0 when a request
+        # arrives.
+        "always_on": False,
+        # Tool calling: vllm-llama-1b-distilled is started with
+        # --enable-auto-tool-choice + --tool-call-parser llama3_json
+        # (Phase #81d deployment-models.yaml entry). Trivial-fast
+        # tier inherits the trivial tier's tool catalog (calculator,
+        # get_current_time, http_fetch, search_session_docs) since
+        # those are the most frequent trivial-tier needs.
+        "supports_tools": True,
+        # Skip the planner — same reasoning as the trivial tier
+        # (cost-not-worth-it for short queries).
+        "use_planner": False,
+        # Llama-3.2-1B has --max-model-len=8192 (Phase #81d). With
+        # tool catalog injection (~1500 tokens), system prompt
+        # (~300), and response budget (~600), ~5800 tokens
+        # remain for RAG context. Match the trivial tier's
+        # 6000 char budget.
+        "rag_max_context_chars": 6000,
+    }
+
+
+# Phase #81e routing remap. Called inside node_classify (or wherever
+# state.route is set) AFTER the classifier picks a tier — gives us
+# a clean A/B between trivial (8B) and trivial-fast (1B distilled).
+def _maybe_remap_to_trivial_fast(route: str) -> str:
+    """If the classifier picked 'trivial' AND the distilled tier is
+    enabled AND the per-request weighted coin lands < TRIVIAL_FAST_
+    FRACTION, swap to 'trivial-fast'. Pure no-op when feature flag
+    is off.
+    """
+    if not DISTILLED_TIER_ENABLED:
+        return route
+    if route != "trivial":
+        return route
+    if TRIVIAL_FAST_FRACTION <= 0.0:
+        return route
+    import random
+    if random.random() < TRIVIAL_FAST_FRACTION:
+        return "trivial-fast"
+    return route
 
 
 # --- Phase #15: canary variant routing per tier ----------------------------
@@ -742,8 +825,11 @@ class AgentState(TypedDict, total=False):
     # The user's bearer token, forwarded to rag-service /retrieve so it
     # can validate against Keycloak and read the user claim. NOT logged.
     auth_token: Optional[str]
-    # Set by classify (or by social_filter when bypassing the LLM pipeline)
-    route: Literal["trivial", "tuned-lora", "reasoning", "hard", "social"]
+    # Set by classify (or by social_filter when bypassing the LLM pipeline).
+    # Phase #81e adds "trivial-fast" — populated by
+    # _maybe_remap_to_trivial_fast when DISTILLED_TIER_ENABLED is true and
+    # the per-request coin falls below TRIVIAL_FAST_FRACTION.
+    route: Literal["trivial", "tuned-lora", "reasoning", "hard", "social", "trivial-fast"]
     classifier_raw: str
     # Set by social_filter (Phase #82). "matched" routes to END with a
     # canned response in `response`; "passed" continues the pipeline.
@@ -2431,12 +2517,21 @@ def node_classify(state: AgentState) -> AgentState:
             route = candidate  # type: ignore[assignment]
             break
 
+    # Phase #81e: trivial → trivial-fast remap for the distilled
+    # student tier. No-op when DISTILLED_TIER_ENABLED is false (default).
+    # Logged BEFORE the remap so dashboards can compare classifier
+    # output vs effective routing.
+    final_route = _maybe_remap_to_trivial_fast(route)
+
     # Inline the route + raw output in the message itself: the existing
     # formatter doesn't surface log-record `extra` fields, so the previous
     # `extra={...}` form left these values invisible in pod logs. Inline
     # makes them grep-able for routing diagnostics.
-    log.info("classified route=%s classifier_raw=%r", route, raw[:80])
-    return {"route": route, "classifier_raw": raw}
+    log.info(
+        "classified route=%s effective_route=%s classifier_raw=%r",
+        route, final_route, raw[:80],
+    )
+    return {"route": final_route, "classifier_raw": raw}
 
 
 def node_retrieve(state: AgentState) -> AgentState:
