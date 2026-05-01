@@ -742,9 +742,13 @@ class AgentState(TypedDict, total=False):
     # The user's bearer token, forwarded to rag-service /retrieve so it
     # can validate against Keycloak and read the user claim. NOT logged.
     auth_token: Optional[str]
-    # Set by classify
-    route: Literal["trivial", "tuned-lora", "reasoning", "hard"]
+    # Set by classify (or by social_filter when bypassing the LLM pipeline)
+    route: Literal["trivial", "tuned-lora", "reasoning", "hard", "social"]
     classifier_raw: str
+    # Set by social_filter (Phase #82). "matched" routes to END with a
+    # canned response in `response`; "passed" continues the pipeline.
+    social_filter_action: Literal["matched", "passed"]
+    social_filter_category: Literal["greeting", "thanks", "ack", "farewell"]
     # Set by retrieve (Phase 4)
     retrieved_chunks: list[dict]   # list of {text, source, chunk_index, score}
     retrieve_count: int
@@ -1261,9 +1265,89 @@ def node_input_validation(state: AgentState) -> AgentState:
     }
 
 
-def _route_after_input_validation(state: AgentState) -> Literal["safety_input", "__end__"]:
-    """Conditional edge: blocked → END; else → safety_input."""
+def _route_after_input_validation(state: AgentState) -> Literal["social_filter", "__end__"]:
+    """Conditional edge: blocked → END; else → social_filter."""
     if state.get("input_validation_action") == "blocked":
+        return END
+    return "social_filter"
+
+
+# ---------------------------------------------------------------------------
+# Phase #82: Social-message pre-filter.
+#
+# Purest production-grade RouteLLM-style optimization: detect "Hi",
+# "thanks", "ok", etc. via regex and respond with a canned reply,
+# WITHOUT going through the LLM pipeline at all. Saves:
+#   - safety_input call (Llama Guard ~200ms + tokens)
+#   - rewrite_query call (~200ms + tokens)
+#   - classify call (~200ms + tokens)
+#   - retrieve call (Qdrant + embedding)
+#   - execute call (the actual response generation, sometimes 5-10s)
+#   - reflect / hallucination_check / safety_output / cache_store / save_memory
+# Total saved per social-message: ~3-5s wall-clock + ~1500 tokens.
+#
+# This also fixes the recursion-loop class of failures — prompts like
+# "Hi" sent the 8B model into a tool-call loop (http_fetch +
+# get_current_time) until hitting the recursion_limit. Bypassing the
+# LLM entirely makes that impossible.
+#
+# Patterns are anchored (^ ... $) and case-insensitive — only EXACT
+# social messages match. "Hi, can you explain Kubernetes?" does NOT
+# match (passes through to the full pipeline). The regex is
+# deliberately strict; false positives are worse than misses
+# (a real question routed to a canned "Hi!" response is bad UX).
+# ---------------------------------------------------------------------------
+
+import re as _re  # local re import — keeps the social block self-contained
+
+_SOCIAL_PATTERNS: list[tuple[_re.Pattern, str]] = [
+    (_re.compile(r"^\s*(hi|hello|hey|yo|howdy|sup|hiya|greetings)[\s!?.,]*$", _re.IGNORECASE), "greeting"),
+    (_re.compile(r"^\s*(thanks|thank\s+you|thanks!|thx|ty|appreciate(?:\s+it)?)[\s!?.,]*$", _re.IGNORECASE), "thanks"),
+    (_re.compile(r"^\s*(ok|okay|cool|got\s+it|nice|great|awesome|perfect|sweet)[\s!?.,]*$", _re.IGNORECASE), "ack"),
+    (_re.compile(r"^\s*(bye|goodbye|see\s+ya|cya|later|good\s+night|gn)[\s!?.,]*$", _re.IGNORECASE), "farewell"),
+]
+
+_SOCIAL_RESPONSES: dict[str, str] = {
+    "greeting": "Hi! I'm here to help. Ask me anything — Kubernetes patterns, AI infrastructure, or anything else you'd like to explore.",
+    "thanks":   "You're welcome! Let me know if there's anything else I can help with.",
+    "ack":      "Got it. Let me know if you have other questions.",
+    "farewell": "Take care!",
+}
+
+
+def node_social_filter(state: AgentState) -> AgentState:
+    """Match the prompt against social-message regex; if hit, set state.answer
+    with a canned response and route directly to END. Else pass through.
+    """
+    prompt = (state.get("prompt") or "").strip()
+    for pattern, response_key in _SOCIAL_PATTERNS:
+        if pattern.match(prompt):
+            response = _SOCIAL_RESPONSES[response_key]
+            log.info(
+                "social_filter matched",
+                extra={"category": response_key, "prompt_len": len(prompt)},
+            )
+            # Set `response` (the existing field consumed by /invoke
+            # handler), not a new `answer` field. Downstream nodes are
+            # skipped via the END edge — execute / reflect / safety_output
+            # / hallucination_check / pii_redact_output / cache_store /
+            # save_memory all bypassed.
+            return {
+                **state,
+                "response": response,
+                "social_filter_action": "matched",
+                "social_filter_category": response_key,
+                # Mark route for downstream telemetry (Langfuse tags,
+                # Prometheus labels) so dashboards can show "X% of
+                # requests bypassed via social filter".
+                "route": "social",
+            }
+    return {**state, "social_filter_action": "passed"}
+
+
+def _route_after_social_filter(state: AgentState) -> Literal["safety_input", "__end__"]:
+    """Conditional edge: matched → END (canned response); passed → safety_input."""
+    if state.get("social_filter_action") == "matched":
         return END
     return "safety_input"
 
@@ -4288,6 +4372,10 @@ def build_graph() -> StateGraph:
     g: StateGraph = StateGraph(AgentState)
     g.add_node("budget_check", node_budget_check)
     g.add_node("input_validation", node_input_validation)
+    # Phase #82: social-message pre-filter — bypasses the LLM pipeline
+    # for plain greetings/thanks/acks/farewells. See node_social_filter
+    # for the matching logic + response catalog.
+    g.add_node("social_filter", node_social_filter)
     g.add_node("safety_input", node_safety_input)
     g.add_node("pii_redact_input", node_pii_redact_input)
     g.add_node("cache_lookup", node_cache_lookup)
@@ -4315,6 +4403,14 @@ def build_graph() -> StateGraph:
     g.add_conditional_edges(
         "input_validation",
         _route_after_input_validation,
+        # Phase #82: route to social_filter (NOT directly to safety_input).
+        # social_filter then routes either to safety_input (continue the
+        # pipeline) or END (canned response, no LLM cost).
+        {"social_filter": "social_filter", END: END},
+    )
+    g.add_conditional_edges(
+        "social_filter",
+        _route_after_social_filter,
         {"safety_input": "safety_input", END: END},
     )
     g.add_conditional_edges(
