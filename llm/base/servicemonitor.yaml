@@ -9,9 +9,34 @@ metadata:
     # is ignored even though the Service + endpoint exist.
     release: kube-prometheus-stack
 spec:
+  # Phase #80e: matchExpressions instead of matchLabels so this single
+  # ServiceMonitor scrapes the canonical `vllm` Service AND every per-
+  # variant Service (vllm-llama-8b, vllm-bge-m3, etc.). Was previously
+  # `matchLabels: { app: vllm }` which silently excluded variants —
+  # discovered when Phase #80c's HPA on vllm-llama-8b showed
+  # TARGETS=<unknown>/5 even though the pod was emitting metrics
+  # correctly (verified directly via curl /metrics on the pod).
+  #
+  # Maintenance: when adding a new vllm-<thing> Service to
+  # services-models.yaml, append the `app:` value here. The
+  # alternative — a `vllm.io/scrape: "true"` label on every Service
+  # selected by `matchLabels` — would be cleaner but requires editing
+  # every Service AND keeping the label in sync; the In-list approach
+  # localizes the maintenance to this single file.
   selector:
-    matchLabels:
-      app: vllm
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - vllm                      # canonical 70B AWQ (deployment.yaml)
+          - vllm-llama-8b             # always-on 8B + LoRA (Phase #80a/#80c HPA target)
+          - vllm-bge-m3               # embedding service
+          - vllm-bge-reranker         # reranker
+          - vllm-deepseek-r1-70b      # reasoning tier
+          - vllm-llama-405b           # heavy-demo tier
+          - vllm-mixtral-8x7b         # comparison variant
+          - vllm-llama-vision-11b     # vision variant
+          - vllm-llama-guard-3-8b     # safety classifier
   endpoints:
     - port: http
       path: /metrics
