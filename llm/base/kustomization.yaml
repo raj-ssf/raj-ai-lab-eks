@@ -37,3 +37,12 @@ resources:
   # the wait is ~5-7 min for Karpenter cold-start. With #54, demo
   # windows find the trivial tier already warm. Cost: ~$330/mo.
   - prewarm-cronjobs.yaml
+  # Phase #80c: HPA on vllm-llama-8b targeting vllm_num_requests_waiting
+  # via the prometheus-adapter custom-metrics API (Phase #80b in
+  # raj-ai-lab-eks-infra/prometheus-adapter.tf). minReplicas=1 always-
+  # warm so HPA has metrics to read; ensure_warm in langgraph-service
+  # becomes effectively a no-op (always sees warm pod). Phase #54's
+  # prewarm-cronjobs become redundant when HPA min=1; keeping them
+  # for the at-2am-scale-down behavior until we redesign the daily-
+  # warm-window pattern around HPA.
+  - hpa-vllm-llama-8b.yaml

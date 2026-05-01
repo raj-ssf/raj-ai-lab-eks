@@ -27,7 +27,17 @@ metadata:
     app: vllm-llama-8b
     vllm-model: llama-3.1-8b
 spec:
-  replicas: 0
+  # Phase #80c: bumped 0 → 1 as the HPA's always-warm baseline.
+  # The HPA (hpa-vllm-llama-8b.yaml) owns 1 → N scaling; without
+  # at least 1 always-warm pod, HPA can't read vllm:* metrics
+  # (the metric series simply doesn't exist when no pod is
+  # emitting). This DOES change the cost model: was scale-from-
+  # 0-via-ensure_warm at ~$0.80/hr g6.xlarge only when langgraph
+  # routed a request, now ~$580/mo always-warm.
+  # Phase #80d candidate: KEDA ScaledObject which CAN scale from
+  # 0 (uses Prometheus directly, polls when no pods exist). Would
+  # restore scale-from-0 with HPA-style autoscaling above 0.
+  replicas: 1
   strategy:
     type: Recreate
   selector:
