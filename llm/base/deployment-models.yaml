@@ -159,6 +159,28 @@ spec:
             # Metric to watch: `vllm:gpu_prefix_cache_hit_rate` in
             # Prometheus (already scraped via ServiceMonitor).
             - "--enable-prefix-caching"
+            # Phase #83a: chunked prefill. Without this, vLLM
+            # processes prefill (compute-bound, generates KV cache
+            # for the prompt) and decode (memory-bound, generates
+            # one token at a time) in SEPARATE iterations. Under
+            # load, a long-prompt request stalls all decode
+            # iterations behind it → p99 latency spikes.
+            #
+            # `--enable-chunked-prefill` chunks long prefills and
+            # interleaves them with decode passes in the same
+            # batch. Effects:
+            #   - p99 latency: ~30-50% lower under mixed-prompt
+            #     loads (long prompts no longer block short ones)
+            #   - throughput: similar to without (the GPU is
+            #     fully utilized either way), but shape of
+            #     latency distribution improves
+            #   - max-model-len budget: chunked prefill reserves
+            #     a small % of the KV cache for the chunking
+            #     buffer; tradeoff is bounded
+            # Default in vLLM 0.6+ for max-model-len ≥ 32K, but
+            # OFF by default for our max-model-len=8192. Flag-flip
+            # opt-in.
+            - "--enable-chunked-prefill"
             - "--enforce-eager"
             - "--host"
             - "0.0.0.0"
