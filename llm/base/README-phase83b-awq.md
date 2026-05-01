@@ -56,7 +56,7 @@ In `llm/base/deployment-models.yaml`, on the `vllm-llama-8b` Deployment:
 -            - "--dtype"
 -            - "half"
 +            - "--quantization"
-+            - "awq"
++            - "awq_marlin"   # NOT plain "awq" — see kernel-path note below
 +            - "--dtype"
 +            - "half"  # FP16 activations on top of INT4 weights — the
 +                      # canonical AWQ inference dtype
@@ -69,6 +69,32 @@ In `llm/base/deployment-models.yaml`, on the `vllm-llama-8b` Deployment:
 +            requests: { nvidia.com/gpu: "1", cpu: "2", memory: "5Gi" }
 +            limits:   { nvidia.com/gpu: "1", cpu: "3", memory: "16Gi" }
 ```
+
+## vLLM AWQ kernel-path footgun
+
+vLLM 0.7.2 has TWO AWQ code paths and the choice is load-bearing:
+
+- `--quantization awq` — legacy reference implementation. vLLM
+  warns on startup: *"awq quantization is not fully optimized
+  yet. The speed can be slower than non-quantized models."*
+  This is the path the original Phase #83b commit (f5ea410)
+  accidentally selected; the live pod was potentially SLOWER
+  than the FP16 baseline it replaced.
+- `--quantization awq_marlin` — Marlin kernel path. INT4 weights
+  × FP16 activations on Ada/Hopper int4 tensor cores. This is
+  what delivers the advertised ~2-3× throughput.
+
+vLLM's startup log makes the right answer explicit:
+```
+awq_marlin.py:115] Detected that the model can run with
+awq_marlin, however you specified quantization=awq explicitly,
+so forcing awq. Use quantization=awq_marlin for faster inference.
+```
+
+Always use `awq_marlin`. Verified by greppinng pod logs:
+`grep -E "Marlin|awq_marlin" pod-logs.txt` should match a
+"Loading model weights took ..." that's followed by Marlin-kernel
+init lines, not the legacy awq config-warning.
 
 ## Validation post-apply
 

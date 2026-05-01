@@ -134,15 +134,26 @@ spec:
             - "llama-3.1-8b"
             - "--tensor-parallel-size"
             - "1"
-            # Phase #83b: AWQ-INT4 quantized weights. vLLM auto-selects
-            # the Marlin kernel on Ada (L4) — INT4 weights × FP16
-            # activations matmul running on Ada's int4 tensor cores.
-            # ~2-3× throughput vs FP16, and weights footprint drops
-            # from ~16GB to ~5GB, freeing ~11GB for KV cache (which is
-            # what enables ~30 → ~90 concurrent decode contexts per
-            # pod under prefix caching from #80a).
+            # Phase #83b: AWQ-INT4 quantized weights running through
+            # the Marlin kernel — INT4 weights × FP16 activations
+            # matmul on Ada's int4 tensor cores. ~2-3× throughput vs
+            # FP16, and weights footprint drops from ~16GB to ~5GB,
+            # freeing ~11GB for KV cache (which is what enables
+            # ~30 → ~90 concurrent decode contexts per pod under
+            # prefix caching from #80a).
+            #
+            # Caveat learned from the first Phase #83b deploy
+            # (commit f5ea410): vLLM 0.7.2 has TWO AWQ code paths.
+            # `--quantization awq` is the legacy/reference impl
+            # (vLLM logs explicitly: "speed can be slower than
+            # non-quantized models" — i.e. potentially SLOWER than
+            # the FP16 baseline we're replacing). The real win comes
+            # from `--quantization awq_marlin`, which dispatches to
+            # the Marlin INT4 kernel. vLLM's startup log auto-detects
+            # the model can run with awq_marlin and explicitly
+            # recommends it. Use `awq_marlin`.
             - "--quantization"
-            - "awq"
+            - "awq_marlin"
             # Activations stay FP16 even with INT4 weights — this is
             # the canonical AWQ inference dtype. Keep --dtype half
             # explicit so vLLM doesn't fall back to bfloat16 on a
