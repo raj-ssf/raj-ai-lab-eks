@@ -31,12 +31,31 @@ resources:
   - service.yaml
   - httproute.yaml
   - servicemonitor.yaml
-  # Phase #54: scheduled CronJobs pre-warm vllm-llama-8b at 9am
-  # Pacific, scale down at 2am Pacific. Closes the cold-start UX
-  # gap that Phase #53 left — #53 makes ensure_warm correct, but
-  # the wait is ~5-7 min for Karpenter cold-start. With #54, demo
-  # windows find the trivial tier already warm. Cost: ~$330/mo.
-  - prewarm-cronjobs.yaml
+  # Phase #54's prewarm-cronjobs.yaml was removed in Phase #82d.
+  # Reason: with Phase #80c's HPA min=1 enforcing always-warm 1
+  # replica, the `prewarm-down` CronJob's scale-to-0 at 2am PT
+  # ACTIVELY conflicts with HPA's floor — HPA cannot scale FROM
+  # zero (the metric-stream goes <unknown> with no pod emitting),
+  # so the deployment stays at 0 from 2am PT until manually
+  # rescued OR until prewarm-up fires at 9am PT. During that
+  # 7-hour window every chat request that doesn't hit the social
+  # filter (Phase #82) returns "no healthy upstream" 503.
+  #
+  # Observed live 2026-05-01 13:32 PT: user prompted "Can you
+  # think?" → classify call to vllm-llama-8b → 503 → user-
+  # visible upstream error. Manual scale rescued it.
+  #
+  # Cost trade-off:
+  #   Before (Phase #54):  17h/day window × ~$0.65/hr ≈ $330/mo
+  #   After (Phase #82d):  24h × ~$0.80/hr (g6.xlarge HPA-managed) ≈ $580/mo
+  # ~$250/mo extra for guaranteed availability of the
+  # always-on tier. Worth it given chat-ui's user-facing impact.
+  #
+  # Future cost-flexibility path:
+  #   Phase #80d KEDA ScaledObject CAN scale from 0 (polls
+  #   Prometheus directly even when no pods exist), restoring the
+  #   2am-scale-down savings while keeping the autoscaling.
+  #   Tracked as a separate phase; #82d is the immediate fix.
   # Phase #80c: HPA on vllm-llama-8b targeting vllm_num_requests_waiting
   # via the prometheus-adapter custom-metrics API (Phase #80b in
   # raj-ai-lab-eks-infra/prometheus-adapter.tf). minReplicas=1 always-
