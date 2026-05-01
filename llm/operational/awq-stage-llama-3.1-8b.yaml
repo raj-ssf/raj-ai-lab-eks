@@ -1,0 +1,155 @@
+# Phase #83b operational: pre-stage Llama-3.1-8B-Instruct AWQ-INT4
+# weights to S3.
+#
+# This is the binary-precondition Job for Phase #83b. Until this
+# Job has run successfully ONCE, the AWQ code change documented in
+# llm/base/README-phase83b-awq.md cannot be applied (vLLM would try
+# to load AWQ-quantized model weights from an S3 path that holds
+# FP16 safetensors, and crash).
+#
+# This Job is INTENTIONALLY OUT-OF-KUSTOMIZATION. It's one-shot
+# operational work, not a declared service. ArgoCD's `vllm` app
+# (path: llm/overlays/dev) doesn't include llm/operational/, so
+# the Job's lifecycle is purely operator-driven.
+#
+# Apply via:
+#   kubectl apply -f llm/operational/awq-stage-llama-3.1-8b.yaml
+#
+# Watch:
+#   kubectl -n default logs -l job-name=awq-stage-llama-3-1-8b -f
+#
+# Cleanup (Job stays for 1h post-completion via TTL; force-clean):
+#   kubectl -n default delete job awq-stage-llama-3-1-8b
+#
+# Expected runtime: ~10-15 min wall-clock (HuggingFace download
+# ~5-7 GB + S3 sync). No GPU required (pure HTTP-and-S3 work).
+#
+# Re-run safety: idempotent. Sync uses `aws s3 sync --delete` so
+# rerunning produces a clean state matching the HF source.
+#
+# Verification post-completion:
+#   aws s3 ls s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/
+#   # Expect: model.safetensors* + tokenizer.json + config.json +
+#   # quant_config.json.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: awq-stage-llama-3-1-8b
+  namespace: default
+  labels:
+    app.kubernetes.io/name: awq-stage
+    app.kubernetes.io/component: model-weights-stager
+    phase: "83b"
+    target-model: llama-3.1-8b-awq
+spec:
+  # Phase #82c lesson: backoffLimit=2 lets cni.repair self-heal
+  # the Karpenter+istio race if it fires (this Job runs on the
+  # general-purpose CPU NodePool which Phase #66 added).
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: awq-stage
+        app.kubernetes.io/component: model-weights-stager
+    spec:
+      # Pod Identity binding from model-weights.tf:165 maps this SA
+      # to the model_weights_stager IAM role (R/W on the entire
+      # model-weights bucket).
+      serviceAccountName: model-weights-stager
+      restartPolicy: OnFailure
+
+      # No GPU needed — pure HTTP + S3 work. Lands on the Phase #66
+      # general-purpose Karpenter NodePool (CPU-only, multi-AZ).
+      # Default tolerations match.
+      nodeSelector:
+        karpenter.sh/nodepool: general
+
+      containers:
+        - name: stage
+          # python:3.11-slim is on the Kyverno catchall allowlist
+          # (default ns isn't in the enforced list anyway, but
+          # belt-and-suspenders). pip install at runtime — keeps
+          # the manifest self-contained without baking a custom
+          # image.
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
+
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              # Runtime deps. ~30s on cold pip cache.
+              pip install --no-cache-dir --quiet \
+                'huggingface-hub[cli]>=0.24.0,<1.0' \
+                'boto3>=1.30,<2.0'
+
+              # Install awscli for `aws s3 sync` (boto3 alone doesn't
+              # have the same convenient sync semantics).
+              apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+                awscli ca-certificates
+              # NOTE on awscli vs boto3-direct: awscli's `aws s3 sync`
+              # handles multipart upload + retry + concurrency
+              # automatically. Replicating that in plain boto3 is
+              # 100+ lines. Acceptable to layer awscli even though
+              # it adds ~100MB to the image.
+
+              echo "=== Phase #83b: pre-stage Llama-3.1-8B-Instruct AWQ-INT4 ==="
+              echo
+
+              # Download from HuggingFace. The hugging-quants org's
+              # AWQ-INT4 release is the canonical community-quantized
+              # weights for Llama-3.1-8B-Instruct. Public, no auth.
+              REPO=hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4
+              LOCAL=/tmp/awq-weights
+              mkdir -p "$LOCAL"
+              cd "$LOCAL"
+
+              # huggingface-cli download with --local-dir-use-symlinks=False
+              # writes the actual files (not HF cache symlinks), making
+              # the subsequent aws s3 sync straightforward.
+              huggingface-cli download "$REPO" \
+                --local-dir . \
+                --local-dir-use-symlinks False \
+                --quiet
+
+              echo
+              echo "=== Downloaded files ==="
+              ls -lh
+
+              echo
+              echo "=== Uploading to s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/ ==="
+              aws s3 sync . s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/ \
+                --delete \
+                --no-progress
+
+              echo
+              echo "=== S3 contents post-upload ==="
+              aws s3 ls s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/
+
+              echo
+              echo "=== AWQ pre-stage complete ==="
+
+          env:
+            - name: AWS_REGION
+              value: us-west-2
+            # Cap HuggingFace's tokenizers parallelism — keeps memory
+            # bounded during download + tokenizer-config validation.
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+            - name: HF_HUB_DISABLE_TELEMETRY
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "20Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+              # Need ~5GB for the AWQ download + ~5GB for the
+              # multipart-upload buffers + headroom. 20Gi is comfortable.
+              ephemeral-storage: "20Gi"
