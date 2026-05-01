@@ -37,6 +37,7 @@ spec:
           - vllm-mixtral-8x7b         # comparison variant
           - vllm-llama-vision-11b     # vision variant
           - vllm-llama-guard-3-8b     # safety classifier
+          - vllm-llama-1b-distilled   # Phase #81d: distilled student of llama-3.3-70b
   endpoints:
     - port: http
       path: /metrics

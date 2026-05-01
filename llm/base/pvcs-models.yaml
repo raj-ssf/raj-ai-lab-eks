@@ -247,3 +247,27 @@ spec:
   resources:
     requests:
       storage: 250Gi
+
+---
+# Phase #81d: Llama 3.2 1B base weights cache for the distilled
+# student. ~2.5GB weights → 10Gi PVC gives lots of headroom for
+# tokenizer/config files + future model variants we might re-stage
+# under the same cache PVC. Smaller than the 8B cache (30Gi) since
+# 1B's working set is ~5× smaller.
+#
+# Pre-stage weights via:
+#   aws s3 sync s3://huggingface-models-public/NousResearch/Llama-3.2-1B/ \
+#     s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/
+# (Operator-side, one-time. Same pattern as the 8B base.)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-llama-1b-distilled
+  labels:
+    app: vllm
+    model: llama-3.2-1b
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi

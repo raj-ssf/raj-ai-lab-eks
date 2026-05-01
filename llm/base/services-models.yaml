@@ -171,3 +171,24 @@ spec:
       port: 8000
       targetPort: http
       protocol: TCP
+
+---
+# Phase #81d: Service for the distilled 1B student. Stable in-cluster
+# DNS (vllm-llama-1b-distilled.llm.svc.cluster.local) for langgraph-
+# service's "trivial-fast" tier (Phase #81e) to address.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-llama-1b-distilled
+  labels:
+    app: vllm-llama-1b-distilled
+    vllm-model: llama-3.2-1b
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-llama-1b-distilled
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP

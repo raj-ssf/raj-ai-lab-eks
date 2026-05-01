@@ -1113,3 +1113,194 @@ spec:
             claimName: vllm-cache-llama-guard-3-8b
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 2Gi }
+
+---
+# Phase #81d: Distilled Llama-3.2-1B student. Serves the QLoRA
+# adapter trained in Phase #81c (distillation of llama-3.3-70b
+# teacher outputs) on top of NousResearch/Llama-3.2-1B base. The
+# routing tier ("trivial-fast") goes here in Phase #81e — most
+# trivial-tier traffic (greetings already short-circuit via
+# Phase #82 social filter, but the long tail of "what is X"
+# style trivial questions) routes here for ~5-10× cost reduction
+# vs the 8B.
+#
+# Stays at replicas=0 in this scaffolding commit because Phase #81c
+# hasn't run yet — the s3://raj-ai-lab-eks-training/adapters/
+# llama-3.2-1b-distilled/ path doesn't exist until then. Scaling up
+# pre-#81c would fail in the adapter-sync init container.
+#
+# Activation sequence:
+#   1. Phase #81b operator runs: dataset-prep Job generates teacher
+#      outputs JSONL.
+#   2. Phase #81c operator runs: distill PyTorchJob trains adapter,
+#      uploads to s3://<bucket>/adapters/llama-3.2-1b-distilled/.
+#   3. Pre-stage base weights (one-time):
+#        aws s3 sync s3://huggingface-models-public/NousResearch/Llama-3.2-1B/ \
+#          s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/
+#   4. kubectl -n llm scale deploy/vllm-llama-1b-distilled --replicas=1
+#   5. Phase #81e merges to enable routing.
+#
+# Sized for g6.xlarge (1× L4 24GB). 1B FP16 weights ≈ 2.5GB; LoRA
+# adds ~30MB. With prefix caching enabled and gpu-mem-util=0.92,
+# KV cache pool is ~18GB → 30+ concurrent decode contexts. Per-pod
+# throughput at trivial-tier traffic shape (short prompts, short
+# responses) should easily clear 100 concurrent users.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-1b-distilled
+  labels:
+    app: vllm-llama-1b-distilled
+    vllm-model: llama-3.2-1b
+spec:
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-llama-1b-distilled
+  template:
+    metadata:
+      labels:
+        app: vllm-llama-1b-distilled
+        vllm-model: llama-3.2-1b
+    spec:
+      serviceAccountName: vllm
+      enableServiceLinks: false
+      nodeSelector:
+        karpenter.sh/nodepool: gpu-experiments
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Exists, effect: NoSchedule }
+        - { key: gpu-experiment, operator: Exists, effect: NoSchedule }
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_REGION, value: us-west-2 }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/ }
+            - { name: MODEL_PATH, value: /model }
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws configure set default.s3.max_concurrent_requests 32
+              aws configure set default.s3.multipart_chunksize 64MB
+              aws s3 sync "$S3_URI" "$MODEL_PATH" --no-progress
+              ls -la "$MODEL_PATH"
+          resources:
+            requests: { cpu: "1", memory: "1Gi" }
+            limits:   { cpu: "2", memory: "2Gi" }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model }
+        # Pulls the distilled LoRA adapter from the training bucket.
+        # WILL FAIL UNTIL PHASE #81C UPLOADS THE ADAPTER. This is
+        # why replicas=0 — the Deployment exists for routing
+        # scaffolding but isn't safe to scale up until the adapter
+        # is in place.
+        - name: adapter-sync
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_REGION,   value: us-west-2 }
+            - { name: S3_URI,       value: s3://raj-ai-lab-eks-training/adapters/llama-3.2-1b-distilled/ }
+            - { name: ADAPTER_PATH, value: /adapters/distilled }
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              # Same exclude pattern as the 8B+Alpaca adapter-sync
+              # (deployment-models.yaml ~line 111): omit tokenizer*
+              # and config files so vLLM falls back to the base
+              # Llama-3.2-1B tokenizer's chat_template.
+              aws s3 sync "$S3_URI" "$ADAPTER_PATH" --no-progress \
+                --exclude "tokenizer*" \
+                --exclude "special_tokens_map.json" \
+                --exclude "config.json" \
+                --exclude "README.md"
+              ls -la "$ADAPTER_PATH"
+          resources:
+            requests: { cpu: "500m", memory: "256Mi" }
+            limits:   { cpu: "1",    memory: "512Mi" }
+          volumeMounts:
+            - { name: adapter-cache, mountPath: /adapters/distilled }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:placeholder
+          args:
+            - "--model"
+            - "/model"
+            - "--served-model-name"
+            - "llama-3.2-1b"
+            - "--tensor-parallel-size"
+            - "1"
+            - "--dtype"
+            - "half"
+            # 1B fits comfortably with 8K context on L4. If we want
+            # to share more system-prompt prefix with the 8B's 8192-
+            # token cache, keeping these aligned is convenient.
+            - "--max-model-len"
+            - "8192"
+            # Same GPU-mem-util reasoning as Phase #80a on the 8B.
+            # 1B's smaller weights (~2.5GB on the L4 24GB) leave a
+            # huge KV cache pool — 0.92 means ~18GB available for
+            # KV + prefix cache.
+            - "--gpu-memory-utilization"
+            - "0.92"
+            # Phase #80a: prefix caching. Trivial-tier traffic has
+            # high system-prompt overlap (every request shares the
+            # same agent system prompt + plan + RAG context) so
+            # hit rate should be ~95%+ once warm. Higher than 8B's
+            # because trivial-tier prompts have less unique
+            # variability.
+            - "--enable-prefix-caching"
+            - "--enforce-eager"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            # LoRA serving. The distilled adapter overrides the
+            # raw Llama-3.2-1B base behavior to match the 70B
+            # teacher's response style + content. Without the
+            # adapter loaded, the base model is a Llama-3.2-1B
+            # raw chat model — usable but not domain-aligned.
+            - "--enable-lora"
+            - "--max-loras"
+            - "1"
+            # Same r=16 as Phase #81's Axolotl config
+            # (training/configs/llama-3.2-1b-distilled.yaml).
+            - "--max-lora-rank"
+            - "16"
+            - "--lora-modules"
+            - "llama-3.2-1b-distilled=/adapters/distilled"
+            # Tool calling support same as the 8B — Llama 3.x family
+            # uses identical tool-call format. Critical for
+            # trivial-fast tier: simple queries (calculator, time)
+            # still want tool support.
+            - "--enable-auto-tool-choice"
+            - "--tool-call-parser"
+            - "llama3_json"
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: HF_HUB_OFFLINE,                value: "1" }
+            - { name: TRANSFORMERS_OFFLINE,          value: "1" }
+            - { name: OTEL_SERVICE_NAME,             value: vllm-llama-1b-distilled }
+            - { name: VLLM_ALLOW_RUNTIME_LORA_UPDATING, value: "True" }
+          resources:
+            # Sized smaller than the 8B (which needs 28Gi memory limit
+            # for the 16GB FP16 weights + load buffer). 1B's peak
+            # host RAM during from_pretrained is ~3-4GB.
+            requests: { nvidia.com/gpu: "1", cpu: "1", memory: "4Gi" }
+            limits:   { nvidia.com/gpu: "1", cpu: "2", memory: "12Gi" }
+          startupProbe: { httpGet: { path: /health, port: http }, initialDelaySeconds: 15, periodSeconds: 10, failureThreshold: 30 }
+          readinessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
+          livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
+          volumeMounts:
+            - { name: model-cache,   mountPath: /model,             readOnly: true }
+            - { name: adapter-cache, mountPath: /adapters/distilled, readOnly: true }
+            - { name: shm,           mountPath: /dev/shm }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache-llama-1b-distilled
+        - name: adapter-cache
+          emptyDir: { sizeLimit: 1Gi }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 2Gi }
