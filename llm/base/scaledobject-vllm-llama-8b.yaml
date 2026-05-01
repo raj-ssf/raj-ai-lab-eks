@@ -1,0 +1,123 @@
+# Phase #80d: KEDA ScaledObject — replaces hpa-vllm-llama-8b.yaml
+# (deleted in this commit). Same workload-target as the HPA,
+# different scaling capabilities:
+#
+#   1. minReplicaCount=0 → scale-to-0 off-hours
+#   2. Stacked triggers: cron (always-warm during demo hours) +
+#      prometheus (load-driven autoscale)
+#   3. cooldownPeriod=600s → stay warm 10min after last request
+#
+# Restores the cost-flexibility of Phase #54's prewarm-cronjobs
+# (deleted in #82d because they conflicted with HPA's min=1 floor)
+# but as a SINGLE declarative resource. KEDA's stacked-trigger
+# semantic means the cron + prometheus rules cannot conflict — the
+# effective replica count is MAX, so the cron's "min 1 during
+# work hours" can never be undercut by the prometheus trigger
+# returning 0.
+#
+# Cold-start UX off-hours documented in the infra-side commit
+# (raj-ai-lab-eks-infra/keda.tf): first /invoke after a 10min idle
+# window during off-hours triggers ~5-6 min cold start. langgraph-
+# service's ensure_warm already handles the wait gracefully.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-llama-8b
+  namespace: llm
+  labels:
+    app: vllm-llama-8b
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vllm-llama-8b
+
+  # Scale-from-0 enabled. KEDA's prometheus-trigger queries the
+  # in-cluster kube-prometheus-stack directly (not via the K8s
+  # custom-metrics API) so an empty PromQL result returns `0`,
+  # which is a legitimate signal to stay at 0 — vs HPA's <unknown>
+  # paralysis.
+  minReplicaCount: 0
+  maxReplicaCount: 4
+
+  # Poll Prometheus every 30s. Same cadence as HPA's controller
+  # default; KEDA's polling is independent of the K8s controller-
+  # manager.
+  pollingInterval: 30
+
+  # Stay at the elevated replica count for 10min after triggers
+  # drop. Karpenter will then consolidate the GPU node away if
+  # nothing else is using it. Replaces the heuristic Phase #80c
+  # behavior.scaleDown stabilizationWindow=600.
+  cooldownPeriod: 600
+
+  # When KEDA decides to scale-from-0, the underlying
+  # autoscaling/v2 HPA gets a 1-pod target (not the trigger's
+  # computed value). idleReplicaCount=0 vs minReplicaCount=0:
+  # idleReplicaCount means "scale to this when ALL triggers are
+  # 0"; minReplicaCount is the floor for the HPA KEDA creates.
+  # Setting both to 0 gives the cleanest scale-from-0 path.
+  idleReplicaCount: 0
+
+  # Trigger 1: time-based cron schedule. Always-warm during
+  # 9am-2am PT (matches Phase #54 prewarm-cronjobs's window).
+  # Outside this window, this trigger contributes 0 to the MAX —
+  # so prometheus-trigger can independently scale up if there's
+  # off-hours load.
+  #
+  # KEDA cron-trigger semantics:
+  #   start cron expression → time the desiredReplicas value
+  #     becomes active
+  #   end cron expression → time it goes back to 0
+  #   Between start and end (LOCAL to timezone), trigger contributes
+  #     desiredReplicas; outside, contributes 0.
+  triggers:
+    - type: cron
+      metadata:
+        timezone: America/Los_Angeles
+        start: "0 9 * * *"      # 9am PT
+        end: "0 2 * * *"        # 2am PT (next day — KEDA handles wraparound)
+        desiredReplicas: "1"
+
+    # Trigger 2: prometheus query on vllm:num_requests_waiting.
+    # Same metric Phase #80c's HPA used. The MAX semantic means
+    # this trigger can ALWAYS contribute load-driven replicas
+    # regardless of cron window — handles off-hours bursts and
+    # business-hours scale-up uniformly.
+    #
+    # threshold=5 means "scale 1 pod per 5 requests in the queue".
+    # query sums across all vllm-llama-8b pods so the trigger sees
+    # cluster-wide queue depth, not per-pod.
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: vllm_num_requests_waiting
+        threshold: "5"
+        query: sum(vllm:num_requests_waiting{pod=~"vllm-llama-8b-.*"})
+
+  # KEDA's underlying HPA behavior config — controls the rate at
+  # which KEDA-driven scale-up/down happens. Same Phase #80c
+  # tuning ported over: scale-up fast (30s window, GPU spawn is
+  # the bottleneck so kick the signal early), scale-down slow
+  # (600s window — but cooldownPeriod above already enforces 10min,
+  # so this is largely redundant; keeping for parity).
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          selectPolicy: Max
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 30
+            - type: Pods
+              value: 1
+              periodSeconds: 30
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          selectPolicy: Min
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60

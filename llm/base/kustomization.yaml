@@ -56,12 +56,14 @@ resources:
   #   Prometheus directly even when no pods exist), restoring the
   #   2am-scale-down savings while keeping the autoscaling.
   #   Tracked as a separate phase; #82d is the immediate fix.
-  # Phase #80c: HPA on vllm-llama-8b targeting vllm_num_requests_waiting
-  # via the prometheus-adapter custom-metrics API (Phase #80b in
-  # raj-ai-lab-eks-infra/prometheus-adapter.tf). minReplicas=1 always-
-  # warm so HPA has metrics to read; ensure_warm in langgraph-service
-  # becomes effectively a no-op (always sees warm pod). Phase #54's
-  # prewarm-cronjobs become redundant when HPA min=1; keeping them
-  # for the at-2am-scale-down behavior until we redesign the daily-
-  # warm-window pattern around HPA.
-  - hpa-vllm-llama-8b.yaml
+  # Phase #80d: KEDA ScaledObject replaces the Phase #80c HPA.
+  # KEDA's prometheus trigger polls Prometheus directly (independent
+  # of pod state) so it CAN scale from 0, unlike HPA. Stacked
+  # cron+prometheus triggers give us:
+  #   - Always-warm 9am-2am PT (matches the original Phase #54 window)
+  #   - Off-hours scale-to-0 (cost saving)
+  #   - Load-driven scale-up at any hour
+  # Phase #82d's prewarm-cronjobs.yaml removal stays — that
+  # mechanism is now subsumed by the cron trigger inside this
+  # ScaledObject.
+  - scaledobject-vllm-llama-8b.yaml
