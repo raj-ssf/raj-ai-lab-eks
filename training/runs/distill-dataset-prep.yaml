@@ -43,6 +43,32 @@
 #   Phase #81b1 candidate: bake into eval image once script
 #   stabilizes, drop the ConfigMap volume.
 
+# Phase #81b run 2026-05-01: Service alias so the canonical README
+# name `vllm-llama-3.3-70b-awq` resolves via cluster DNS without
+# duplicating the Deployment manifest. Selects on `app: vllm-g6e-1gpu`
+# (the cheapest 70B AWQ Deployment, 1× L40S 48GB g6e.xlarge ~$1.86/hr).
+# Lives inline with this operator-applied Job — ArgoCD doesn't track
+# this file, so the Service stays out of sync-pruning eyes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-llama-3.3-70b-awq
+  namespace: llm
+  labels:
+    app.kubernetes.io/name: vllm-llama-3.3-70b-awq
+    app.kubernetes.io/component: teacher-alias
+    phase: "81b"
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-g6e-1gpu
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -54,6 +80,11 @@ metadata:
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 3600
+  # Hard cost-cap. At ~$1.86/hr teacher + ~$0.05/hr Job pod, 8h is
+  # ~$15 budget. Real expectation is 4-6h for Dolly-15k at conc=16
+  # / max_tokens=512. If the Job exceeds 8h something has gone
+  # sideways and stopping is the right move.
+  activeDeadlineSeconds: 28800
   template:
     metadata:
       labels:
@@ -110,17 +141,19 @@ spec:
                 --output-s3-uri "s3://${TRAINING_BUCKET}/datasets/distill-llama-3.3-70b/teacher_outputs.jsonl" \
                 --teacher-url "${TEACHER_URL}" \
                 --teacher-model "${TEACHER_MODEL}" \
-                --max-tokens 1024 \
-                --max-concurrent 8
+                --max-tokens 512 \
+                --max-concurrent 16
 
           env:
             - name: TRAINING_BUCKET
               value: ${TRAINING_BUCKET}
-            # Teacher: the canonical 70B AWQ. Switch to vllm-deepseek-
-            # r1-70b for reasoning-heavy distillation, or vllm-llama-
-            # 405b for the highest-fidelity (and slowest) teacher.
+            # Teacher: the canonical 70B AWQ via the Service alias
+            # added at the top of this manifest. Resolves to whichever
+            # variant pod is scaled up (currently vllm-g6e-1gpu, single
+            # L40S, ~$1.86/hr). Switch the Service's selector for a
+            # different teacher.
             - name: TEACHER_URL
-              value: http://vllm.llm.svc.cluster.local:8000/v1
+              value: http://vllm-llama-3.3-70b-awq.llm.svc.cluster.local:8000/v1
             - name: TEACHER_MODEL
               value: llama-3.3-70b
             # Quiet boto3 + openai SDK chatter
