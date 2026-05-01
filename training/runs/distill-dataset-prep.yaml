@@ -1,0 +1,146 @@
+# Phase #81b: K8s Job that runs seed_prompts.py — generates the
+# teacher-output dataset that Phase #81c's PyTorchJob trains on.
+#
+# Apply via:
+#   # Pre-req: prompts JSONL must exist at PROMPTS_S3_URI. For first
+#   # iteration use the lab's eval datasets:
+#   #   cat eval/ragas/dataset.yaml eval/runs/dataset.yaml \
+#   #     | python3 -c "import yaml,sys,json; \
+#   #         [print(json.dumps({'prompt': e['question']})) \
+#   #          for d in yaml.safe_load_all(sys.stdin) \
+#   #          for e in d.get('entries',[])]" \
+#   #     | aws s3 cp - s3://${TRAINING_BUCKET}/datasets/distill-llama-3.3-70b/prompts.jsonl
+#
+#   # Pre-req: scale teacher up
+#   kubectl -n llm scale deploy/vllm-llama-3.3-70b-awq --replicas=1
+#   kubectl -n llm wait --for=condition=available --timeout=15m \
+#     deploy/vllm-llama-3.3-70b-awq
+#
+#   # Refresh the script ConfigMap
+#   kubectl -n llm create configmap distill-seed-prompts \
+#     --from-file=seed_prompts.py=training/distill/seed_prompts.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+#   # Apply Job
+#   export TRAINING_BUCKET=raj-ai-lab-eks-training
+#   envsubst < training/runs/distill-dataset-prep.yaml | kubectl apply -f -
+#
+#   # Watch
+#   kubectl -n llm logs -l app.kubernetes.io/name=distill-dataset-prep -f
+#
+# Why llm namespace + eval-pod SA:
+#   eval-pod already has Pod Identity creds for S3 write to the
+#   training bucket's distill-* prefix (extension to be made in
+#   training.tf — see operational note in commit message). Running
+#   here also means the Job can call vllm Services directly via mesh-
+#   internal Service DNS, with mTLS already established on both ends
+#   via Istio sidecars.
+#
+# Why ConfigMap-mounted script (vs baked into eval image):
+#   Phase #81b is iteration-heavy (tweaking max_tokens, concurrency,
+#   retry logic) — refreshing a ConfigMap is faster than rebuilding
+#   the eval image + retagging the kustomize overlay.
+#   Phase #81b1 candidate: bake into eval image once script
+#   stabilizes, drop the ConfigMap volume.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distill-dataset-prep
+  namespace: llm
+  labels:
+    app.kubernetes.io/name: distill-dataset-prep
+    app.kubernetes.io/component: distillation-data
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: distill-dataset-prep
+        app.kubernetes.io/component: distillation-data
+    spec:
+      serviceAccountName: eval-pod
+      restartPolicy: Never
+
+      # Sync prompts JSONL from S3 before main container runs. Mirror
+      # of the dataset-sync pattern in training/runs/llama-3.2-1b-
+      # distill.yaml — keeps the Python container focused on the
+      # one thing (teacher inference) and uses awscli for what it's
+      # good at (S3 transfer).
+      initContainers:
+        - name: prompts-sync
+          image: amazon/aws-cli:2.17.0
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws s3 cp \
+                "s3://${TRAINING_BUCKET}/datasets/distill-llama-3.3-70b/prompts.jsonl" \
+                /workspace/prompts/prompts.jsonl
+              wc -l /workspace/prompts/prompts.jsonl
+          env:
+            - name: TRAINING_BUCKET
+              value: ${TRAINING_BUCKET}
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+          volumeMounts:
+            - { name: prompts, mountPath: /workspace/prompts }
+
+      containers:
+        - name: seed-prompts
+          # python:3.11-slim + boto3 + openai pip install at runtime.
+          # Phase #81b1 candidate: bake into the eval image (which
+          # already has these deps) and drop the runtime install.
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
+
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              # Runtime deps. Adds ~30s to pod startup; one-shot Job
+              # so cold-cache is acceptable. Phase #81b1 will move
+              # to a baked image.
+              pip install --no-cache-dir --quiet boto3 'openai>=1.0,<2.0'
+              echo "=== Starting teacher-output generation ==="
+              python /workspace/script/seed_prompts.py \
+                --prompts-file /workspace/prompts/prompts.jsonl \
+                --output-file /tmp/teacher_outputs.jsonl \
+                --output-s3-uri "s3://${TRAINING_BUCKET}/datasets/distill-llama-3.3-70b/teacher_outputs.jsonl" \
+                --teacher-url "${TEACHER_URL}" \
+                --teacher-model "${TEACHER_MODEL}" \
+                --max-tokens 1024 \
+                --max-concurrent 8
+
+          env:
+            - name: TRAINING_BUCKET
+              value: ${TRAINING_BUCKET}
+            # Teacher: the canonical 70B AWQ. Switch to vllm-deepseek-
+            # r1-70b for reasoning-heavy distillation, or vllm-llama-
+            # 405b for the highest-fidelity (and slowest) teacher.
+            - name: TEACHER_URL
+              value: http://vllm.llm.svc.cluster.local:8000/v1
+            - name: TEACHER_MODEL
+              value: llama-3.3-70b
+            # Quiet boto3 + openai SDK chatter
+            - name: PYTHONUNBUFFERED
+              value: "1"
+
+          resources:
+            # Pure HTTP-client workload — no GPU, modest CPU/memory.
+            requests: { cpu: "200m", memory: "256Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+
+          volumeMounts:
+            - { name: script,  mountPath: /workspace/script, readOnly: true }
+            - { name: prompts, mountPath: /workspace/prompts, readOnly: true }
+
+      volumes:
+        - name: script
+          configMap:
+            name: distill-seed-prompts
+            defaultMode: 0555
+        # initContainer writes here; main container reads it
+        - name: prompts
+          emptyDir: { sizeLimit: 100Mi }
