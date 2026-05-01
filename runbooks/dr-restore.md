@@ -159,3 +159,87 @@ If the cluster is being recreated from scratch (true DR scenario):
 For the lab specifically, an end-to-end fresh-cluster recovery is a
 separate drill — this runbook covers single-app/single-namespace
 restore on the existing cluster.
+
+## Drill record
+
+### 2026-05-01 — Phase #71 backup-half drill
+
+**Outcome**: ✅ Backup half of the procedure verified. Restore half
+deferred (would briefly impact live `hello` HTTPRoute traffic;
+requires operator-scheduled maintenance window).
+
+**Procedure executed (non-destructive)**:
+
+```bash
+kubectl apply -f - <<YAML
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase71-drill-20260501-211619
+  namespace: velero
+  labels:
+    drill: phase71
+    target: default
+spec:
+  includedNamespaces: [default]
+  defaultVolumesToFsBackup: false
+  storageLocation: default
+  ttl: 168h
+YAML
+```
+
+**Measured timings**:
+
+| Metric | Value |
+|---|---|
+| Backup submission → start | <1s |
+| Items backed up | 274 |
+| Backup duration (start → completion) | **3 seconds** |
+| Errors | 0 |
+| Status | Completed |
+| TTL | 168h (auto-expires 2026-05-08) |
+
+**What this proves**:
+
+- BackupStorageLocation is reachable + the S3 path is writeable
+  via the velero-pod's IAM role.
+- Velero can enumerate + serialize the cluster's resources for
+  `default` namespace in 3 seconds (274 items: hello deploy + svc
+  + httproute + service-account + 3 pods + node-debugger remnants
+  + RBAC bindings).
+- The nightly-all schedule that runs at 02:00 UTC daily uses the
+  exact same code path; the 7-minute duration of those backups
+  reflects 2157-item cluster-wide scope, not a defect in any
+  per-namespace path.
+
+**What this DOESN'T prove (next-drill targets)**:
+
+- That a Velero `Restore` resource can re-create the resources
+  in a fresh namespace. Restore-half drill requires operator
+  authorization — it would briefly delete `hello` resources +
+  re-create them. RTO measurement = next drill.
+- That cross-cluster restore (true DR scenario) works. That
+  requires standing up a fresh cluster pointed at the same S3
+  bucket, then running `velero restore create`.
+
+**Drill artifacts**:
+
+- Backup name: `phase71-drill-20260501-211619`
+- S3 location: `s3://${cluster}-velero/backups/phase71-drill-20260501-211619/`
+- Auto-expires: 2026-05-08 (TTL 168h)
+
+**Next-drill checklist**:
+
+1. Schedule a 30-min maintenance window where `hello.ekstest.com`
+   can be 5xx for ~2-3 minutes.
+2. Pause ArgoCD `hello` app autosync.
+3. Run the DELETE step from "Procedure" section above against
+   `default` namespace's hello resources.
+4. Run `velero restore create` from the latest nightly-all backup
+   targeting `--include-resources deployments,services,httproutes
+   --selector app=hello`.
+5. Time T0 (delete complete) → T1 (curl https://hello.ekstest.com
+   returns 200 again).
+6. Append the measured RTO to this runbook + record in this
+   "Drill record" section.
+7. Re-enable ArgoCD autosync.
