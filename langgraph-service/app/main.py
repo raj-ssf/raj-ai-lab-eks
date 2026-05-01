@@ -5103,6 +5103,7 @@ def invoke(
 
 _NODE_NAMES = {
     "budget_check", "input_validation", "safety_input",
+    "social_filter",
     "pii_redact_input", "cache_lookup", "load_memory",
     "rewrite_query", "classify", "retrieve", "ensure_warm",
     "plan", "execute", "reflect", "safety_output",
@@ -5116,6 +5117,13 @@ _NODE_NAMES = {
 _NODE_END_FIELDS = {
     "budget_check": ["budget_action", "budget_consumed", "budget_remaining"],
     "input_validation": ["input_validation_action", "input_validation_details"],
+    # Phase #82b: surface social_filter's state update in the SSE
+    # stream's per-node event AND the final_data accumulator. Without
+    # this, chat-ui's "route=" display reads a stale value (typically
+    # the classify-node's output, which never ran on a social-bypass
+    # path) and the canned response wouldn't appear in routing.json.
+    # `route` is included so chat-ui shows route=social on bypass.
+    "social_filter": ["social_filter_action", "social_filter_category", "route", "response"],
     "safety_input": ["safety_input_verdict", "safety_categories", "safety_action"],
     "cache_lookup": ["cache_hit", "cache_similarity"],
     "load_memory": ["memory_turn_count"],
