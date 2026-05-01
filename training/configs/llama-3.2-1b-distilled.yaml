@@ -1,0 +1,139 @@
+# Phase #81: Distillation — supervised fine-tune of Llama-3.2-1B on
+# teacher outputs from llama-3.3-70b (or any larger teacher).
+#
+# Strategy: OUTPUT distillation, not logit/KD distillation. Logit
+# distillation requires running teacher inference INSIDE the training
+# loop (extremely expensive — adds full teacher forward pass per
+# training step). Output distillation runs the teacher OFFLINE once,
+# captures (prompt, teacher_response) pairs to S3, then SFT the
+# student on those pairs as plain instruction-tuning data. Quality
+# loss vs logit-KD is small for chat-style tasks; cost reduction is
+# 50-100×.
+#
+# Why Llama-3.2-1B as student:
+#   - 2.5B params, ~2.5GB FP16. Comfortable on a single L4 (24GB)
+#     with room for KV cache supporting 30+ concurrent sessions.
+#   - Same Llama 3.x family as the teacher → same chat template,
+#     same tokenizer, same special tokens. No conversion friction
+#     during inference, and SFT on teacher outputs preserves the
+#     teacher's chat-style formatting.
+#   - 5-10× cheaper inference per token than 8B at <80% quality
+#     loss on simple tasks (the "trivial" + "tuned-lora" tier of
+#     ROUTE_REGISTRY in langgraph-service). Routing simple queries
+#     here saves real money at 1000-user scale.
+#
+# Why QLoRA (not full FT):
+#   - 1B base in 4-bit NF4 = ~700MB. LoRA adapter adds ~30MB.
+#     Total VRAM ~5GB during training, fits comfortably on L4
+#     (g6.xlarge — same NodePool as the 8B QLoRA fine-tune).
+#   - Full FT of a 1B model would be feasible on L40S (g6e.xlarge,
+#     48GB) but the cost-per-quality bump is tiny vs LoRA. Same
+#     reasoning as the 8B+Alpaca QLoRA in the existing config.
+#
+# Operational flow:
+#   1. Phase #81a (this commit): scaffolding lands, no training yet
+#   2. Phase #81b operational step: run teacher-inference dataset
+#      prep — TBD via a separate K8s Job that calls vllm-llama-3.3-
+#      70b-awq Service over a curated prompt corpus, writes
+#      (prompt, response) JSONL to s3://<bucket>/datasets/
+#      distill-llama-3.3-70b/. Estimated 4-6 hours on warm 70B.
+#   3. Phase #81c: PyTorchJob (training/runs/llama-3.2-1b-distill.
+#      yaml) consumes that JSONL → trains adapter → ships to
+#      s3://<bucket>/adapters/llama-3.2-1b-distilled/. ~1-2 hours
+#      on g6.xlarge.
+#   4. Phase #81d: vllm-llama-1b-distilled Deployment serves the
+#      adapter alongside Llama-3.2-1B base. ROUTE_REGISTRY in
+#      langgraph-service gains a "trivial-fast" tier routing here
+#      instead of the 8B for simple queries.
+
+base_model: NousResearch/Llama-3.2-1B
+model_type: LlamaForCausalLM
+tokenizer_type: AutoTokenizer
+
+# Same pad-token strategy as the 8B Alpaca config — Llama 3.x
+# tokenizers ship with bos + eos but no pad. Setting it to eos is
+# the canonical workaround for SFT (causal LM ignores padded
+# positions via the attention mask).
+special_tokens:
+  pad_token: <|end_of_text|>
+
+# Sequence length: matches teacher's typical response length. The
+# 70B teacher is configured with max_model_len=16384, but most
+# chat replies are <2K tokens. 4096 is a sweet spot — captures
+# even verbose responses without bloating per-step memory.
+sequence_len: 4096
+sample_packing: true
+pad_to_sequence_len: true
+
+# QLoRA: 4-bit NF4 quantization of the 1B base. Same pattern as
+# the 8B Alpaca config (training/configs/llama-3.1-8b-alpaca-lora.
+# yaml). Layer targets are Llama-family attention + MLP projections.
+adapter: qlora
+load_in_4bit: true
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_linear: true
+
+# Dataset: teacher-output JSONL produced by Phase #81b's prep step.
+# The path is parameterized — Phase #81b's Job writes to a stable
+# S3 prefix; the training image's startup script (or runtime
+# entrypoint) syncs from S3 to /workspace/datasets/distill/ before
+# axolotl train runs.
+#
+# Format: alpaca-style with `instruction` (the prompt sent to
+# teacher), empty `input`, and `output` (teacher's response).
+# Axolotl's built-in alpaca formatter handles the rest — wraps
+# the (instruction, output) into a Llama chat template at training
+# time.
+datasets:
+  - path: /workspace/datasets/distill/teacher_outputs.jsonl
+    type: alpaca
+
+# Train/eval split: 5% holdout. With ~10K teacher outputs the
+# eval set is ~500 examples — large enough for stable
+# eval_loss + perplexity tracking without noticeably eating
+# training time.
+val_set_size: 0.05
+
+# Output: LoRA adapter + tokenizer files. The training pod's
+# /workspace/output is synced to S3 by the PyTorchJob's command
+# (see training/runs/llama-3.2-1b-distill.yaml).
+output_dir: /workspace/output
+
+# Hyperparameters: copied from a known-good 1B QLoRA recipe. Same
+# learning rate as the 8B+Alpaca config (2e-4) since LoRA's
+# adapter weights have similar magnitude regardless of base size.
+gradient_accumulation_steps: 4
+micro_batch_size: 2
+num_epochs: 3
+optimizer: paged_adamw_8bit
+learning_rate: 2e-4
+lr_scheduler: cosine
+warmup_steps: 50
+
+# Mixed precision: bf16 on Ampere+ (which g6.xlarge L4 supports
+# via cuda compute capability 8.9). Faster than fp16 with similar
+# numerical range to fp32 — Llama-family models train cleanly in
+# bf16 without divergence.
+bf16: true
+tf32: true
+
+# Flash attention: g6.xlarge L4 (Ada Lovelace, sm_89) supports
+# flash-attn 2 → ~2× training throughput vs vanilla SDPA. Already
+# baked into the Axolotl base image we use.
+flash_attention: true
+sample_packing_efficiency: 1.0
+
+# Logging cadence: every 10 steps so the GHA build + initial
+# operator-run feedback loop stays tight. Drop to every 50 steps
+# once the run is stable.
+logging_steps: 10
+save_steps: 100
+save_total_limit: 3
+eval_steps: 100
+
+# Checkpoint resumption: training/runs/llama-3.2-1b-distill.yaml
+# uses the hf-cache PVC; if a node dies mid-run, restart resumes
+# from the last save_steps checkpoint at ~5min granularity.
+resume_from_checkpoint: auto
