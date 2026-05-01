@@ -12,9 +12,9 @@
 #   #     | aws s3 cp - s3://${TRAINING_BUCKET}/datasets/distill-llama-3.3-70b/prompts.jsonl
 #
 #   # Pre-req: scale teacher up
-#   kubectl -n llm scale deploy/vllm-llama-3.3-70b-awq --replicas=1
+#   kubectl -n llm scale deploy/vllm-llama-3-3-70b-awq --replicas=1
 #   kubectl -n llm wait --for=condition=available --timeout=15m \
-#     deploy/vllm-llama-3.3-70b-awq
+#     deploy/vllm-llama-3-3-70b-awq
 #
 #   # Refresh the script ConfigMap
 #   kubectl -n llm create configmap distill-seed-prompts \
@@ -43,25 +43,163 @@
 #   Phase #81b1 candidate: bake into eval image once script
 #   stabilizes, drop the ConfigMap volume.
 
-# Phase #81b run 2026-05-01: Service alias so the canonical README
-# name `vllm-llama-3.3-70b-awq` resolves via cluster DNS without
-# duplicating the Deployment manifest. Selects on `app: vllm-g6e-1gpu`
-# (the cheapest 70B AWQ Deployment, 1× L40S 48GB g6e.xlarge ~$1.86/hr).
-# Lives inline with this operator-applied Job — ArgoCD doesn't track
-# this file, so the Service stays out of sync-pruning eyes.
+# Phase #81b run 2026-05-01: inline teacher Deployment +
+# Service named `vllm-llama-3-3-70b-awq` (the canonical README
+# name) sized correctly for a single L40S 48GB g6e.xlarge.
+#
+# Why inline + not in deployment-variants.yaml:
+#   The existing vllm-g6e-1gpu Deployment in deployment-variants.yaml
+#   has --max-model-len=16384 + --gpu-memory-utilization=0.85, which
+#   does NOT fit Llama-3.3-70B AWQ (~38 GB weights + 5.4 GB KV per
+#   16K context = 43.4 GB needed; 0.85 × 48 = 40.8 GB usable).
+#   Scaling it up reproducibly OOMs at vLLM's KV cache init step.
+#
+#   Rather than edit the gitops manifest (would need ArgoCD sync +
+#   risk of unrelated drift), this run uses a fresh Deployment with
+#   correct sizing for the dataset-prep workload (short prompts,
+#   max-tokens=512). max-model-len drops 16384 -> 4096 (~1.4 GB
+#   KV per context, leaves ~4.8 GB free for batching) and
+#   gpu-mem-util bumps 0.85 -> 0.92.
+#
+#   ALSO: --quantization awq_marlin instead of awq (Phase #83b
+#   lesson — see feedback_vllm_awq_marlin.md). Plain `awq` warns
+#   "speed can be slower than non-quantized models"; awq_marlin
+#   uses Ada's int4 tensor cores.
+#
+#   This Deployment + Service live in this operator-applied file
+#   (not tracked by ArgoCD), so kubectl apply lands them atomically
+#   and selfHeal can't prune them.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-3-3-70b-awq
+  namespace: llm
+  labels:
+    app: vllm-llama-3-3-70b-awq
+    app.kubernetes.io/name: vllm-llama-3-3-70b-awq
+    app.kubernetes.io/component: teacher
+    phase: "81b"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-llama-3-3-70b-awq
+  template:
+    metadata:
+      labels:
+        app: vllm-llama-3-3-70b-awq
+        app.kubernetes.io/name: vllm-llama-3-3-70b-awq
+    spec:
+      serviceAccountName: vllm
+      enableServiceLinks: false
+      nodeSelector:
+        node.kubernetes.io/instance-type: g6e.xlarge
+      tolerations:
+        - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
+        - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_REGION, value: us-west-2 }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.3-70b-instruct-awq/ }
+            - { name: MODEL_PATH, value: /model }
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws configure set default.s3.max_concurrent_requests 32
+              aws configure set default.s3.multipart_chunksize 128MB
+              aws s3 sync "$S3_URI" "$MODEL_PATH" \
+                --exclude ".cache/*" \
+                --exclude "*.metadata" \
+                --no-progress
+              ls -la "$MODEL_PATH"
+          resources:
+            requests: { cpu: "1", memory: "1Gi" }
+            limits:   { cpu: "2", memory: "2Gi" }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.7.2
+          args:
+            - "--model"
+            - "/model"
+            - "--served-model-name"
+            - "llama-3.3-70b"
+            - "--tensor-parallel-size"
+            - "1"
+            - "--quantization"
+            - "awq_marlin"
+            - "--dtype"
+            - "half"
+            # 4096 chosen for the Dolly-15k workload: prompts avg
+            # ~100 tokens + max_tokens=512 response = well under
+            # 1K total. 4096 is generous headroom AND fits the
+            # KV-cache budget on single L40S (~1.4 GB per context).
+            - "--max-model-len"
+            - "4096"
+            # 0.92 (vs the 0.85 in deployment-variants.yaml) gives
+            # ~3.4 extra GB for KV pool on top of the smaller
+            # max-model-len savings.
+            - "--gpu-memory-utilization"
+            - "0.92"
+            - "--enable-prefix-caching"
+            - "--enforce-eager"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: HF_HUB_OFFLINE,       value: "1" }
+            - { name: TRANSFORMERS_OFFLINE, value: "1" }
+            - { name: OTEL_SERVICE_NAME,    value: vllm-llama-3-3-70b-awq }
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              nvidia.com/gpu: "1"
+              cpu: "3"
+              memory: "28Gi"
+          startupProbe:  { httpGet: { path: /health, port: http }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 60 }
+          readinessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
+          livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: shm,         mountPath: /dev/shm }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            # Same PVC as vllm-g6e-1gpu — already has the 38 GB
+            # AWQ weights cached, so model-sync init's aws s3 sync
+            # is a quick no-op rather than a fresh 38 GB download.
+            # RWO is fine: vllm-g6e-1gpu is now scaled to 0 so
+            # the PVC is detachable.
+            claimName: vllm-model-cache
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 2Gi }
+
+---
 apiVersion: v1
 kind: Service
 metadata:
-  name: vllm-llama-3.3-70b-awq
+  name: vllm-llama-3-3-70b-awq
   namespace: llm
   labels:
-    app.kubernetes.io/name: vllm-llama-3.3-70b-awq
+    app.kubernetes.io/name: vllm-llama-3-3-70b-awq
     app.kubernetes.io/component: teacher-alias
     phase: "81b"
 spec:
   type: ClusterIP
   selector:
-    app: vllm-g6e-1gpu
+    app: vllm-llama-3-3-70b-awq
   ports:
     - name: http
       port: 8000
@@ -120,20 +258,44 @@ spec:
 
       containers:
         - name: seed-prompts
-          # python:3.11-slim + boto3 + openai pip install at runtime.
-          # Phase #81b1 candidate: bake into the eval image (which
-          # already has these deps) and drop the runtime install.
-          image: python:3.11-slim
+          # Use the lab's training image — already on Kyverno's
+          # allowlist for the llm namespace AND has Python 3.11 +
+          # boto3 + awscli baked in. Only `openai` SDK needs a
+          # runtime pip install.
+          # (Phase #81b's original draft assumed python:3.11-slim
+          #  but Kyverno's deny-unverified-images policy added
+          #  2026-04-23 blocked that image in critical namespaces.)
+          image: 050693401425.dkr.ecr.us-west-2.amazonaws.com/training:latest
           imagePullPolicy: IfNotPresent
           terminationMessagePolicy: FallbackToLogsOnError
 
           command: ["/bin/sh", "-euxc"]
           args:
             - |
-              # Runtime deps. Adds ~30s to pod startup; one-shot Job
-              # so cold-cache is acceptable. Phase #81b1 will move
-              # to a baked image.
-              pip install --no-cache-dir --quiet boto3 'openai>=1.0,<2.0'
+              # Only openai SDK is missing from the training image.
+              # boto3 + awscli are baked in.
+              pip install --no-cache-dir --quiet 'openai>=1.0,<2.0'
+
+              # Wait for teacher to be ready before firing prompts.
+              # The teacher pod cold-starts in ~10 min (Karpenter spawn
+              # + 70B AWQ load); without this gate, seed_prompts.py
+              # would burn through 16-concurrent retries while the
+              # teacher is still loading. The training image has
+              # `curl` baked in via the axolotl base, so no extra deps.
+              TEACHER_HEALTH_URL="${TEACHER_URL%/v1}/health"
+              echo "=== Waiting for teacher: $TEACHER_HEALTH_URL ==="
+              ATTEMPTS=0
+              until curl --max-time 5 -sf "$TEACHER_HEALTH_URL" >/dev/null 2>&1; do
+                ATTEMPTS=$((ATTEMPTS+1))
+                if [ $ATTEMPTS -gt 90 ]; then
+                  echo "ERROR: teacher not ready after 15min — aborting"
+                  exit 1
+                fi
+                echo "  (attempt $ATTEMPTS) teacher not yet ready, sleeping 10s..."
+                sleep 10
+              done
+              echo "=== Teacher ready (after $ATTEMPTS attempts) ==="
+
               echo "=== Starting teacher-output generation ==="
               python /workspace/script/seed_prompts.py \
                 --prompts-file /workspace/prompts/prompts.jsonl \
@@ -153,7 +315,7 @@ spec:
             # L40S, ~$1.86/hr). Switch the Service's selector for a
             # different teacher.
             - name: TEACHER_URL
-              value: http://vllm-llama-3.3-70b-awq.llm.svc.cluster.local:8000/v1
+              value: http://vllm-llama-3-3-70b-awq.llm.svc.cluster.local:8000/v1
             - name: TEACHER_MODEL
               value: llama-3.3-70b
             # Quiet boto3 + openai SDK chatter
