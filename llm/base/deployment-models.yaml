@@ -70,7 +70,12 @@ spec:
           image: amazon/aws-cli:2.17.0
           env:
             - { name: AWS_REGION, value: us-west-2 }
-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-instruct/ }
+            # Phase #83b (2026-05-01): switched from FP16 weights to
+            # the AWQ-INT4 quantized release (~16GB → ~6GB on disk,
+            # ~75% VRAM reduction in the loaded model). Pre-staged via
+            # llm/operational/awq-stage-llama-3.1-8b.yaml against the
+            # hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4 repo.
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/ }
             - { name: MODEL_PATH, value: /model }
           command: ["/bin/sh", "-euxc"]
           args:
@@ -129,6 +134,20 @@ spec:
             - "llama-3.1-8b"
             - "--tensor-parallel-size"
             - "1"
+            # Phase #83b: AWQ-INT4 quantized weights. vLLM auto-selects
+            # the Marlin kernel on Ada (L4) — INT4 weights × FP16
+            # activations matmul running on Ada's int4 tensor cores.
+            # ~2-3× throughput vs FP16, and weights footprint drops
+            # from ~16GB to ~5GB, freeing ~11GB for KV cache (which is
+            # what enables ~30 → ~90 concurrent decode contexts per
+            # pod under prefix caching from #80a).
+            - "--quantization"
+            - "awq"
+            # Activations stay FP16 even with INT4 weights — this is
+            # the canonical AWQ inference dtype. Keep --dtype half
+            # explicit so vLLM doesn't fall back to bfloat16 on a
+            # different GPU class if Karpenter ever schedules to one
+            # (the gpu-experiments NodePool also includes A100/H100).
             - "--dtype"
             - "half"
             - "--max-model-len"
@@ -234,8 +253,13 @@ spec:
             # pre-loads alpaca on cold-start.
             - { name: VLLM_ALLOW_RUNTIME_LORA_UPDATING, value: "True" }
           resources:
-            requests: { nvidia.com/gpu: "1", cpu: "2", memory: "8Gi" }
-            limits:   { nvidia.com/gpu: "1", cpu: "3", memory: "28Gi" }
+            # Phase #83b: AWQ load uses ~5GB peak host RAM during
+            # from_pretrained (vs ~10-12GB for FP16 deserialization).
+            # Memory limit drop 28Gi → 16Gi gives the Karpenter
+            # bin-packer more headroom to schedule on smaller g6
+            # variants under spot capacity pressure.
+            requests: { nvidia.com/gpu: "1", cpu: "2", memory: "5Gi" }
+            limits:   { nvidia.com/gpu: "1", cpu: "3", memory: "16Gi" }
           startupProbe:  { httpGet: { path: /health, port: http }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 60 }
           readinessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
           livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }

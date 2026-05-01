@@ -1,6 +1,6 @@
 # Phase #83b: vllm-llama-8b → AWQ-INT4 quantization
 
-Status: **Code path documented; awaits operator S3 pre-stage**.
+Status: **APPLIED 2026-05-01**. S3 pre-staged via `llm/operational/awq-stage-llama-3.1-8b.yaml` (Job `awq-stage-llama-3-1-8b` ran in 5m41s, ~5.73GB AWQ weights at `s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/`). Code diff applied to `deployment-models.yaml` in the same commit that flipped this status line.
 
 ## What this delivers
 
