@@ -62,7 +62,7 @@ def build_user_prompt(question: str, contexts: list[str]) -> str:
     )
 
 
-def call_model(url: str, model: str, prompt: str, max_tokens: int = 512) -> str:
+def call_model(url: str, model: str, prompt: str, max_tokens: int) -> str:
     """One /v1/chat/completions call. Returns assistant text."""
     body = {
         "model": model,
@@ -161,6 +161,12 @@ def main() -> int:
     p.add_argument("--judge-model", default="llama-3.1-8b")
     p.add_argument("--embeddings-url", default="http://localhost:18003/v1")
     p.add_argument("--embeddings-model", default="bge-m3")
+    # Phase #81f mitigation: simulate the langgraph-service trivial-fast
+    # max_tokens_cap at the eval level by capping the candidate's
+    # generation budget directly. Lets us iterate on the cap value
+    # without redeploying langgraph-service. Default 512 = no cap.
+    p.add_argument("--baseline-max-tokens", type=int, default=512)
+    p.add_argument("--candidate-max-tokens", type=int, default=512)
     p.add_argument("--output", default="/tmp/ragas-compare-scores.json")
     args = p.parse_args()
 
@@ -177,12 +183,16 @@ def main() -> int:
         print(f"  {e['id']}: prompt_len={len(prompt)} chars")
 
         t0 = time.time()
-        resp_b = call_model(args.baseline_url, args.baseline_model, prompt)
+        resp_b = call_model(
+            args.baseline_url, args.baseline_model, prompt, args.baseline_max_tokens
+        )
         t_b = time.time() - t0
         print(f"    baseline ({args.baseline_model}): {t_b:.1f}s, {len(resp_b)} chars")
 
         t0 = time.time()
-        resp_c = call_model(args.candidate_url, args.candidate_model, prompt)
+        resp_c = call_model(
+            args.candidate_url, args.candidate_model, prompt, args.candidate_max_tokens
+        )
         t_c = time.time() - t0
         print(f"    candidate ({args.candidate_model}): {t_c:.1f}s, {len(resp_c)} chars")
 

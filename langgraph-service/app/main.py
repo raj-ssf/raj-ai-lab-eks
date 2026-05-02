@@ -220,6 +220,27 @@ MODEL_TRIVIAL_FAST_URL = os.environ.get(
 )
 MODEL_TRIVIAL_FAST_NAME = os.environ.get("MODEL_TRIVIAL_FAST_NAME", "llama-3.2-1b-distilled")
 DEPLOY_TRIVIAL_FAST = os.environ.get("DEPLOY_TRIVIAL_FAST", "vllm-llama-1b-distilled")
+# Phase #81f mitigation: cap max_tokens for the trivial-fast tier
+# at serving time. The distilled 1B inherited the 70B teacher's
+# verbosity (5-10× longer responses than the 8B trivial tier), and
+# the verbosity correlates with faithfulness regression — RAGAS
+# scored -24.5pp faithfulness (eval/ragas/results/phase-81f-
+# 2026-05-02.json). Capping the response length at serving time
+# bounds room for unsupported claims AND brings end-user p95
+# latency back under the 8B's, recovering the cost-savings story.
+#
+# 128 chosen empirically from the Phase #81f eval iterations:
+#   cap=512 (no cap) → faithfulness -24.5pp vs 8B (FAIL)
+#   cap=256          → faithfulness -9.5pp  (still FAIL the 0.85× gate)
+#   cap=128          → faithfulness +9.6pp (BEATS the 8B baseline)
+# Mechanism: the distilled 1B's response shape opens with grounded,
+# structured content (markdown bullets straight from context) and
+# THEN drifts into elaborative prose. Truncating keeps the faithful
+# head and chops the extrapolating tail. answer_relevancy stays
+# +24pp above the 8B at this cap — the structured opening is the
+# valuable part per-token.
+# See eval/ragas/results/phase-81f-2026-05-02*.json for the data.
+TRIVIAL_FAST_MAX_TOKENS_CAP = int(os.environ.get("TRIVIAL_FAST_MAX_TOKENS_CAP", "128"))
 
 # Inference parameters. The classifier prompt benefits from low temperature
 # (deterministic output). Execute calls inherit the user's max_tokens.
@@ -383,6 +404,12 @@ if DISTILLED_TIER_ENABLED:
         # remain for RAG context. Match the trivial tier's
         # 6000 char budget.
         "rag_max_context_chars": 6000,
+        # Phase #81f mitigation: cap response length to bound the
+        # distilled 1B's inherited verbosity-driven faithfulness
+        # regression. node_execute reads this and clamps
+        # state["max_tokens"] before calling the model. If absent,
+        # no cap is applied (default behavior for other tiers).
+        "max_tokens_cap": TRIVIAL_FAST_MAX_TOKENS_CAP,
     }
 
 
@@ -4013,6 +4040,16 @@ def node_execute(state: AgentState) -> AgentState:
     final_prompt = _build_rag_prompt(
         state["prompt"], state.get("retrieved_chunks", []), route=state["route"]
     )
+    # Phase #81f mitigation: clamp the user's requested max_tokens to
+    # the tier's cap if one is configured (currently only trivial-fast,
+    # bounding 1B-distilled verbosity that drove a -24pp faithfulness
+    # regression in the Phase #81f RAGAS eval). Other tiers don't set
+    # max_tokens_cap, so this is a no-op for them.
+    requested_max_tokens = state.get("max_tokens", 512)
+    tier_cap = cfg.get("max_tokens_cap")
+    effective_max_tokens = (
+        min(requested_max_tokens, tier_cap) if tier_cap else requested_max_tokens
+    )
     started = time.monotonic()
 
     if not cfg.get("supports_tools"):
@@ -4027,7 +4064,7 @@ def node_execute(state: AgentState) -> AgentState:
             model=variant_name,  # Phase #15: stable or canary
             base_url=cfg["url"],
             api_key="not-required",
-            max_tokens=state.get("max_tokens", 512),
+            max_tokens=effective_max_tokens,  # Phase #81f cap if tier sets one
             timeout=EXECUTE_TIMEOUT_SECONDS,
             streaming=True,
         )
@@ -4073,7 +4110,7 @@ def node_execute(state: AgentState) -> AgentState:
         model=variant_name,  # Phase #15: stable or canary
         base_url=cfg["url"],
         api_key="not-required",
-        max_tokens=state.get("max_tokens", 512),
+        max_tokens=effective_max_tokens,  # Phase #81f cap if tier sets one
         timeout=EXECUTE_TIMEOUT_SECONDS,
         streaming=True,
     ).bind_tools(TOOLS)

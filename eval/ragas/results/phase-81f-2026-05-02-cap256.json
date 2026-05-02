@@ -1,0 +1,126 @@
+{
+  "baseline": {
+    "url": "http://localhost:18002",
+    "model": "llama-3.1-8b",
+    "aggregate": {
+      "faithfulness": 0.72,
+      "answer_relevancy": 0.5777465420269147
+    },
+    "per_entry": [
+      {
+        "id": "pod-identity-vs-irsa",
+        "faithfulness": 1.0,
+        "answer_relevancy": 0.9274548711685436
+      },
+      {
+        "id": "karpenter-nodepool-purpose",
+        "faithfulness": 0.6,
+        "answer_relevancy": 0.5596466098018679
+      },
+      {
+        "id": "vllm-tool-call-parser",
+        "faithfulness": 0.5,
+        "answer_relevancy": 0.0
+      },
+      {
+        "id": "lora-tool-call-degradation",
+        "faithfulness": 0.5,
+        "answer_relevancy": 0.9384762636856987
+      },
+      {
+        "id": "graph-reasoning-loop-cap",
+        "faithfulness": 1.0,
+        "answer_relevancy": 0.46315496547846347
+      }
+    ],
+    "responses": [
+      {
+        "id": "pod-identity-vs-irsa",
+        "response": "The lab uses EKS Pod Identity exclusively for all workload IAM access. \n\nThe difference between EKS Pod Identity and IRSA is not explicitly stated in the given context.",
+        "latency_s": 2.3868207931518555
+      },
+      {
+        "id": "karpenter-nodepool-purpose",
+        "response": "The lab defines two GPU NodePools, gpu and gpu-experiments, to split production serving from experimental Jobs.",
+        "latency_s": 1.3227016925811768
+      },
+      {
+        "id": "vllm-tool-call-parser",
+        "response": "I'm unable to determine the answer from the provided context.",
+        "latency_s": 0.7679412364959717
+      },
+      {
+        "id": "lora-tool-call-degradation",
+        "response": "The context does not explicitly state why supports_tools is set to False for the tuned-lora tier.",
+        "latency_s": 1.1732261180877686
+      },
+      {
+        "id": "graph-reasoning-loop-cap",
+        "response": "MAX_REASONING_CYCLES caps the number of full retrieve\u2192execute\u2192reflect passes.",
+        "latency_s": 1.0638489723205566
+      }
+    ]
+  },
+  "candidate": {
+    "url": "http://localhost:18001",
+    "model": "llama-3.2-1b-distilled",
+    "aggregate": {
+      "faithfulness": 0.625,
+      "answer_relevancy": 0.8872396025586751
+    },
+    "per_entry": [
+      {
+        "id": "pod-identity-vs-irsa",
+        "faithfulness": NaN,
+        "answer_relevancy": 0.6568034515118842
+      },
+      {
+        "id": "karpenter-nodepool-purpose",
+        "faithfulness": NaN,
+        "answer_relevancy": 0.9174275557374657
+      },
+      {
+        "id": "vllm-tool-call-parser",
+        "faithfulness": 0.75,
+        "answer_relevancy": 0.964290976389071
+      },
+      {
+        "id": "lora-tool-call-degradation",
+        "faithfulness": 0.5,
+        "answer_relevancy": 0.9897245908848168
+      },
+      {
+        "id": "graph-reasoning-loop-cap",
+        "faithfulness": NaN,
+        "answer_relevancy": 0.9079514382701376
+      }
+    ],
+    "responses": [
+      {
+        "id": "pod-identity-vs-irsa",
+        "response": " \nIn AWS, there are two main IAM (Identity and Access Management) mechanisms for managing access to AWS services:\n\n1. **AWS Identity and Access Management (IAM)**: This is the traditional mechanism for managing access to AWS services, using user accounts and passwords. IAM is used for managing access to AWS services, including EKS.\n2. **AWS Identity and Access Management for Kubernetes (IRSA)**: This is a new IAM mechanism for managing access to Kubernetes services, including EKS. IRSA uses OIDC (OpenID Connect) and STS (Secure Token Service) for authentication and authorization.\n\nIn the context of this lab, **Pod Identity** is the new EKS IAM mechanism, which is used exclusively for managing access to EKS services. This includes managing access to EKS pods, clusters, and services.\n\nIn contrast, **IRSA** is the traditional IAM mechanism for managing access to AWS services, including EKS. However, in this lab, **Pod Identity** is used exclusively for managing access to EKS services, and IRSA is not used at all.\n\nSo, to answer your question, **Pod Identity** is the IAM mechanism used in this lab for managing access to EKS services, including EKS pods, clusters, and services",
+        "latency_s": 7.503947019577026
+      },
+      {
+        "id": "karpenter-nodepool-purpose",
+        "response": " \nThe lab defines two GPU NodePools because it has two distinct use cases for GPU resources:\n\n1. **Production serving**: This is where the GPU resources are used to serve web applications, images, and other data-intensive tasks. The production GPU NodePool is used to handle these tasks.\n2. **Experimental jobs**: This is where the GPU resources are used for experiments, training, and other tasks that don't require the full power of the GPU. The gpu-experiments NodePool is used to handle these jobs, which may not be as demanding on the GPU resources.\n\nBy defining these two NodePools, the lab ensures that the GPU resources are allocated and managed appropriately, and that the production GPU NodePool is used for serving tasks, while the gpu-experiments NodePool is used for experiments and other tasks that don't require the full GPU power.",
+        "latency_s": 4.770991802215576
+      },
+      {
+        "id": "vllm-tool-call-parser",
+        "response": " \nThe --tool-call-parser llama3_json flag is used by vllm-llama-8b to parse the Llama 3.1 native tool-call grammar, which is tuned specifically for the llama3_json parser. Without this flag, vllm-llama-8b would not be able to parse the Llama 3.1 tool-call grammar correctly.",
+        "latency_s": 2.2132060527801514
+      },
+      {
+        "id": "lora-tool-call-degradation",
+        "response": " \nThe reason supports_tools is set to False for the tuned-LORA tier in this lab is because the model is not being trained with the support for tool-call examples. Without these examples, the model is not able to learn the correct tool-call grammar, and the output is instead emitted as Alpaca-style JSON-in-text.",
+        "latency_s": 1.8848021030426025
+      },
+      {
+        "id": "graph-reasoning-loop-cap",
+        "response": " \nThe graph-level reasoning loop in langgraph-service can run forever if the following conditions are met:\n\n1. **MAX_REASONING_CYCLES** is set to a value that is too high.\n2. The **conditional edge function** is configured to re-check the cap independently.\n3. Every reflect error path defaults to **needs_more_context=False**.\n\nIn other words, if the graph is large enough, and the reasoning loop is enabled, and the conditional edge function is not configured to take into account the previous reasoning, then the loop can continue to run indefinitely.",
+        "latency_s": 3.1836049556732178
+      }
+    ]
+  }
+}
