@@ -1,0 +1,198 @@
+# GPU MODEL SCALING — single source of truth.
+#
+# Edit a `replicas:` number below + push to scale a GPU model up or down.
+# ArgoCD's webhook synces in ~5 sec; the new ReplicaSet rolls within
+# the cold-start budget for that model (1B/8B: ~5 min; 70B AWQ: ~10 min;
+# 405B AWQ: ~20 min).
+#
+# WHY THIS FILE EXISTS:
+#   The actual Deployment specs live in deployment-models.yaml +
+#   deployment-variants.yaml (alongside their full args / volumes /
+#   probes). But scaling is the lever you reach for most often, so
+#   we collect ALL replica counts in one strategic-merge patch
+#   here. Kustomize merges this AFTER the source manifests, so the
+#   value below is the authoritative replicas count.
+#
+# 2026-05-02 (Phase #81e Option-A): moved scaling fully to gitops for
+# every GPU Deployment EXCEPT vllm-llama-8b (which KEDA owns via the
+# scaledobject-vllm-llama-8b.yaml ScaledObject; gitops-set replicas
+# would fight KEDA). All other tiers are now operator-controlled
+# from this file alone — the RAGAS workflow no longer kubectl-scales,
+# and langgraph-service's ensure_warm no longer issues kubectl-scale
+# (it only waits for the gitops-managed pod to become Ready).
+#
+# COST QUICK-REFERENCE for choosing replicas (g6.xlarge L4 = $0.80/hr,
+# g6e.xlarge L40S = $1.86/hr, g6.12xlarge 4×L4 = $4.60/hr,
+# p4d.24xlarge 8×A100 = $32.77/hr):
+#   8B  on g6.xlarge       (always-warm)  → ~$580/mo
+#   1B  on g6.xlarge        (always-warm) → ~$580/mo
+#   70B on g6.12xlarge     (always-warm)  → ~$3,300/mo
+#   405B on p4d.24xlarge   (always-warm)  → ~$23,500/mo  ← BE CAREFUL
+#
+# OPERATOR HINT: when bringing up a model for an eval / demo, also
+# check what's already running so you know your cost burn:
+#   kubectl -n llm get deploy -o custom-columns=\
+#     NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas
+
+# ============================================================
+# ALWAYS-WARM
+# ============================================================
+
+---
+# vllm-llama-8b: KEDA-managed (Phase #80d ScaledObject). The replicas
+# value below is a baseline — KEDA's cron + Prometheus triggers may
+# scale it 0..N independently. ignoreDifferences in the vllm ArgoCD
+# Application protects KEDA's writes from gitops drift correction;
+# DO NOT remove that ignoreDifferences entry.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-8b
+spec:
+  replicas: 1   # KEDA baseline; KEDA may bump to N
+
+---
+# vllm-llama-1b-distilled: trivial-fast canary tier (Phase #81e).
+# 5% of trivial-tier traffic routes here per langgraph-service's
+# TRIVIAL_FAST_FRACTION. Always-warm to avoid 503s on canary requests.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-1b-distilled
+spec:
+  replicas: 1
+
+# ============================================================
+# JIT — scale up before use, scale down after
+# ============================================================
+
+---
+# vllm-bge-m3: bge-m3 dense+sparse retriever for ingestion-service +
+# rag-service. Used by RAGAS eval and live ingestion. Bring up
+# manually (replicas: 1) before kicking off an eval or before users
+# start uploading docs to chat-ui; scale down after.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-bge-m3
+spec:
+  replicas: 0
+
+---
+# vllm-deepseek-r1-70b: reasoning-tier model. Cold-start ~10 min on
+# g6.12xlarge ($4.60/hr). Operator typically warms during evening /
+# weekend deep-work sessions; default cold to keep daily idle ~$0.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-deepseek-r1-70b
+spec:
+  replicas: 0
+
+---
+# vllm: the canonical 70B AWQ Deployment (tp=4 g6e.12xlarge ~$11/hr).
+# Used as the "hard" tier in langgraph-service routing.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+spec:
+  replicas: 0
+
+# ============================================================
+# COLD by default — bring up only for specific demos
+# ============================================================
+
+---
+# vllm-mixtral-8x7b: MoE demo on g6e.xlarge L40S 48GB.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-mixtral-8x7b
+spec:
+  replicas: 0
+
+---
+# vllm-llama-vision-11b: multimodal demo on g6e.xlarge.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-vision-11b
+spec:
+  replicas: 0
+
+---
+# vllm-llama-405b: SOTA flagship on p4d.24xlarge ($32.77/hr — be
+# CERTAIN before scaling this up). Cold-start ~20 min.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-405b
+spec:
+  replicas: 0
+
+---
+# vllm-llama-guard-3-8b: content safety classifier (Phase #4).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-guard-3-8b
+spec:
+  replicas: 0
+
+---
+# vllm-bge-reranker: TEI cross-encoder reranker for hybrid retrieval.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-bge-reranker
+spec:
+  replicas: 0
+
+# ============================================================
+# HARDWARE-COMPARISON TEST VARIANTS — bring up one at a time
+# ============================================================
+# These all serve Llama-3.3-70B AWQ but on different GPU classes.
+# Used for cost/throughput benchmarking. PVC is RWO, so scaling
+# more than one to >=1 simultaneously will leave the second
+# Pending on FailedAttachVolume.
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-g4dn-4gpu       # 4×T4  on g4dn.12xlarge ~$3.91/hr
+spec:
+  replicas: 0
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-g6e-1gpu        # 1×L40S on g6e.xlarge ~$1.86/hr
+spec:
+  replicas: 0
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-g6e-4gpu        # 4×L40S on g6e.12xlarge ~$11/hr
+spec:
+  replicas: 0
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-p4d-8gpu        # 8×A100 on p4d.24xlarge ~$32.77/hr
+spec:
+  replicas: 0
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-p5-8gpu         # 8×H100 on p5.48xlarge ~$98/hr  ← yikes
+spec:
+  replicas: 0

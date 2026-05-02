@@ -95,18 +95,44 @@ jobs:
             --name "${{ vars.EKS_CLUSTER_NAME }}" \
             --region us-west-2
 
-      # Scale GPU-backed services up if they're at 0 replicas.
-      # Idempotent: if a deployment is already at 1+, this is a no-op.
-      # `wait --for=condition=available` blocks until at least one Ready
-      # pod, with the long timeout to cover Karpenter cold provisioning.
-      - name: Scale up GPU services
+      # Phase #81e Option-A (2026-05-02): GPU scaling is now gitops-only
+      # via raj-ai-lab-eks/llm/base/scaling.yaml. This workflow no longer
+      # `kubectl scale`s — instead it FAILS FAST if any required GPU
+      # Deployment isn't already at desired>=1 with a Ready replica when
+      # the eval starts. The expected operator workflow:
+      #   1. Edit scaling.yaml: set vllm-bge-m3 + vllm-deepseek-r1-70b
+      #      replicas to 1, push.
+      #   2. Wait for ArgoCD sync (~5s via webhook) + cold-start
+      #      (~5-10 min for 70B on g6.12xlarge).
+      #   3. Trigger this workflow (or merge a PR that touches the
+      #      eval-relevant paths).
+      #   4. After eval, edit scaling.yaml back to replicas=0 and push.
+      # Failing fast (~30s) instead of waiting JOB_WAIT_TIMEOUT (60 min)
+      # makes the "I forgot to warm" failure mode obvious.
+      - name: Verify required GPU services are warm
         run: |
+          MISSING=""
           for d in $GPU_DEPLOYMENTS; do
-            kubectl -n "$NAMESPACE" scale deploy/"$d" --replicas=1
+            DESIRED=$(kubectl -n "$NAMESPACE" get deploy "$d" \
+              -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "")
+            READY=$(kubectl -n "$NAMESPACE" get deploy "$d" \
+              -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            READY=${READY:-0}
+            if [ "${DESIRED:-0}" -lt 1 ] || [ "$READY" -lt 1 ]; then
+              MISSING="$MISSING $d(desired=${DESIRED:-0},ready=$READY)"
+            fi
           done
-          for d in $GPU_DEPLOYMENTS; do
-            kubectl -n "$NAMESPACE" rollout status deploy/"$d" --timeout=900s
-          done
+          if [ -n "$MISSING" ]; then
+            cat <<EOF >&2
+          ::error::Required GPU services are not warm:$MISSING
+          Edit raj-ai-lab-eks/llm/base/scaling.yaml so each of the
+          following has 'replicas: 1', then push and wait for ArgoCD
+          to sync + the pod(s) to be Ready before re-running:
+            $GPU_DEPLOYMENTS
+          EOF
+            exit 1
+          fi
+          echo "All required GPU services warm: $GPU_DEPLOYMENTS"
 
       # Image tag selection: PR/push runs use the freshly built sha
       # tag, but to keep the workflow simple, we use :latest. The
@@ -250,16 +276,16 @@ jobs:
           gh pr comment "${{ github.event.pull_request.number }}" \
             --body-file /tmp/comment.md
 
-      # Always scale GPU services back to 0 — same pattern as the
-      # interactive smoke. `if: always()` ensures this runs even when
-      # earlier steps fail; we never want a workflow failure to leave
-      # GPU pods running and burning credit.
-      - name: Scale down GPU services
-        if: always()
-        run: |
-          for d in $GPU_DEPLOYMENTS; do
-            kubectl -n "$NAMESPACE" scale deploy/"$d" --replicas=0 || true
-          done
+      # Phase #81e Option-A (2026-05-02): scale-down is now the
+      # operator's responsibility — edit raj-ai-lab-eks/llm/base/
+      # scaling.yaml to set vllm-bge-m3 + vllm-deepseek-r1-70b
+      # replicas back to 0 and push. We removed the workflow's
+      # `kubectl scale --replicas=0` because it would fight the
+      # gitops state ArgoCD enforces from scaling.yaml (no
+      # ignoreDifferences entry exists for these two anymore).
+      # The `Verify required GPU services are warm` step at the
+      # top of the job catches the symmetric "forgot to scale up"
+      # mistake.
 
       # If the runner exit code indicated a regression (the wait step
       # set job_failed=true), fail the whole workflow now. Done at

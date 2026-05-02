@@ -73,3 +73,13 @@ resources:
   # 400s without an explicit template via --chat-template arg.
   # ConfigMap is mounted into the Deployment as a Jinja file.
   - chat-template-llama3.yaml
+
+# Phase #81e Option-A (2026-05-02): single source of truth for GPU
+# model replica counts. Strategic-merge patch overrides each
+# Deployment's `replicas:` from deployment-models.yaml +
+# deployment-variants.yaml, so the operator only needs to edit ONE
+# file (scaling.yaml) to scale anything up or down. Kustomize
+# applies these patches AFTER the source manifests are merged in,
+# so the values in scaling.yaml are authoritative.
+patches:
+  - path: scaling.yaml

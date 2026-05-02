@@ -489,33 +489,25 @@ def _select_variant(route: str) -> tuple[str, str]:
 # Loaded once at import time. Reads the projected serviceaccount token + CA
 # cert from /var/run/secrets/kubernetes.io/serviceaccount/. The
 # langgraph-service ServiceAccount is bound (via the Role+RoleBinding in
-# raj-ai-lab-eks/langgraph-service/base/serviceaccount.yaml) to scale
-# Deployments in the llm namespace — that's the only privilege we need.
+# raj-ai-lab-eks/langgraph-service/base/serviceaccount.yaml) to READ
+# Deployments + Pods in the llm namespace.
+#
+# Phase #81e Option-A (2026-05-02): the Role's `deployments/scale` patch
+# permission was dropped together with `_scale_deployment` below. Scaling
+# is fully gitops-owned now via raj-ai-lab-eks/llm/base/scaling.yaml;
+# ensure_warm only READS (replicas, status, pod readiness) and waits.
 try:
     k8s_config.load_incluster_config()
     K8S_APPS = k8s_client.AppsV1Api()
     K8S_CORE = k8s_client.CoreV1Api()
     log.info("kubernetes in-cluster config loaded")
 except k8s_config.ConfigException as e:
-    # Allow local dev / unit tests without an in-cluster context. The JIT
-    # scale path will raise at first use rather than at import; healthz
-    # and /invoke without scaling-required routes still work.
+    # Allow local dev / unit tests without an in-cluster context. The
+    # ensure_warm path will raise at first use rather than at import;
+    # healthz still works.
     log.warning("kubernetes in-cluster config unavailable: %s", e)
     K8S_APPS = None  # type: ignore[assignment]
     K8S_CORE = None  # type: ignore[assignment]
-
-
-def _scale_deployment(name: str, replicas: int) -> None:
-    """Patch /scale on a Deployment in the llm namespace.
-
-    Uses the scale subresource (not full deployment patch) — the SA's Role
-    only grants `apps/deployments/scale`, so any attempt to mutate other
-    fields would 403.
-    """
-    if K8S_APPS is None:
-        raise RuntimeError("kubernetes client not initialized")
-    body = {"spec": {"replicas": replicas}}
-    K8S_APPS.patch_namespaced_deployment_scale(name=name, namespace=LLM_NAMESPACE, body=body)
 
 
 def _read_replicas(name: str) -> int:
@@ -2679,37 +2671,32 @@ def node_retrieve(state: AgentState) -> AgentState:
 
 
 def node_ensure_warm(state: AgentState) -> AgentState:
-    """JIT-scale the chosen variant if it's cold, then wait for Ready.
+    """Wait for the chosen variant to be Ready. Does NOT scale.
 
-    Steady-state behavior:
-      - trivial route (always_on=True): no-op, return cold_start=False
-      - heavier routes: read current replicas. If >=1, no-op (variant is
-        already warm). If 0, patch scale to 1, wait for Ready, return
-        cold_start=True with elapsed seconds.
+    Phase #81e Option-A (2026-05-02): scaling moved to gitops
+    (raj-ai-lab-eks/llm/base/scaling.yaml). This node previously
+    `_scale_deployment(replicas=1)`'d a cold variant on demand; that
+    write would now fight ArgoCD's enforcement of scaling.yaml (no
+    ignoreDifferences entry exists for these Deployments anymore).
 
-    On scale-up failure (deployment missing, RBAC denied) or wait-for-ready
-    timeout (Karpenter couldn't provision GPU, image pull stuck, etc.),
+    Three steady states the node distinguishes:
+      (1) available >= 1                 → variant is warm + serving. Fast skip.
+      (2) spec >= 1 but available < 1    → cold-start in progress (gitops
+          set replicas=1, the pod is still in Init / image-pull /
+          model-load). Wait for Ready.
+      (3) spec == 0                      → operator has NOT scaled this
+          tier via gitops yet. Raise immediately with an actionable
+          message — the agent cannot self-rescue.
+
+    The previous version pre-Option-A treated state (3) as "scale + wait."
+    Now it's a hard stop: the user must edit scaling.yaml + push.
+
+    On state (2) wait timeout (Karpenter slow, image pull stuck, etc.),
     we raise — LangGraph propagates the exception and the FastAPI layer
     converts it to a 502 with the underlying message.
     """
     cfg = ROUTE_REGISTRY[state["route"]]
     deploy = cfg["deployment"]
-    # Phase #53: dropped the early-return for cfg["always_on"] (was
-    # at this exact spot). The flag was a static config promise ("we
-    # intend to keep this tier hot") that the cluster reality doesn't
-    # honor: Karpenter's WhenEmpty consolidation scales the GPU node
-    # down whenever the deployment is at replicas=0 OR when no GPU
-    # workload is using the node, which can leave the trivial tier
-    # cold despite always_on=True. Skipping ensure_warm in that state
-    # caused user-visible "no healthy upstream" 503s (incident
-    # 2026-04-29 — chat-ui canary error then plain unhealthy upstream).
-    #
-    # The fix: every tier — including always_on — runs the same
-    # check-and-wait flow. The available>=1 fast-path below handles
-    # the warm case in ~50ms (one kubectl read), so the cost when the
-    # tier IS actually warm is small. always_on is now an annotation
-    # of intent (used by docs / future scheduled-warming logic in
-    # Phase #54), not a runtime short-circuit.
     log.info("ensure_warm checking", extra={"deployment": deploy, "route": state["route"]})
 
     started = time.monotonic()
@@ -2719,16 +2706,6 @@ def node_ensure_warm(state: AgentState) -> AgentState:
     except ApiException as e:
         raise RuntimeError(f"failed to read scale of {LLM_NAMESPACE}/{deploy}: {e.reason}") from e
 
-    # Three states to handle:
-    #   (1) available >= 1                 → variant is warm + serving. Skip.
-    #   (2) spec >= 1 but available < 1    → cold-start in progress (pod
-    #       exists but still in Init / model-load). Don't re-scale; wait.
-    #   (3) spec == 0                      → not scaled yet. Scale, then wait.
-    #
-    # The previous version checked only spec.replicas and returned
-    # immediately on (2). That caused execute to fire against a Service
-    # with no Ready endpoints → 'no healthy upstream' → 500.
-
     if available >= 1:
         log.info(
             "ensure_warm: variant warm + serving, skipping wait",
@@ -2737,16 +2714,20 @@ def node_ensure_warm(state: AgentState) -> AgentState:
         return {"cold_start": False, "warm_wait_seconds": 0.0}
 
     if spec_replicas == 0:
-        log.info("ensure_warm: scaling up cold variant", extra={"deployment": deploy})
-        try:
-            _scale_deployment(deploy, replicas=1)
-        except ApiException as e:
-            raise RuntimeError(f"failed to scale {LLM_NAMESPACE}/{deploy}: {e.reason}") from e
-    else:
-        log.info(
-            "ensure_warm: variant cold-starting, waiting for ready",
-            extra={"deployment": deploy, "spec_replicas": spec_replicas, "available_replicas": available},
+        # State (3): tier is gitops-cold. Caller must scale via the
+        # scaling.yaml lever — we will not patch /scale ourselves.
+        raise RuntimeError(
+            f"{LLM_NAMESPACE}/{deploy} is at replicas=0 (gitops-cold). "
+            f"To warm it, edit raj-ai-lab-eks/llm/base/scaling.yaml so "
+            f"the {deploy} Deployment has 'replicas: 1', commit, push, "
+            f"wait for ArgoCD sync (~5s) + cold-start, then retry."
         )
+
+    # State (2): cold-start in progress. Wait for the Ready pod.
+    log.info(
+        "ensure_warm: variant cold-starting, waiting for ready",
+        extra={"deployment": deploy, "spec_replicas": spec_replicas, "available_replicas": available},
+    )
 
     # The variant Deployments label their pods with `app: <deployment-name>`
     # — match deployment-models.yaml in the app repo. If that scheme ever
