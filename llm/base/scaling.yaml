@@ -76,7 +76,7 @@ kind: Deployment
 metadata:
   name: vllm-bge-m3
 spec:
-  replicas: 0
+  replicas: 1
 
 ---
 # vllm-deepseek-r1-70b: reasoning-tier model. Cold-start ~10 min on
