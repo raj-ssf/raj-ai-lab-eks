@@ -124,36 +124,6 @@ spec:
             limits:   { cpu: "1",    memory: "512Mi" }
           volumeMounts:
             - { name: adapter-cache, mountPath: /adapters/alpaca-lora }
-        # Phase #83c: pull the Llama 3.2 1B base weights for use as the
-        # speculative-decoding draft model. vLLM loads the draft inside
-        # the target's process, so the 1B weights must be on the 8B
-        # pod's filesystem (mounted via the dedicated draft-cache PVC).
-        # Source bucket is the same one the vllm-llama-1b-distilled
-        # Deployment uses; we DON'T pull the distilled LoRA here
-        # because vLLM speculative decoding doesn't accept LoRA on the
-        # draft (target only) — using the stock base 1B keeps the
-        # initial wiring simple. Future Phase: merge the distilled
-        # LoRA into base 1B with peft.merge_and_unload, stage the
-        # merged weights to model-weights/llama-3.2-1b-distilled-merged/
-        # and switch S3_URI here to point at it.
-        - name: draft-sync
-          image: amazon/aws-cli:2.17.0
-          env:
-            - { name: AWS_REGION, value: us-west-2 }
-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/ }
-            - { name: DRAFT_PATH, value: /draft-model }
-          command: ["/bin/sh", "-euxc"]
-          args:
-            - |
-              aws configure set default.s3.max_concurrent_requests 32
-              aws configure set default.s3.multipart_chunksize 64MB
-              aws s3 sync "$S3_URI" "$DRAFT_PATH" --no-progress
-              ls -la "$DRAFT_PATH"
-          resources:
-            requests: { cpu: "500m", memory: "512Mi" }
-            limits:   { cpu: "1",    memory: "1Gi" }
-          volumeMounts:
-            - { name: draft-cache, mountPath: /draft-model }
       containers:
         - name: vllm
           image: vllm/vllm-openai:placeholder
@@ -193,23 +163,14 @@ spec:
             - "half"
             - "--max-model-len"
             - "8192"
-            # Phase #80a: 0.85 → 0.92 maximizes the KV cache pool with
-            # prefix caching for higher cross-request hit rate.
-            # Phase #83c (2026-05-02): 0.92 → 0.85 to leave headroom
-            # for the speculative-decode draft model (~2.5 GB FP16 1B
-            # weights loaded into the same vLLM process — see
-            # `--speculative-model` below). Memory math on L4 24 GB:
-            #   8B AWQ-INT4 weights:  ~5.4 GB
-            #   1B FP16 draft weights: ~2.5 GB
-            #   Activations + scratch: ~2.0 GB
-            #   ── leaves ~10.5 GB for KV cache (vs ~13.7 GB pre-#83c)
-            # That's a ~24% KV pool reduction → ~50 in-flight requests
-            # per pod (vs the Phase #83b-measured ~60). Acceptable
-            # tradeoff for the spec-decode throughput gain when
-            # acceptance rate is meaningful (>40%); revisit if
-            # post-rollout load tests show worse p99 than baseline.
+            # Phase #80a: bumped 0.85 → 0.92. With prefix caching (below)
+            # enabled, more memory in the KV cache pool = more prefixes
+            # retained = higher hit rate. Llama-3.1-8B FP16 is ~16GB
+            # weights on the L4's 24GB. At 0.85 ≈ 4.4GB KV; at 0.92
+            # ≈ 6.1GB. Same stability margin (vLLM never allocates
+            # 100% of its budget).
             - "--gpu-memory-utilization"
-            - "0.85"
+            - "0.92"
             # Phase #80a: enable prefix caching. Shares KV cache across
             # requests with identical prefixes. langgraph-service sends
             # the same system prompt + (often) the same plan/RAG
@@ -290,34 +251,6 @@ spec:
             - "--enable-auto-tool-choice"
             - "--tool-call-parser"
             - "llama3_json"
-            # Phase #83c (2026-05-02): speculative decoding. The 1B base
-            # model loaded from /draft-model (synced by draft-sync init
-            # container) drafts N tokens; the 8B target verifies them
-            # in a single forward pass. Wins:
-            #   - Drafting is cheap (1B vs 8B, ~3x cheaper FLOPs/token)
-            #   - Verification is one batched forward, not N sequential
-            #   - On accepted drafts, effective throughput rises 1.5-3x
-            # Caveats:
-            #   - First-token latency is unchanged (still target prefill)
-            #   - Acceptance rate is distribution-dependent: stock 1B
-            #     base + 8B Instruct target are NOT perfectly aligned
-            #     (different post-training); expect ~30-50% accept,
-            #     not 70%+. A merged distilled-1B draft would likely
-            #     do better — punted to a follow-up.
-            #   - Tool-call paths (--enable-auto-tool-choice above) use
-            #     vLLM's structured-output mode, which bypasses spec
-            #     decoding. So this only speeds up plain chat, not
-            #     tool-call responses.
-            #   - Prefix caching + chunked prefill remain compatible
-            #     in vLLM 0.7.2 with spec decoding.
-            # Tuning lever: --num-speculative-tokens. Higher = more
-            # speedup when accept rate is high, more wasted compute
-            # when low. 5 is the typical sweet spot per vLLM docs;
-            # we'll measure and iterate.
-            - "--speculative-model"
-            - "/draft-model"
-            - "--num-speculative-tokens"
-            - "5"
           ports:
             - { name: http, containerPort: 8000 }
           env:
@@ -344,7 +277,6 @@ spec:
           volumeMounts:
             - { name: model-cache,   mountPath: /model,             readOnly: true }
             - { name: adapter-cache, mountPath: /adapters/alpaca-lora, readOnly: true }
-            - { name: draft-cache,   mountPath: /draft-model,         readOnly: true }
             - { name: shm,           mountPath: /dev/shm }
       volumes:
         - name: model-cache
@@ -356,13 +288,6 @@ spec:
         # the GBs, switch to a shared RO PVC across the fleet.
         - name: adapter-cache
           emptyDir: { sizeLimit: 1Gi }
-        # Phase #83c: draft model cache for speculative decoding. PVC
-        # rather than emptyDir because the 2.5 GB sync would otherwise
-        # repeat on every pod restart (vs ~0 on a warmed PVC). Matches
-        # the model-cache pattern; PVC defined in pvcs-models.yaml.
-        - name: draft-cache
-          persistentVolumeClaim:
-            claimName: vllm-cache-llama-3.2-1b-draft
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 2Gi }
 

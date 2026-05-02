@@ -46,36 +46,6 @@ spec:
       storage: 30Gi
 
 ---
-# Phase #83c: Llama 3.2 1B base weights as a SPECULATIVE-DECODING DRAFT
-# for vllm-llama-8b. vLLM loads the draft inside the same process as
-# the target — they can't be separately-deployed pods — so the 8B pod
-# needs the 1B weights on a PVC it can mount alongside its own
-# vllm-cache-llama-8b cache. ~2.5 GB on disk; 10 GiB leaves slack for
-# `aws s3 sync` transient staging.
-#
-# Source: s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/ (already
-# pre-staged by llm/operational/base-stage-llama-3.2-1b.yaml — same
-# bucket the vllm-llama-1b-distilled Deployment pulls from).
-#
-# Why a SEPARATE PVC vs reusing vllm-cache-llama-1b-distilled: that
-# PVC is RWO and bound to the 1B-distilled pod. We can't multi-mount
-# RWO across the 8B pod and the 1B-distilled pod simultaneously, so
-# we duplicate the 2.5 GB at the cost of $0.80/mo.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: vllm-cache-llama-3.2-1b-draft
-  labels:
-    app: vllm
-    model: llama-3.2-1b-draft
-    purpose: speculative-decoding-draft
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: 10Gi
-
----
 # Mixtral 8x7B Instruct AWQ — 28 GB on disk (MoE-quantized), 50 GiB
 # PVC. Larger margin for Mixtral's multi-shard safetensors layout.
 apiVersion: v1
