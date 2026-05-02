@@ -1210,17 +1210,20 @@ metadata:
     app: vllm-llama-1b-distilled
     vllm-model: llama-3.2-1b
 spec:
-  # Phase #81d (operator-controlled scaling): replicas=0 by default.
-  # Bring up via `kubectl -n llm scale deploy/vllm-llama-1b-distilled
-  # --replicas=1` for a demo session, scale back to 0 after to stop
-  # GPU billing (~$0.80/hr g6.xlarge L4). Same pattern as the other
-  # JIT-scaled vllm-* Deployments in this file.
+  # Phase #81e (gitops-controlled scaling): replicas=1 because this
+  # is the trivial-fast canary tier. langgraph-service routes 5% of
+  # trivial-tier traffic here (TRIVIAL_FAST_FRACTION=0.05); the pod
+  # needs to be always-warm to avoid 503s on canary requests. Cost:
+  # ~$0.80/hr always-on g6.xlarge L4. Toggle this via gitops commit:
+  # set replicas to 0 to disable the canary, push, ArgoCD syncs.
   #
-  # PREREQUISITE for kubectl scale to stick: this Deployment's
-  # /spec/replicas needs to be in the vllm ArgoCD Application's
-  # ignoreDifferences list (raj-ai-lab-eks-infra/argocd-apps.tf).
-  # Until that terraform change is applied, ArgoCD selfHeal will
-  # revert kubectl scale within ~3 sec.
+  # 2026-05-02: moved from operator-controlled (Phase #81d kubectl
+  # scale + ignoreDifferences) to gitops-controlled. The matching
+  # change in raj-ai-lab-eks-infra/argocd-apps.tf removes
+  # vllm-llama-1b-distilled from /spec/replicas ignoreDifferences,
+  # so ArgoCD now enforces this manifest's replicas value. Future
+  # scale events: edit this number, commit, push, wait ~3 min for
+  # ArgoCD selfHeal sync.
   #
   # Pre-reqs already satisfied (Phase #81b/c/d-prereq):
   #   - base weights at s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/
@@ -1228,7 +1231,7 @@ spec:
   #   - LoRA adapter at s3://raj-ai-lab-eks-training/adapters/
   #     llama-3.2-1b-distilled/ (trained 2026-05-01 23:26 PT,
   #     45 MB, train loss 0.74 / eval loss 0.95)
-  replicas: 0
+  replicas: 1
   strategy:
     type: Recreate
   selector:
