@@ -329,6 +329,30 @@ spec:
             - name: PII_REDACT_INPUT_ENABLED
               value: "false"
 
+            # --- Phase #73b: Presidio-backed PII detection ------------
+            # PII_BACKEND selects the detector:
+            #   regex     hand-rolled patterns from Phase #11 (default)
+            #   presidio  Presidio analyzer service in `presidio` ns
+            #             (NER + pattern recognizers, more types)
+            # Flip to "presidio" after smoke-testing the analyzer is
+            # reachable and AuthZ-allowed (Istio AuthorizationPolicy
+            # `allow-apps-to-presidio` already includes our SA).
+            #
+            # When flipping to presidio, also extend PII_REDACT_ENTITY_TYPES
+            # above to opt into NER-driven types (e.g. add ",person,
+            # location,date_time"). Default omits them for backward-
+            # compat with the regex catalog.
+            - name: PII_BACKEND
+              value: regex
+            - name: PRESIDIO_ANALYZER_URL
+              value: http://presidio-analyzer.presidio.svc.cluster.local:5001
+            - name: PRESIDIO_TIMEOUT_SECONDS
+              value: "2.0"
+            - name: PRESIDIO_SCORE_THRESHOLD
+              value: "0.5"
+            - name: PRESIDIO_LANGUAGE
+              value: en
+
             # --- Phase #13: plan-and-execute agent pattern -------------
             - name: PLANNER_ENABLED
               value: "false"

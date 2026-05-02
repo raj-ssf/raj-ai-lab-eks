@@ -3459,9 +3459,13 @@ PII_REDACT_INPUT_ENABLED = os.environ.get(
     "PII_REDACT_INPUT_ENABLED", "false"
 ).lower() in ("1", "true", "yes")
 
-# Entity types to redact, comma-separated. Default = all six. Operators
-# can narrow (e.g. "ipv4,aws_access_key") for a use case where natural
-# PII like emails is expected and shouldn't be masked.
+# Entity types to redact, comma-separated. Default = the six the regex
+# backend covers. When PII_BACKEND=presidio (Phase #73b), additional NER-
+# driven types unlock — see _PRESIDIO_TYPE_BY_INTERNAL below for the
+# extended set; operators opt into them by adding to this list (e.g.
+# "...,person,location,date_time"). Operators can also narrow (e.g.
+# "ipv4,aws_access_key") for a use case where natural PII like emails is
+# expected and shouldn't be masked.
 PII_REDACT_ENTITY_TYPES = set(
     s.strip().lower()
     for s in os.environ.get(
@@ -3470,6 +3474,37 @@ PII_REDACT_ENTITY_TYPES = set(
     ).split(",")
     if s.strip()
 )
+
+# Phase #73b: detection-backend dispatch. Two backends:
+#   "regex"    Hand-rolled patterns from Phase #11. Covers email/phone/
+#              SSN/credit_card/IPv4/aws_access_key. Runs in-process,
+#              ~50µs for typical chat prompts. Always-available.
+#   "presidio" HTTP call to the Presidio analyzer service in the
+#              `presidio` namespace (Phase #73 infra). Adds NER-driven
+#              detection (person, location, date_time, IBAN, medical
+#              license, …) on top of the regex set. Slower (~50-200ms
+#              per call due to spaCy NER) but catches PII the regex
+#              catalog can't see.
+#
+# Default = "regex" so behavior is unchanged on existing deployments;
+# operators flip to "presidio" after smoke-testing. Either way, the
+# dispatcher in _detect_pii() falls back to regex if Presidio is
+# unreachable — fail-open matches our broader safety-stack policy
+# (regex still scrubs the obvious tokens; better than blocking the
+# request on a Presidio outage).
+PII_BACKEND = os.environ.get("PII_BACKEND", "regex").lower()
+PRESIDIO_ANALYZER_URL = os.environ.get(
+    "PRESIDIO_ANALYZER_URL",
+    "http://presidio-analyzer.presidio.svc.cluster.local:5001",
+)
+# Bounded latency budget — if Presidio is slow, fail-open beats blocking
+# the chat hot path.
+PRESIDIO_TIMEOUT_SECONDS = float(os.environ.get("PRESIDIO_TIMEOUT_SECONDS", "2.0"))
+# spaCy NER scores common-name PERSON ~0.85, pattern recognizers (SSN,
+# email, etc) at 1.0. 0.5 is conservative enough to catch named entities
+# without ballooning false-positives on common nouns.
+PRESIDIO_SCORE_THRESHOLD = float(os.environ.get("PRESIDIO_SCORE_THRESHOLD", "0.5"))
+PRESIDIO_LANGUAGE = os.environ.get("PRESIDIO_LANGUAGE", "en")
 
 
 # Regex patterns for each entity type. Compiled once at module load
@@ -3516,21 +3551,141 @@ _PII_PATTERNS: dict[str, "_re.Pattern"] = {
 }
 
 
-def _detect_pii(text: str) -> list[tuple[str, int, int]]:
-    """Find PII spans in text. Returns [(entity_type, start, end), ...]
-    sorted by end-position descending so callers can replace right-to-left
-    without breaking earlier offsets."""
-    if not text:
-        return []
+# Phase #73b: bidirectional name map between our internal lowercase
+# entity-type identifiers (used for env config + placeholder text) and
+# Presidio's UPPERCASE canonical names (the values the analyzer's
+# /analyze endpoint expects in the `entities` request field and emits in
+# response objects).
+#
+# AWS access key has no Presidio-native recognizer, so it stays regex-
+# only — the dispatcher always layers regex behind presidio so the
+# regex-covered types are caught even when the operator opts into the
+# Presidio backend.
+_PRESIDIO_TYPE_BY_INTERNAL: dict[str, str] = {
+    # Types the Phase #11 regex catalog ALSO covers (Presidio is
+    # higher-quality on most because its phone/cc/IP recognizers do
+    # context+checksum validation; see Presidio's PatternRecognizer
+    # docs for the differences).
+    "email":             "EMAIL_ADDRESS",
+    "phone_us":          "PHONE_NUMBER",
+    "ssn":               "US_SSN",
+    "credit_card":       "CREDIT_CARD",
+    "ipv4":              "IP_ADDRESS",
+    # NEW NER-driven types — regex-impossible. Default
+    # PII_REDACT_ENTITY_TYPES does NOT include these (backward
+    # compat); operators add them when they flip to presidio.
+    "person":            "PERSON",
+    "location":          "LOCATION",
+    "date_time":         "DATE_TIME",
+    "url":               "URL",
+    "iban":              "IBAN_CODE",
+    "us_driver_license": "US_DRIVER_LICENSE",
+    "us_passport":       "US_PASSPORT",
+    "us_bank_number":    "US_BANK_NUMBER",
+    "medical_license":   "MEDICAL_LICENSE",
+}
+_INTERNAL_TYPE_BY_PRESIDIO: dict[str, str] = {
+    v: k for k, v in _PRESIDIO_TYPE_BY_INTERNAL.items()
+}
+
+
+def _detect_pii_regex(text: str) -> list[tuple[str, int, int]]:
+    """Phase #11 backend: hand-rolled regex catalog (_PII_PATTERNS).
+
+    Always available, in-process, ~50µs for typical chat-length text.
+    Used as the default backend AND as the always-on fallback layer
+    behind Presidio so types Presidio can't recognize (aws_access_key)
+    or which fail-open during a Presidio outage still get matched.
+    """
     spans: list[tuple[str, int, int]] = []
     for entity_type, pattern in _PII_PATTERNS.items():
         if entity_type not in PII_REDACT_ENTITY_TYPES:
             continue
         for match in pattern.finditer(text):
             spans.append((entity_type, match.start(), match.end()))
-    # Right-to-left so .replace by offset doesn't shift later spans
-    spans.sort(key=lambda s: s[1], reverse=True)
     return spans
+
+
+def _detect_pii_presidio(text: str) -> list[tuple[str, int, int]]:
+    """Phase #73b backend: Presidio analyzer service over HTTP.
+
+    POSTs to PRESIDIO_ANALYZER_URL/analyze with the operator-selected
+    entity list (filtered to types Presidio knows about) and a score
+    threshold. Translates Presidio's UPPERCASE entity_type strings back
+    to our internal lowercase names so downstream code (placeholder
+    formatting, env filtering, log fields) is unchanged from the
+    regex path.
+
+    Fail-open: any HTTP/network/parse error returns []. The dispatcher
+    always also runs the regex backend, so a Presidio outage degrades
+    detection quality (loses NER) but never blocks the request.
+    """
+    requested = [
+        _PRESIDIO_TYPE_BY_INTERNAL[t]
+        for t in PII_REDACT_ENTITY_TYPES
+        if t in _PRESIDIO_TYPE_BY_INTERNAL
+    ]
+    if not requested:
+        return []
+    try:
+        with httpx.Client(timeout=PRESIDIO_TIMEOUT_SECONDS) as client:
+            resp = client.post(
+                f"{PRESIDIO_ANALYZER_URL}/analyze",
+                json={
+                    "text": text,
+                    "language": PRESIDIO_LANGUAGE,
+                    "entities": requested,
+                    "score_threshold": PRESIDIO_SCORE_THRESHOLD,
+                },
+            )
+            resp.raise_for_status()
+            results = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("presidio analyzer call failed (%s); fail-open to regex", e)
+        return []
+
+    spans: list[tuple[str, int, int]] = []
+    for r in results or []:
+        internal = _INTERNAL_TYPE_BY_PRESIDIO.get(r.get("entity_type"))
+        if not internal:
+            continue
+        start, end = r.get("start"), r.get("end")
+        if not isinstance(start, int) or not isinstance(end, int) or start >= end:
+            continue
+        spans.append((internal, start, end))
+    return spans
+
+
+def _detect_pii(text: str) -> list[tuple[str, int, int]]:
+    """Public entry point — dispatches to the configured PII_BACKEND.
+
+    Returns [(entity_type, start, end), ...] sorted by start-position
+    DESCENDING so callers (_redact_pii) can replace right-to-left
+    without invalidating earlier offsets.
+
+    When PII_BACKEND=presidio, results from Presidio + regex are merged
+    with overlapping (start,end) spans deduplicated. Presidio's entry
+    wins on tie because it carries the more semantically-precise
+    entity_type (e.g. PERSON vs the regex layer's lack of NER).
+    """
+    if not text:
+        return []
+    if PII_BACKEND != "presidio":
+        spans = _detect_pii_regex(text)
+        spans.sort(key=lambda s: s[1], reverse=True)
+        return spans
+    presidio_spans = _detect_pii_presidio(text)
+    regex_spans = _detect_pii_regex(text)
+    seen: set[tuple[int, int]] = set()
+    merged: list[tuple[str, int, int]] = []
+    for span in presidio_spans + regex_spans:
+        key = (span[1], span[2])
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(span)
+    merged.sort(key=lambda s: s[1], reverse=True)
+    return merged
 
 
 def _redact_pii(text: str, spans: list[tuple[str, int, int]]) -> str:
