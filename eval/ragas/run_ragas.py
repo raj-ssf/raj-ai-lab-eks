@@ -163,7 +163,15 @@ def ingest_doc(token: str, session_id: str, filename: str, content: str) -> None
 
 
 def invoke(token: str, prompt: str, session_id: str) -> dict[str, Any]:
-    """POST to /invoke and return the parsed response."""
+    """POST to /invoke and return the parsed response.
+
+    Phase #81f run #2 (2026-05-02): bumped per-request timeout from
+    180s to 600s. The 5th eval question routes to the `reasoning`
+    tier (vllm-deepseek-r1-70b), which can legitimately take 3-5 min
+    when the pod is cold-starting AND the agent runs multiple
+    classify→plan→retrieve→execute cycles. 180s was too tight;
+    600s gives realistic headroom for the worst-case full pipeline.
+    """
     resp = httpx.post(
         f"{LANGGRAPH_URL}/invoke",
         headers={
@@ -175,7 +183,7 @@ def invoke(token: str, prompt: str, session_id: str) -> dict[str, Any]:
             "max_tokens": 512,
             "session_id": session_id,
         },
-        timeout=180.0,
+        timeout=600.0,
     )
     if resp.status_code >= 400:
         sys.exit(f"/invoke failed: {resp.status_code} {resp.text[:300]}")

@@ -61,8 +61,21 @@ concurrency:
 env:
   NAMESPACE: llm
   JOB_NAME: ragas-eval
-  GPU_DEPLOYMENTS: vllm-llama-8b vllm-bge-m3
-  JOB_WAIT_TIMEOUT: 1500s   # 25 min — covers cold-start GPUs + 5 prompts × judge calls
+  # Phase #81f run #2 (2026-05-02): added vllm-deepseek-r1-70b
+  # because the dataset's 5th question (graph-reasoning-loop-cap)
+  # routes to the `reasoning` tier per langgraph-service's classifier.
+  # Without pre-warming that Deployment, the 5th /invoke call hits a
+  # cold pod and the in-script httpx timeout fires before the 70B
+  # finishes cold-start. Symptom: 4 of 5 queries succeed (trivial /
+  # tuned-lora — both served by vllm-llama-8b), 5th errors with
+  # "httpx.ReadTimeout: timed out", whole Job hangs until
+  # JOB_WAIT_TIMEOUT, scores JSON empty, gate exits 1.
+  GPU_DEPLOYMENTS: vllm-llama-8b vllm-bge-m3 vllm-deepseek-r1-70b
+  # Phase #81f run #2: bumped 1500→3600 to leave headroom for the 70B
+  # cold-start (~5-10 min on g6.12xlarge) PLUS 5 langgraph /invoke
+  # turns PLUS the 5×3-metric RAGAS scoring loop. 25 min was too
+  # tight; 60 min is comfortable.
+  JOB_WAIT_TIMEOUT: 3600s   # 60 min — covers cold-start of all 3 GPU tiers + scoring
 
 jobs:
   ragas-eval:
