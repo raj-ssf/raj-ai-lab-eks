@@ -27,10 +27,20 @@ opentelemetry-instrumentation-logging>=0.54b0,<1.0.0
 
 # --- Phase 3: ingestion pipeline -------------------------------------------
 
-# Document parser. The [pdf,docx] extras pull pdfminer-six, pdf2image,
-# pytesseract, python-docx, lxml, etc. OS-level deps (libgl1, poppler,
-# tesseract) are baked into the Dockerfile, not pulled by pip.
-unstructured[pdf,docx]==0.16.5
+# Document parser. The [pdf,docx,md] extras pull pdfminer-six,
+# pdf2image, pytesseract, python-docx, lxml, markdown, etc. OS-level
+# deps (libgl1, poppler, tesseract) are baked into the Dockerfile,
+# not pulled by pip.
+#
+# The [md] extra was missing prior to 2026-05-02 — symptom: every .md
+# /upload returned HTTP 202 then the background task crashed with
+# "partition_md() is not available because one or more dependencies
+# are not installed". /retrieve consequently returned hits=0 for the
+# session because no chunks ever made it to qdrant. The Phase #81f
+# RAGAS production gate was scoring faithfulness as 0.0/NaN against
+# empty contexts as a result. Caught when the ragas-eval dataset
+# (5 .md source_docs) failed to retrieve anything.
+unstructured[pdf,docx,md]==0.16.5
 
 # Recursive character splitter (the "standard" chunker — splits on
 # paragraph → sentence → word boundaries before falling back to
