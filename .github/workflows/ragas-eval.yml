@@ -142,18 +142,56 @@ jobs:
       - name: Wait for Job completion
         id: wait
         run: |
-          # `kubectl wait` returns non-zero on Failed condition AND on
-          # timeout. Capture into a status var so we still tail logs
-          # below regardless of outcome — the failure mode is just as
-          # informative as the success mode for debugging.
+          # Poll for terminal Job state — bypasses a known issue where
+          # `kubectl wait --for=condition=complete` hangs indefinitely
+          # if the Job's Complete condition was set BEFORE the watch
+          # opened (i.e., when the Job finished faster than the wait
+          # could attach). We hit this 2026-05-02: a 4m4s eval Job
+          # finished, but `kubectl wait` never returned, so the
+          # workflow sat at "Wait for Job completion" until
+          # JOB_WAIT_TIMEOUT (was 1500s, now 3600s) expired before
+          # proceeding to log capture.
+          #
+          # The poll loop checks .status.conditions on a 10-second
+          # cadence and exits as soon as either Complete=True or
+          # Failed=True. Same outcome as kubectl wait but reliable
+          # against the already-Met-condition race.
+          #
+          # JOB_WAIT_TIMEOUT format is "3600s" — strip the trailing
+          # "s" for arithmetic.
           set +e
-          kubectl -n "$NAMESPACE" wait --for=condition=complete \
-            --timeout=$JOB_WAIT_TIMEOUT job/"$JOB_NAME" &
-          WAIT_OK=$!
-          kubectl -n "$NAMESPACE" wait --for=condition=failed \
-            --timeout=$JOB_WAIT_TIMEOUT job/"$JOB_NAME" && \
-            echo "job_failed=true" >> "$GITHUB_OUTPUT" || true
-          wait $WAIT_OK
+          TIMEOUT_SEC=${JOB_WAIT_TIMEOUT%s}
+          DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            STATUS=$(kubectl -n "$NAMESPACE" get job "$JOB_NAME" -o json 2>/dev/null | \
+              jq -r '
+                .status.conditions // [] |
+                (map(select(.type=="Complete" and .status=="True")) | length > 0) as $complete |
+                (map(select(.type=="Failed"   and .status=="True")) | length > 0) as $failed   |
+                if $complete then "complete"
+                elif $failed then "failed"
+                else "running"
+                end
+              ')
+            case "$STATUS" in
+              complete)
+                ELAPSED=$(( $(date +%s) - DEADLINE + TIMEOUT_SEC ))
+                echo "job complete after ${ELAPSED}s"
+                set -e
+                exit 0
+                ;;
+              failed)
+                ELAPSED=$(( $(date +%s) - DEADLINE + TIMEOUT_SEC ))
+                echo "job failed after ${ELAPSED}s"
+                echo "job_failed=true" >> "$GITHUB_OUTPUT"
+                set -e
+                exit 0
+                ;;
+            esac
+            sleep 10
+          done
+          echo "wait timed out after ${TIMEOUT_SEC}s without terminal state"
+          echo "job_failed=true" >> "$GITHUB_OUTPUT"
           set -e
 
       - name: Capture Job logs
