@@ -87,7 +87,7 @@ kind: Deployment
 metadata:
   name: vllm-deepseek-r1-70b
 spec:
-  replicas: 0
+  replicas: 1
 
 ---
 # vllm: the canonical 70B AWQ Deployment (tp=4 g6e.12xlarge ~$11/hr).
