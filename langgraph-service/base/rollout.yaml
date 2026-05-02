@@ -168,6 +168,46 @@ spec:
             - name: LLM_NAMESPACE
               value: llm
 
+            # --- Phase #81e: trivial-fast tier (1B distilled) canary -----
+            # The distilled adapter trained in Phase #81c serves as a
+            # cheap-tier replacement for `trivial` queries.
+            # _maybe_remap_to_trivial_fast in main.py flips a weighted
+            # coin per request — TRIVIAL_FAST_FRACTION of the trivial-
+            # tier traffic gets routed to the 1B distilled instead of
+            # the 8B baseline.
+            #
+            # Phase #81f RAGAS eval (eval/ragas/results/phase-81f-
+            # 2026-05-02-cap128.json) cleared the 0.85× faithfulness
+            # gate at TRIVIAL_FAST_MAX_TOKENS_CAP=128 (the cap is
+            # set in main.py — beats the 8B baseline by +9.6pp on
+            # faithfulness, +24.3pp on answer_relevancy).
+            #
+            # Starting at 5% canary fraction. Ramp by bumping
+            # TRIVIAL_FAST_FRACTION over hours/days while watching
+            # Langfuse + RAGAS for any drift:
+            #   0.05 → 0.10 → 0.25 → 0.50 → 1.0
+            #
+            # Prerequisite for traffic to actually flow to the
+            # distilled tier: `vllm-llama-1b-distilled` Deployment
+            # must be at replicas≥1. It's at 0 by default per Phase
+            # #81d's operator-controlled scaling pattern. Bring up
+            # before flipping DISTILLED_TIER_ENABLED to avoid 503s
+            # on the canary slice.
+            - name: DISTILLED_TIER_ENABLED
+              value: "true"
+            - name: TRIVIAL_FAST_FRACTION
+              value: "0.05"
+            # MODEL_TRIVIAL_FAST_URL / NAME / DEPLOY_TRIVIAL_FAST defaults
+            # in main.py already point at vllm-llama-1b-distilled. Listing
+            # them explicitly here so the rollout config self-documents
+            # what tier the trivial-fast canary points at.
+            - name: MODEL_TRIVIAL_FAST_URL
+              value: http://vllm-llama-1b-distilled.llm.svc.cluster.local:8000
+            - name: MODEL_TRIVIAL_FAST_NAME
+              value: llama-3.2-1b-distilled
+            - name: DEPLOY_TRIVIAL_FAST
+              value: vllm-llama-1b-distilled
+
             # --- Phase 4: rag-service /retrieve --------------------
             - name: RAG_SERVICE_URL
               value: http://rag-service.rag.svc.cluster.local
