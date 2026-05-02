@@ -97,6 +97,22 @@ spec:
                 - /bin/bash
                 - -c
                 - |
+                  # Persistent logging: tee everything to /workspace/.cache/
+                  # huggingface/training.log (in hf-cache PVC) so logs survive
+                  # pod deletion on failure. Phase #81c run #1 (2026-05-01) had
+                  # backoffLimit=0 + pod auto-cleanup losing all logs from a
+                  # failed run.
+                  LOG_FILE=/workspace/.cache/huggingface/training-$(date +%s).log
+                  exec > >(tee -a "$LOG_FILE") 2>&1
+                  echo "=== Logs persisting to $LOG_FILE ==="
+
+                  # Trap: on any exit, upload the log to S3 so it's accessible
+                  # from outside the cluster too (failure or success).
+                  trap 'echo "=== EXIT trap: uploading log to S3 ==="; \
+                        aws s3 cp "$LOG_FILE" \
+                          "s3://${TRAINING_BUCKET}/logs/llama-3.2-1b-distill/$(basename $LOG_FILE)" \
+                          --no-progress 2>&1 || true' EXIT
+
                   set -euxo pipefail
                   echo "=== Starting Llama-3.2-1B distillation SFT ==="
                   axolotl train /workspace/configs/llama-3.2-1b-distilled.yaml
