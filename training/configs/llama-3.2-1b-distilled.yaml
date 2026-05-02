@@ -59,9 +59,19 @@ special_tokens:
 
 # Sequence length: matches teacher's typical response length. The
 # 70B teacher is configured with max_model_len=16384, but most
-# chat replies are <2K tokens. 4096 is a sweet spot — captures
-# even verbose responses without bloating per-step memory.
-sequence_len: 4096
+# chat replies are <2K tokens.
+#
+# Phase #81c run #3 (2026-05-01) hit CUDA OOM at the loss
+# computation step (transformers/loss/loss_utils.py:ForCausalLMLoss
+# does logits.float() — for Llama-3.2-1B's vocab_size=128256, that
+# tensor is 128256 × seq_len × batch × 4 bytes FP32). On the L4
+# 24GB at seq_len=4096, batch=2, the FP32 logits cast alone is
+# ~8 GB transient, exceeding capacity when combined with model +
+# optimizer state.
+#
+# Cut to 2048 — halves logits memory. Dolly responses are typically
+# <500 tokens; sample_packing fills 2048 efficiently.
+sequence_len: 2048
 sample_packing: true
 pad_to_sequence_len: true
 
@@ -104,8 +114,14 @@ output_dir: /workspace/output
 # Hyperparameters: copied from a known-good 1B QLoRA recipe. Same
 # learning rate as the 8B+Alpaca config (2e-4) since LoRA's
 # adapter weights have similar magnitude regardless of base size.
-gradient_accumulation_steps: 4
-micro_batch_size: 2
+#
+# Phase #81c run #3 fix: micro_batch_size 2→1 + gradient_accumulation
+# 4→8 keeps effective batch size = 8 (same training dynamics) while
+# halving per-step memory peak. Combined with seq_len 4096→2048
+# above, total per-step memory drops ~75% (from ~20 GB to ~5 GB).
+# Comfortable on L4 24 GB.
+gradient_accumulation_steps: 8
+micro_batch_size: 1
 num_epochs: 3
 optimizer: paged_adamw_8bit
 learning_rate: 2e-4
