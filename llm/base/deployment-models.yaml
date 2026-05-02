@@ -1351,6 +1351,21 @@ spec:
             - "--enable-auto-tool-choice"
             - "--tool-call-parser"
             - "llama3_json"
+            # Phase #81d chat-template fix. NousResearch/Llama-3.2-1B
+            # is the BASE variant (not Instruct), so its tokenizer
+            # ships no chat_template. Without this flag vLLM's
+            # /v1/chat/completions returns HTTP 400 ("As of
+            # transformers v4.44, default chat template is no longer
+            # allowed..."). Mounted from the chat-template-llama3
+            # ConfigMap (llm/base/chat-template-llama3.yaml).
+            #
+            # Tools-aware variant of this template is a follow-up;
+            # current template handles basic system/user/assistant
+            # turns but doesn't render tools={...} into the prompt,
+            # so tool calls won't reach the model in chat-completions
+            # requests until the template is upgraded.
+            - "--chat-template"
+            - "/chat-templates/llama3.jinja"
           ports:
             - { name: http, containerPort: 8000 }
           env:
@@ -1368,14 +1383,19 @@ spec:
           readinessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 10, failureThreshold: 3 }
           livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 30, failureThreshold: 3 }
           volumeMounts:
-            - { name: model-cache,   mountPath: /model,             readOnly: true }
-            - { name: adapter-cache, mountPath: /adapters/distilled, readOnly: true }
-            - { name: shm,           mountPath: /dev/shm }
+            - { name: model-cache,    mountPath: /model,             readOnly: true }
+            - { name: adapter-cache,  mountPath: /adapters/distilled, readOnly: true }
+            - { name: chat-templates, mountPath: /chat-templates,     readOnly: true }
+            - { name: shm,            mountPath: /dev/shm }
       volumes:
         - name: model-cache
           persistentVolumeClaim:
             claimName: vllm-cache-llama-1b-distilled
         - name: adapter-cache
           emptyDir: { sizeLimit: 1Gi }
+        # Phase #81d: chat template Jinja file mounted from ConfigMap.
+        - name: chat-templates
+          configMap:
+            name: chat-template-llama3
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 2Gi }

@@ -67,3 +67,9 @@ resources:
   # mechanism is now subsumed by the cron trigger inside this
   # ScaledObject.
   - scaledobject-vllm-llama-8b.yaml
+  # Phase #81d: chat template for vllm-llama-1b-distilled.
+  # NousResearch/Llama-3.2-1B is the BASE variant (no chat_template
+  # in its tokenizer_config.json), so vLLM's /v1/chat/completions
+  # 400s without an explicit template via --chat-template arg.
+  # ConfigMap is mounted into the Deployment as a Jinja file.
+  - chat-template-llama3.yaml
