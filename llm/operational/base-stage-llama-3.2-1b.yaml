@@ -1,0 +1,139 @@
+# Phase #81d operational: pre-stage Llama-3.2-1B base weights to S3.
+#
+# Prerequisite for the vllm-llama-1b-distilled Deployment in
+# llm/base/deployment-models.yaml — its model-sync init container
+# does `aws s3 sync s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/`
+# and will fail-fast if the prefix is empty.
+#
+# This Job is INTENTIONALLY OUT-OF-KUSTOMIZATION — same pattern as
+# llm/operational/awq-stage-llama-3.1-8b.yaml. ArgoCD's `vllm` app
+# (path: llm/overlays/dev) doesn't include llm/operational/, so the
+# Job's lifecycle is purely operator-driven.
+#
+# Apply via:
+#   kubectl apply -f llm/operational/base-stage-llama-3.2-1b.yaml
+#
+# Watch:
+#   kubectl -n default logs -l job-name=base-stage-llama-3-2-1b -f
+#
+# Cleanup (Job stays for 1h post-completion via TTL):
+#   kubectl -n default delete job base-stage-llama-3-2-1b
+#
+# Expected runtime: ~1-2 min wall-clock. Llama-3.2-1B FP16 is ~2.5 GB
+# (much smaller than the 8B / 70B siblings); HuggingFace download +
+# S3 sync over the VPC endpoint is fast.
+#
+# Re-run safety: idempotent. `aws s3 sync --delete` produces a clean
+# state matching the HF source.
+#
+# Verification post-completion:
+#   aws s3 ls s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/
+#   # Expect: model.safetensors* + tokenizer.json + tokenizer_config.json
+#   # + config.json + special_tokens_map.json + generation_config.json.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: base-stage-llama-3-2-1b
+  namespace: default
+  labels:
+    app.kubernetes.io/name: base-stage
+    app.kubernetes.io/component: model-weights-stager
+    phase: "81d"
+    target-model: llama-3.2-1b
+spec:
+  # Phase #82c lesson: backoffLimit=2 lets cni.repair self-heal
+  # the Karpenter+istio race if it fires.
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: base-stage
+        app.kubernetes.io/component: model-weights-stager
+    spec:
+      # Pod Identity binding from model-weights.tf:165 maps this SA
+      # to the model_weights_stager IAM role (R/W on the entire
+      # model-weights bucket).
+      serviceAccountName: model-weights-stager
+      restartPolicy: OnFailure
+
+      # No GPU needed — pure HTTP + S3 work. Lands on the Phase #66
+      # general-purpose Karpenter NodePool (CPU-only, multi-AZ).
+      nodeSelector:
+        karpenter.sh/nodepool: general
+
+      containers:
+        - name: stage
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
+
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              # Runtime deps. ~30s on cold pip cache.
+              pip install --no-cache-dir --quiet \
+                'huggingface-hub[cli]>=0.24.0,<1.0' \
+                'boto3>=1.30,<2.0'
+
+              # Install awscli for `aws s3 sync` (boto3 alone doesn't
+              # have the same convenient sync semantics).
+              apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+                awscli ca-certificates
+
+              echo "=== Phase #81d: pre-stage Llama-3.2-1B base ==="
+
+              # NousResearch/Llama-3.2-1B is the public open-mirror.
+              # Same source the training config uses (training/
+              # configs/llama-3.2-1b-distilled.yaml: base_model). No
+              # auth needed.
+              REPO=NousResearch/Llama-3.2-1B
+              LOCAL=/tmp/base-weights
+              mkdir -p "$LOCAL"
+              cd "$LOCAL"
+
+              huggingface-cli download "$REPO" \
+                --local-dir . \
+                --local-dir-use-symlinks False \
+                --quiet
+
+              echo
+              echo "=== Downloaded files ==="
+              ls -lh
+
+              echo
+              echo "=== Uploading to s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/ ==="
+              aws s3 sync . s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/ \
+                --delete \
+                --no-progress
+
+              echo
+              echo "=== S3 contents post-upload ==="
+              aws s3 ls s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/
+
+              echo
+              echo "=== Base pre-stage complete ==="
+
+          env:
+            - name: AWS_REGION
+              value: us-west-2
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+            - name: HF_HUB_DISABLE_TELEMETRY
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+
+          resources:
+            # Initial sizing 1Gi/2Gi was too tight — first run was
+            # OOM-killed silently mid-`huggingface-cli download`
+            # (kubelet kills don't always reach stdout). Matching
+            # the awq-stage Job's known-good 2Gi/4Gi.
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "15Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+              ephemeral-storage: "15Gi"
