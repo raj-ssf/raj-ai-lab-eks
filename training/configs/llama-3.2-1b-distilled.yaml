@@ -133,7 +133,20 @@ save_steps: 100
 save_total_limit: 3
 eval_steps: 100
 
-# Checkpoint resumption: training/runs/llama-3.2-1b-distill.yaml
-# uses the hf-cache PVC; if a node dies mid-run, restart resumes
-# from the last save_steps checkpoint at ~5min granularity.
-resume_from_checkpoint: auto
+# Checkpoint resumption: DISABLED for first runs.
+#
+# `resume_from_checkpoint: auto` was the original setting (intended
+# for mid-run node-death recovery) but it FAILS HARD on first ever
+# run because transformers' Trainer._load_from_checkpoint raises
+# ValueError("Can't find a valid checkpoint at auto") when output_dir
+# has no checkpoint-* subdirs. Bug hit during Phase #81c both attempts
+# 2026-05-01.
+#
+# To re-enable for resume scenarios: uncomment AND ensure the
+# training command in training/runs/llama-3.2-1b-distill.yaml first
+# checks for the existence of /workspace/output/checkpoint-* before
+# axolotl train, only passing the resume flag when checkpoints exist.
+# See https://github.com/axolotl-ai-cloud/axolotl/issues/... for the
+# canonical "auto detect on resume" pattern.
+#
+# resume_from_checkpoint: auto
