@@ -1210,25 +1210,25 @@ metadata:
     app: vllm-llama-1b-distilled
     vllm-model: llama-3.2-1b
 spec:
-  # Phase #81d: bumped 0 → 1 once the trained adapter landed in
-  # s3://raj-ai-lab-eks-training/adapters/llama-3.2-1b-distilled/
-  # (Phase #81c, 2026-05-01) AND the base weights were pre-staged
-  # to s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/ (operational
-  # Job at llm/operational/base-stage-llama-3.2-1b.yaml).
+  # Phase #81d (operator-controlled scaling): replicas=0 by default.
+  # Bring up via `kubectl -n llm scale deploy/vllm-llama-1b-distilled
+  # --replicas=1` for a demo session, scale back to 0 after to stop
+  # GPU billing (~$0.80/hr g6.xlarge L4). Same pattern as the other
+  # JIT-scaled vllm-* Deployments in this file.
   #
-  # ArgoCD's `vllm` Application currently has /spec/replicas in
-  # ignoreDifferences for the OTHER vllm-* Deployments but NOT for
-  # this one (raj-ai-lab-eks-infra/argocd-apps.tf will need that
-  # added before scale-from-0 / KEDA-style operator scaling can
-  # work). For now ArgoCD enforces replicas=1, which is fine — the
-  # trivial-fast tier wants always-warm to avoid cold-start
-  # latency on every routed request.
+  # PREREQUISITE for kubectl scale to stick: this Deployment's
+  # /spec/replicas needs to be in the vllm ArgoCD Application's
+  # ignoreDifferences list (raj-ai-lab-eks-infra/argocd-apps.tf).
+  # Until that terraform change is applied, ArgoCD selfHeal will
+  # revert kubectl scale within ~3 sec.
   #
-  # Future Phase #81e candidate: KEDA ScaledObject mirroring the
-  # vllm-llama-8b pattern (cron + prometheus stacked triggers)
-  # plus the ignoreDifferences add — would let off-hours scale-to-0
-  # mirror the 8B's cost shape.
-  replicas: 1
+  # Pre-reqs already satisfied (Phase #81b/c/d-prereq):
+  #   - base weights at s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/
+  #     (operational Job at llm/operational/base-stage-llama-3.2-1b.yaml)
+  #   - LoRA adapter at s3://raj-ai-lab-eks-training/adapters/
+  #     llama-3.2-1b-distilled/ (trained 2026-05-01 23:26 PT,
+  #     45 MB, train loss 0.74 / eval loss 0.95)
+  replicas: 0
   strategy:
     type: Recreate
   selector:
