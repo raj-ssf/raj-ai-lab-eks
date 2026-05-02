@@ -1210,7 +1210,25 @@ metadata:
     app: vllm-llama-1b-distilled
     vllm-model: llama-3.2-1b
 spec:
-  replicas: 0
+  # Phase #81d: bumped 0 → 1 once the trained adapter landed in
+  # s3://raj-ai-lab-eks-training/adapters/llama-3.2-1b-distilled/
+  # (Phase #81c, 2026-05-01) AND the base weights were pre-staged
+  # to s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/ (operational
+  # Job at llm/operational/base-stage-llama-3.2-1b.yaml).
+  #
+  # ArgoCD's `vllm` Application currently has /spec/replicas in
+  # ignoreDifferences for the OTHER vllm-* Deployments but NOT for
+  # this one (raj-ai-lab-eks-infra/argocd-apps.tf will need that
+  # added before scale-from-0 / KEDA-style operator scaling can
+  # work). For now ArgoCD enforces replicas=1, which is fine — the
+  # trivial-fast tier wants always-warm to avoid cold-start
+  # latency on every routed request.
+  #
+  # Future Phase #81e candidate: KEDA ScaledObject mirroring the
+  # vllm-llama-8b pattern (cron + prometheus stacked triggers)
+  # plus the ignoreDifferences add — would let off-hours scale-to-0
+  # mirror the 8B's cost shape.
+  replicas: 1
   strategy:
     type: Recreate
   selector:
