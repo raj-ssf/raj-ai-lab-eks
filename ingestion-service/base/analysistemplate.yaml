@@ -45,7 +45,38 @@ spec:
           # 4xx (e.g. 401 from missing JWT, 422 from bad multipart)
           # as success — those are caller bugs, not service
           # regressions.
+          #
+          # No-traffic handling (fixed 2026-05-02):
+          # The previous query used `clamp_min(denominator, 1e-9)`
+          # to avoid 0/0, which made the formula return 0 (fail)
+          # when the canary saw zero ambient /upload calls in the
+          # 5-min window. Hit this twice on the [md] fix rollout —
+          # the lab has no synthetic load, so a fresh canary often
+          # sees 0 calls before AnalysisRun checks fire. Result:
+          # the canary failed not because the new image was bad
+          # but because nothing exercised it.
+          #
+          # New query: gate the denominator on `> 0`. PromQL's
+          # comparison operator filters: when the sum is 0, the
+          # `> 0` strips it out → empty denominator → division
+          # produces no series → the trailing `or on() vector(1.0)`
+          # backfills 1.0 → passes the ≥0.95 gate. When sum > 0,
+          # the comparison passes the value through and division
+          # proceeds normally.
+          # Net effect:
+          #   - No traffic in window  → 1.0  (pass — fix)
+          #   - Mostly successful     → ratio (pass)
+          #   - 5xx-heavy traffic     → low ratio (fail correctly)
+          # Trade-off: a canary that's so broken it can't accept
+          # any /upload calls also passes here. That risk is
+          # caught by the readiness probe + the bg watchdog
+          # AnalysisTemplate (analysistemplate-bg.yaml's
+          # `failureCondition: result[0] > 0.10`), which fires
+          # on sustained 5xx — different signal, different gate.
           query: |
-            sum(rate(http_requests_total{job="ingestion-service",handler="/upload",status!~"5.."}[5m]))
-            /
-            clamp_min(sum(rate(http_requests_total{job="ingestion-service",handler="/upload"}[5m])), 1e-9)
+            (
+              sum(rate(http_requests_total{job="ingestion-service",handler="/upload",status!~"5.."}[5m]))
+              /
+              (sum(rate(http_requests_total{job="ingestion-service",handler="/upload"}[5m])) > 0)
+            )
+            or on() vector(1.0)
