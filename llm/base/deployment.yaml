@@ -74,6 +74,30 @@ spec:
           volumeMounts:
             - name: model-cache
               mountPath: /model
+        # Phase #83c (2026-05-02): pull the Llama 3.2 1B base weights for
+        # use as the speculative-decoding draft. vLLM loads draft + target
+        # in the same process, so the 1B weights need to be on the 70B
+        # pod's filesystem (mounted via vllm-cache-llama-3.2-1b-draft PVC).
+        # ~2.5 GB sync; ~30 s warm, ~5 s on warmed PVC.
+        - name: draft-sync
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_REGION, value: us-west-2 }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/ }
+            - { name: DRAFT_PATH, value: /draft-model }
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws configure set default.s3.max_concurrent_requests 32
+              aws configure set default.s3.multipart_chunksize 64MB
+              aws s3 sync "$S3_URI" "$DRAFT_PATH" --no-progress
+              ls -la "$DRAFT_PATH"
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+          volumeMounts:
+            - name: draft-cache
+              mountPath: /draft-model
       containers:
         - name: vllm
           # OpenAI-compatible server build. Pin the tag in the overlay so
@@ -99,6 +123,42 @@ spec:
             - "0.0.0.0"
             - "--port"
             - "8000"
+            # Phase #83c (2026-05-02): speculative decoding. Llama 3.2 1B
+            # (FP16, base) drafts N tokens; this 70B target verifies them
+            # in a single forward pass.
+            #
+            # Why this target (not the 8B from attempt-1): vLLM 0.7.2's
+            # SpecDecodeWorker raises ValueError when --enable-lora is
+            # set on the target. The 8B has the alpaca LoRA loaded and
+            # serves the tuned-lora langgraph tier; this 70B Deployment
+            # is LoRA-free, so the guard doesn't fire. See
+            # feedback_vllm_spec_decode_lora.md.
+            #
+            # TP=4 + spec decode topology: vLLM defaults
+            # speculative-draft-tensor-parallel-size=1, so the 1B draft
+            # loads on rank 0 only (asymmetric ~2.5 GB on one of four
+            # L40S 48 GiB GPUs). With gpu-memory-utilization=0.92 and
+            # 70B AWQ at ~9.5 GiB per GPU shard + ~6 GiB activations,
+            # GPU 0 still has ~26 GiB KV pool vs ~28 GiB on GPUs 1-3 —
+            # asymmetry well under noise. No need to drop the
+            # gpu-memory-utilization here (unlike attempt-1 on the 8B
+            # where the L4 24 GiB margin was tight).
+            #
+            # Caveats inherited from spec decode in vLLM 0.7.2:
+            #   - Acceptance rate depends on draft/target distribution
+            #     alignment. 1B base + 70B Instruct are both Llama
+            #     family but different post-training; expect 30-50%
+            #     accept on plain chat.
+            #   - This Deployment doesn't use --enable-auto-tool-choice
+            #     or --enable-lora, so the draft path covers all
+            #     traffic uniformly.
+            #   - Compatible with --enforce-eager (above) — spec
+            #     decoding works without CUDA graphs at some per-token
+            #     overhead.
+            - "--speculative-model"
+            - "/draft-model"
+            - "--num-speculative-tokens"
+            - "5"
             # OTLP tracing disabled: stock vllm/vllm-openai:v0.7.2 image
             # doesn't ship OpenTelemetry Python packages, so setting
             # --otlp-traces-endpoint crashes engine init with
@@ -165,12 +225,21 @@ spec:
             - name: model-cache
               mountPath: /model
               readOnly: true
+            - name: draft-cache
+              mountPath: /draft-model
+              readOnly: true
             - name: shm
               mountPath: /dev/shm
       volumes:
         - name: model-cache
           persistentVolumeClaim:
             claimName: vllm-model-cache
+        # Phase #83c: draft model cache for speculative decoding. PVC
+        # rather than emptyDir so the 2.5 GB sync doesn't repeat on
+        # every pod restart. PVC defined in pvcs-models.yaml.
+        - name: draft-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache-llama-3.2-1b-draft
         # NCCL's P2P + vLLM's tensor-parallel IPC use /dev/shm heavily.
         # Default container shm is 64 MiB — far too small for 70B across
         # 4 GPUs. Memory-backed emptyDir bypasses disk and grows as needed
