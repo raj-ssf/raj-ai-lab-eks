@@ -1,22 +1,47 @@
-# Phase #81d: Chat template for vllm-llama-1b-distilled.
+# Phase #81d: Alpaca-format chat template for vllm-llama-1b-distilled.
 #
-# The base model NousResearch/Llama-3.2-1B is the BASE variant
-# (not Instruct), so its tokenizer ships no chat_template. Without
-# a template, vLLM 0.7.2's /v1/chat/completions returns HTTP 400:
-#   "As of transformers v4.44, default chat template is no longer
-#    allowed, so you must provide a chat template if the tokenizer
-#    does not define one."
+# The base model NousResearch/Llama-3.2-1B is the BASE variant (not
+# Instruct), so its tokenizer ships no chat_template. Without a
+# template, vLLM 0.7.2's /v1/chat/completions returns HTTP 400.
 #
-# We pass --chat-template /chat-templates/llama3.jinja to vLLM via
-# the Deployment args (llm/base/deployment-models.yaml vllm-llama-1b-
-# distilled section). This mounts here as a ConfigMap volume.
+# IMPORTANT: this template renders messages in **Alpaca format**, not
+# the canonical Llama-3 chat-template format. Why:
 #
-# Template scope: basic chat (system / user / assistant turns).
-# Tools support is NOT included in this version — a tools-aware
-# template (matching what Llama-3.1-Instruct's tokenizer ships) is
-# a follow-up. Tool calls in /v1/chat/completions requests will
-# silently not render to the model until the tools-aware template
-# replaces this one.
+#   The distilled LoRA was trained via axolotl `type: alpaca` on
+#   Dolly-15k teacher outputs (training/configs/llama-3.2-1b-
+#   distilled.yaml). Axolotl's alpaca formatter wraps each example as:
+#
+#     Below is an instruction that describes a task. Write a
+#     response that appropriately completes the request.
+#
+#     ### Instruction:
+#     {instruction}
+#
+#     ### Response:
+#     {output}<|end_of_text|>
+#
+#   So the LoRA learned to recognize "### Instruction:" / "### Response:"
+#   as the prompt structure and emit <|end_of_text|> as the stop token.
+#   It NEVER saw the Llama-3 chat-template special tokens
+#   (<|start_header_id|>, <|eot_id|>) during training, so wrapping
+#   inference prompts in those tokens makes the LoRA produce garbled
+#   output that fails to stop at end-of-turn.
+#
+#   First Phase #81d chat-completions test (2026-05-02) confirmed this:
+#   Llama-3 chat template produced "What is the capital of France?
+#   edReader\n\n[repeats]..." with finish=length. Switched to Alpaca
+#   format here.
+#
+# Single-turn assumption: trivial-fast tier handles single-turn
+# factual queries; multi-turn chat history is reduced to "last user
+# message" in this template. If trivial-fast ever needs real
+# multi-turn awareness, this template would need to render the full
+# conversation as the instruction with a "Conversation history:" prefix.
+#
+# Tools support: not included. Same caveat as the prior Llama-3
+# template: tool calls in chat-completions requests will silently
+# not render to the model. A tools-aware Alpaca variant (or
+# re-training the LoRA on a chat-format dataset) is a follow-up.
 #
 # Why ConfigMap instead of inline `--chat-template "<jinja>"` arg:
 # Jinja escaping inside YAML strings is fragile (newlines, single
@@ -24,9 +49,9 @@
 # clean Jinja and reference it by path.
 #
 # Other Deployments (vllm-llama-8b, vllm-deepseek-r1-70b, etc.) use
-# Instruct/chat-tuned bases whose tokenizer_config.json already ships
-# a chat_template — they don't need this. This file is specific to
-# the 1B-distilled variant whose base lacks one.
+# Instruct-tuned bases that ship their own chat_template AND were
+# trained on chat-format data — they don't need this fix. This is
+# specific to the 1B-distilled-on-Alpaca-data combination.
 
 apiVersion: v1
 kind: ConfigMap
@@ -38,14 +63,13 @@ metadata:
     phase: "81d"
 data:
   llama3.jinja: |
-    {%- set loop_messages = messages -%}
-    {%- for message in loop_messages -%}
-    {%- set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n' + message['content'] | trim + '<|eot_id|>' -%}
-    {%- if loop.index0 == 0 -%}
-    {%- set content = bos_token + content -%}
-    {%- endif -%}
-    {{- content -}}
-    {%- endfor -%}
-    {%- if add_generation_prompt -%}
-    {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' -}}
-    {%- endif -%}
+    {%- set sys = (messages | selectattr('role', 'equalto', 'system') | map(attribute='content') | list | first) | default('') -%}
+    {%- set usr = (messages | selectattr('role', 'equalto', 'user') | map(attribute='content') | list | last) | default('') -%}
+    Below is an instruction that describes a task. Write a response that appropriately completes the request.
+    {% if sys %}
+    {{ sys | trim }}
+    {% endif %}
+    ### Instruction:
+    {{ usr | trim }}
+
+    ### Response:
