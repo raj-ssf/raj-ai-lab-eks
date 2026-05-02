@@ -21,9 +21,18 @@
 #     --from-file=seed_prompts.py=training/distill/seed_prompts.py \
 #     --dry-run=client -o yaml | kubectl apply -f -
 #
-#   # Apply Job
+#   # Apply Job. CRITICAL: envsubst MUST use allowlist mode
+#   # (the '$TRAINING_BUCKET' arg) — without it, envsubst eats every
+#   # $VAR reference in the manifest, including in-pod bash variables
+#   # like $S3_URI / $MODEL_PATH / $TEACHER_URL / $ATTEMPTS, replacing
+#   # them with empty strings from the host shell's env. Pod containers
+#   # then run with empty arguments and crash-loop. This bit us
+#   # 2026-05-01 on first run: teacher pod CrashLoopBackOff'd 7 times
+#   # because `aws s3 sync "$S3_URI" "$MODEL_PATH"` got pre-substituted
+#   # to `aws s3 sync "" ""`. The allowlist syntax tells envsubst to
+#   # ONLY touch $TRAINING_BUCKET and pass everything else through.
 #   export TRAINING_BUCKET=raj-ai-lab-eks-training
-#   envsubst < training/runs/distill-dataset-prep.yaml | kubectl apply -f -
+#   envsubst '$TRAINING_BUCKET' < training/runs/distill-dataset-prep.yaml | kubectl apply -f -
 #
 #   # Watch
 #   kubectl -n llm logs -l app.kubernetes.io/name=distill-dataset-prep -f
