@@ -321,29 +321,56 @@ spec:
             - name: HALLUCINATION_CONFIDENCE_THRESHOLD
               value: "0.6"
 
-            # --- Phase #11: PII redaction at output -------------------
+            # --- Phase #11/#73b: PII redaction enabled --------------
+            # 2026-05-02: flipped from disabled (Phase #11 staging) to
+            # enabled with Presidio backend. Combination effect:
+            #   PII_REDACT_INPUT_ENABLED=true   →  node_pii_redact_input
+            #     populates state.redacted_prompt; cache keys / vector
+            #     search / memory storage / rewrite-query input use
+            #     the redacted version (raw prompt still goes to
+            #     node_execute so the model can answer the actual
+            #     question)
+            #   PII_REDACT_OUTPUT_ENABLED=true  →  node_pii_redact_output
+            #     scrubs the model's response before cache_store +
+            #     save_memory. Hallucination_check still runs on the
+            #     unredacted text (entity-level evidence preserved
+            #     for the check, then redacted for persistence).
+            # Together they bound where PII can sit to a single hot
+            # path: prompt → execute → response, never touching
+            # cache, memory, retrieval logs, or chat history storage.
             - name: PII_REDACT_OUTPUT_ENABLED
-              value: "false"
-            - name: PII_REDACT_ENTITY_TYPES
-              value: email,phone_us,ssn,credit_card,ipv4,aws_access_key
+              value: "true"
             - name: PII_REDACT_INPUT_ENABLED
-              value: "false"
+              value: "true"
+            # Entity types — extended past the regex baseline to
+            # include the NER-driven types that only Presidio can
+            # recognize. The regex backend ignores entries it doesn't
+            # know (graceful degradation if PII_BACKEND is flipped
+            # back to "regex"); presidio resolves all of them via the
+            # _PRESIDIO_TYPE_BY_INTERNAL map in main.py.
+            - name: PII_REDACT_ENTITY_TYPES
+              value: email,phone_us,ssn,credit_card,ipv4,aws_access_key,person,location,date_time
 
             # --- Phase #73b: Presidio-backed PII detection ------------
             # PII_BACKEND selects the detector:
-            #   regex     hand-rolled patterns from Phase #11 (default)
+            #   regex     hand-rolled patterns from Phase #11 (default
+            #             — kept as fallback for fail-open path)
             #   presidio  Presidio analyzer service in `presidio` ns
             #             (NER + pattern recognizers, more types)
-            # Flip to "presidio" after smoke-testing the analyzer is
-            # reachable and AuthZ-allowed (Istio AuthorizationPolicy
-            # `allow-apps-to-presidio` already includes our SA).
             #
-            # When flipping to presidio, also extend PII_REDACT_ENTITY_TYPES
-            # above to opt into NER-driven types (e.g. add ",person,
-            # location,date_time"). Default omits them for backward-
-            # compat with the regex catalog.
+            # 2026-05-02: flipped to "presidio". Presidio infra (Phase
+            # #73, raj-ai-lab-eks-infra/presidio.tf) is meshed and
+            # the AuthorizationPolicy `allow-apps-to-presidio`
+            # already lists langgraph-service's SPIFFE principal,
+            # so no infra changes were needed for this flip.
+            #
+            # Fail-open: if presidio analyzer is unreachable / errors,
+            # _detect_pii_presidio returns [] and the dispatcher
+            # always layers _detect_pii_regex behind it. Net effect:
+            # presidio outage → degrade to regex coverage, never
+            # block the request.
             - name: PII_BACKEND
-              value: regex
+              value: presidio
             - name: PRESIDIO_ANALYZER_URL
               value: http://presidio-analyzer.presidio.svc.cluster.local:5001
             - name: PRESIDIO_TIMEOUT_SECONDS
