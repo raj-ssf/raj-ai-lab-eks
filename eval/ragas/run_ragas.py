@@ -343,8 +343,15 @@ def main() -> int:
             base_url=JUDGE_LLM_URL,
             api_key="not-required",  # vLLM doesn't enforce
             temperature=0.0,
-            max_tokens=8192,
-            timeout=120,  # bigger budget can mean longer wall-clock
+            # 12288 = ceiling-near. 70B's --max-model-len 16384 leaves
+            # ~4K for prompt + retrieved chunks at this output budget;
+            # RAGAS Faithfulness prompts are typically 1-3K so this is
+            # the practical max that keeps the prompt non-truncated.
+            # Run 25267247638 at 8192 still NaN'd 3/5 entries; one
+            # final bump before pivoting structurally to response
+            # truncation if this doesn't close all remaining gaps.
+            max_tokens=12288,
+            timeout=180,
         )
     )
     # Used by ResponseRelevancy + LLMContextPrecisionWithReference.
