@@ -479,6 +479,16 @@ def main() -> int:
         new_baselines["per_entry"] = per_entry
         BASELINES_PATH.write_text(json.dumps(new_baselines, indent=2) + "\n")
         print("UPDATE_BASELINE=true: wrote new baseline. Commit baselines.json.")
+        # Emit the new baseline content between markers so the
+        # workflow can capture it from kubectl-logs onto the GHA
+        # runner's filesystem (where peter-evans/create-pull-request
+        # expects to find it). Without this, the in-pod write to
+        # /workspace/baselines.json never reaches the runner and the
+        # auto-PR step concludes "success" but creates nothing —
+        # observed in run 25269440614 (2026-05-03).
+        print("===RAGAS_BASELINES_JSON_BEGIN===")
+        print(json.dumps(new_baselines, indent=2))
+        print("===RAGAS_BASELINES_JSON_END===")
         return 0
 
     return gate(scores, baselines)

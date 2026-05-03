@@ -1,11 +1,37 @@
 {
-  "_comment": "Baseline RAGAS scores per metric. The runner compares each new score against these and fails the workflow if any metric drops by more than RAGAS_REGRESSION_THRESHOLD_PP (default 5pp). Null values mean 'no baseline established yet — emit scores but skip the gate'. Populate by running the workflow with workflow_dispatch + update_baseline=true on a known-good commit.",
+  "_comment": "Baseline RAGAS scores per metric. The runner compares each new score against these and fails the workflow if any metric drops by more than RAGAS_REGRESSION_THRESHOLD_PP (default 5pp). Null values mean 'no baseline established yet \u2014 emit scores but skip the gate'. Populate by running the workflow with workflow_dispatch + update_baseline=true on a known-good commit.",
   "_schema_version": 1,
   "_dataset_version": "ragas-eval-baseline-v1",
   "metrics": {
-    "faithfulness": null,
-    "answer_relevancy": null,
-    "context_precision": null
+    "faithfulness": 0.9305194805194805,
+    "answer_relevancy": 0.8922560675783083,
+    "llm_context_precision_with_reference": 0.99999999991
   },
-  "per_entry": {}
+  "per_entry": {
+    "pod-identity-vs-irsa": {
+      "faithfulness": 1.0,
+      "answer_relevancy": 0.8893866858833617,
+      "llm_context_precision_with_reference": 0.99999999995
+    },
+    "karpenter-nodepool-purpose": {
+      "faithfulness": 0.9583333333333334,
+      "answer_relevancy": 0.9031338552983508,
+      "llm_context_precision_with_reference": 0.9999999999
+    },
+    "vllm-tool-call-parser": {
+      "faithfulness": 0.837121212121212,
+      "answer_relevancy": 0.8808311468214276,
+      "llm_context_precision_with_reference": 0.9999999999
+    },
+    "lora-tool-call-degradation": {
+      "faithfulness": 0.8571428571428571,
+      "answer_relevancy": 0.9708363775339267,
+      "llm_context_precision_with_reference": 0.9999999999
+    },
+    "graph-reasoning-loop-cap": {
+      "faithfulness": 1.0,
+      "answer_relevancy": 0.8170922723544746,
+      "llm_context_precision_with_reference": 0.9999999999
+    }
+  }
 }

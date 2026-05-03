@@ -250,6 +250,30 @@ jobs:
           echo "Scores:"
           cat /tmp/scores.json | python3 -m json.tool || true
 
+      # 2026-05-03: when update_baseline=true, the runner emits the new
+      # baselines.json content between RAGAS_BASELINES_JSON_BEGIN/END
+      # markers. Capture it onto the GHA runner's filesystem at the
+      # canonical path so peter-evans/create-pull-request below sees a
+      # real diff and creates a real PR. Without this step, the runner
+      # writes the new baseline only inside the eval Job pod's
+      # ephemeral container layer (image-baked /workspace/baselines.json)
+      # — never propagating to the runner — and the auto-PR step
+      # silently no-ops "success" with nothing to commit. Symptom seen
+      # in run 25269440614.
+      - name: Extract baselines JSON (update_baseline path only)
+        if: inputs.update_baseline == true
+        run: |
+          awk '/===RAGAS_BASELINES_JSON_BEGIN===/{flag=1; next} /===RAGAS_BASELINES_JSON_END===/{flag=0} flag' \
+            /tmp/ragas-eval.log > /tmp/baselines.json
+          if [ ! -s /tmp/baselines.json ]; then
+            echo "::error::update_baseline=true but no RAGAS_BASELINES_JSON block in log output"
+            exit 1
+          fi
+          # Write to the canonical repo path so create-pull-request sees the diff.
+          cp /tmp/baselines.json eval/ragas/baselines.json
+          echo "Captured new baselines.json:"
+          cat eval/ragas/baselines.json | python3 -m json.tool
+
       - name: Render PR comment markdown
         id: comment
         run: |
