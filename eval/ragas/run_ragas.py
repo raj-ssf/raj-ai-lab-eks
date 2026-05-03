@@ -195,6 +195,40 @@ def invoke(token: str, prompt: str, session_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+# Phase #46e (2026-05-03): structural pivot away from cap-tuning the
+# Faithfulness judge. Retrieval accumulation across langgraph reflective
+# cycles (cycles=3 entries pulling 9+ chunks at ~1500 chars each) was
+# bloating the judge prompt past vLLM's --max-model-len 16384 budget,
+# causing prompt truncation → judge sees a broken prompt → NaN.
+#
+# Cap to top-N chunks (rag-service returns score-desc, so top-N keeps
+# the highest-relevance ones) and bound total context characters as a
+# secondary defence. The 5 questions in the dataset have ground_truth
+# overlap concentrated in the first 2-3 chunks; cutting at 5 retains
+# the gating signal. Also bound the response chars so a verbose
+# multi-cycle agent can't dominate the statement-extraction step.
+RAGAS_MAX_CHUNKS = 5
+RAGAS_MAX_CONTEXT_CHARS = 6000  # total across the chunk list
+RAGAS_MAX_RESPONSE_CHARS = 2400  # ~600 tokens at 4 chars/token
+
+
+def _truncate_chunks(chunks: list[str], max_chunks: int, max_total_chars: int) -> list[str]:
+    """Top-N chunks, total chars bounded. Ordered top-first
+    (rag-service returns score-desc)."""
+    out: list[str] = []
+    used = 0
+    for c in chunks[:max_chunks]:
+        remaining = max_total_chars - used
+        if remaining <= 0:
+            break
+        if len(c) > remaining:
+            out.append(c[:remaining])
+            break
+        out.append(c)
+        used += len(c)
+    return out
+
+
 def build_eval_dataset(dataset: dict, results: list[dict]) -> EvaluationDataset:
     """Assemble RAGAS-shape rows from dataset entries + invoke results.
 
@@ -203,16 +237,24 @@ def build_eval_dataset(dataset: dict, results: list[dict]) -> EvaluationDataset:
     The `reference` field is the ground_truth_answer (used by metrics
     like ResponseRelevancy). `reference_contexts` is the ground-truth
     context list (used by LLMContextPrecisionWithReference).
+
+    2026-05-03 pivot: retrieved_contexts are pre-truncated to RAGAS_MAX_CHUNKS
+    (top-N by retrieval score) and RAGAS_MAX_CONTEXT_CHARS to keep the judge
+    prompt deterministic-sized regardless of langgraph's reflective-loop
+    cycle count. Same idea for response chars.
     """
     rows: list[dict] = []
     for entry, result in zip(dataset["entries"], results):
+        chunks = [c["text"] for c in result.get("retrieved_chunks", [])]
+        bounded_chunks = _truncate_chunks(
+            chunks, RAGAS_MAX_CHUNKS, RAGAS_MAX_CONTEXT_CHARS
+        )
+        response = (result["response"] or "")[:RAGAS_MAX_RESPONSE_CHARS]
         rows.append(
             {
                 "user_input": entry["question"],
-                "response": result["response"],
-                "retrieved_contexts": [
-                    c["text"] for c in result.get("retrieved_chunks", [])
-                ],
+                "response": response,
+                "retrieved_contexts": bounded_chunks,
                 "reference": entry["ground_truth_answer"],
                 "reference_contexts": entry["ground_truth_contexts"],
             }
@@ -343,15 +385,20 @@ def main() -> int:
             base_url=JUDGE_LLM_URL,
             api_key="not-required",  # vLLM doesn't enforce
             temperature=0.0,
-            # 12288 = ceiling-near. 70B's --max-model-len 16384 leaves
-            # ~4K for prompt + retrieved chunks at this output budget;
-            # RAGAS Faithfulness prompts are typically 1-3K so this is
-            # the practical max that keeps the prompt non-truncated.
-            # Run 25267247638 at 8192 still NaN'd 3/5 entries; one
-            # final bump before pivoting structurally to response
-            # truncation if this doesn't close all remaining gaps.
-            max_tokens=12288,
-            timeout=180,
+            # max_tokens=8192 (reverted from 12288). Run 25267464025
+            # at 12288 produced 5/5 NaN — WORSE than 8192's 3/5.
+            # Likely cause: with only 4K left for prompt at 12288
+            # output budget, vLLM truncated the assembled judge
+            # prompt (RAGAS prompt + accumulated retrieved chunks)
+            # → judge sees broken input → garbage out → NaN.
+            #
+            # 8192 (best observed config) leaves ~8K for prompt +
+            # retrieved chunks. Combined with the new RAGAS-input
+            # truncation in build_eval_dataset (RAGAS_MAX_CHUNKS=5,
+            # RAGAS_MAX_CONTEXT_CHARS=6000), the prompt now fits
+            # comfortably regardless of langgraph cycle count.
+            max_tokens=8192,
+            timeout=120,
         )
     )
     # Used by ResponseRelevancy + LLMContextPrecisionWithReference.
