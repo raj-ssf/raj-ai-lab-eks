@@ -592,14 +592,14 @@ spec:
         # ec2nodeclass labels). Aligning with the working pattern used by
         # the 8B and other GPU Deployments in this manifest.
         karpenter.sh/nodepool: gpu-experiments
-        # AZ pin swapped 2026-04-29 22:30 → 23:31 from us-west-2a
-        # back to us-west-2c. AWS capacity rotated: at 22:30,
-        # us-west-2a had p4d/p5 capacity and us-west-2c didn't;
-        # by 23:31 AWS reported the inverse, with us-west-2b/c/d
-        # holding capacity. Both gp3 PVCs are populated, so the
-        # operator just edits this two-line block + the claimName
-        # below to swap. Tag-team AZs.
-        topology.kubernetes.io/zone: us-west-2c
+        # AZ pin swapped 2026-05-03 from us-west-2c → us-west-2a:
+        # AWS had no p4d/p5 capacity in us-west-2c at scale-up time
+        # (Karpenter logged "no instance type ... had a required
+        # offering" for ~5 min of retry). us-west-2a's gp3 PVC
+        # vllm-cache-llama-405b-gp3-usw2a is pre-staged for exactly
+        # this swap. If 2a also lacks capacity, try 2b
+        # (vllm-cache-llama-405b-gp3-usw2b) — both PVCs persist.
+        topology.kubernetes.io/zone: us-west-2a
       tolerations:
         - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
         - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
@@ -677,7 +677,10 @@ spec:
             # See the nodeSelector comment above for the full
             # claimName/zone-pin swap recipe + the S3-Mountpoint
             # fallback path (vllm-cache-llama-405b, multi-AZ).
-            claimName: vllm-cache-llama-405b-gp3
+            # 2026-05-03: swapped from -gp3 (us-west-2c) to
+            # -gp3-usw2a (us-west-2a) due to lack of p4d/p5 capacity
+            # in us-west-2c at scale-up time.
+            claimName: vllm-cache-llama-405b-gp3-usw2a
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 16Gi }
 
