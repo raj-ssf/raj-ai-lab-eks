@@ -129,7 +129,7 @@ kind: Deployment
 metadata:
   name: vllm-llama-405b
 spec:
-  replicas: 1
+  replicas: 0
 
 ---
 # vllm-llama-guard-3-8b: content safety classifier (Phase #4).
