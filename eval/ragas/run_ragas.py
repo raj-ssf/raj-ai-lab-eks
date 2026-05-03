@@ -371,8 +371,22 @@ def main() -> int:
             base_url=JUDGE_LLM_URL,
             api_key="not-required",  # vLLM doesn't enforce
             temperature=0.0,
-            max_tokens=2048,
             timeout=60,
+            # Pass max_tokens via model_kwargs (raw OpenAI API kwargs)
+            # in addition to the constructor arg. Run 25268640080
+            # showed the constructor-level max_tokens=2048 was being
+            # silently dropped somewhere between LangchainLLMWrapper
+            # and the actual HTTP request — every Faithfulness call
+            # went to vLLM with max_tokens=8192 (the model's
+            # max-model-len) and failed with HTTP 400.
+            #
+            # model_kwargs is langchain-openai's escape hatch for
+            # parameters that need to bypass langchain's per-version
+            # parameter munging (the max_tokens vs
+            # max_completion_tokens migration in particular). These
+            # kwargs are forwarded directly to the OpenAI client's
+            # chat.completions.create() call.
+            model_kwargs={"max_tokens": 2048},
         )
     )
     embeddings = LangchainEmbeddingsWrapper(
