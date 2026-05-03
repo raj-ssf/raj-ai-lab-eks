@@ -97,7 +97,7 @@ kind: Deployment
 metadata:
   name: vllm
 spec:
-  replicas: 0
+  replicas: 1
 
 # ============================================================
 # COLD by default — bring up only for specific demos
