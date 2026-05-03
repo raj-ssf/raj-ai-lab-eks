@@ -310,41 +310,51 @@ def main() -> int:
     eval_ds = build_eval_dataset(dataset, results)
 
     print("Configuring judge LLM + embeddings (in-cluster vLLM)...")
-    # max_tokens history (chasing LLMDidNotFinishException → NaN
-    # faithfulness):
-    #   pre-2026-05-02: 512   (8B judge)  → 3/5 NaN
-    #   895d665:        2048  (8B judge)  → 1/5 NaN
-    #   895d665+007e495 2048  (70B judge) → ALL NaN initially
-    #                                       (pod crashed under load,
-    #                                        fixed by 78854c5)
-    #   78854c5:        2048  (70B judge) → 4/5 NaN
-    #   THIS:           4096  (70B judge) → expected 0/5 NaN
+    # Two-judge setup: Faithfulness alone needs a much higher
+    # max_tokens budget than ResponseRelevancy or ContextPrecision.
+    # See history of NaN-chasing in commit 4f96500 + the eval runs
+    # 25266810622 (70B@2048) and 25267032733 (70B@4096) that landed
+    # 4-of-5 NaN with different entries failing each time.
     #
-    # Why successive bumps were necessary: RAGAS Faithfulness is a
-    # 2-step LLM-judge metric: (1) extract atomic statements from
-    # the response, (2) verify each statement vs retrieved_contexts —
-    # both as strict JSON. The 70B-as-judge produces denser, more
-    # nuanced statement breakdowns than the 8B (the very behavior
-    # that makes it a better judge), so the same per-call output
-    # budget runs out faster. RAGAS surfaces this as
-    # `LLMDidNotFinishException(...Please increase the max_tokens...)`.
+    # Why per-metric is the structural fix: RAGAS Faithfulness is
+    # a 2-step JSON dance — statement extraction then per-statement
+    # verification — emitting a JSON list whose size scales with
+    # claim density of the response. The 70B-as-judge extracts more
+    # atomic statements + writes more nuanced per-statement reasoning
+    # than smaller judges, so its outputs blow past flat caps even
+    # at 4096 tokens. Bumping the GLOBAL cap further would also
+    # bloat ResponseRelevancy / ContextPrecision calls that already
+    # finish in ~1K tokens — wasted latency.
     #
-    # 4096 with 70B judge: 70B serves at --max-model-len 16384, so
-    # 4096 output leaves 12K for prompt + retrieved chunks. Latency
-    # rises to maybe 10-25s per cap-bound call; full eval grows
-    # ~60-120s. No cost impact (in-cluster).
+    # Faithfulness judge: 8192 max_tokens. The 70B serves at
+    # --max-model-len 16384, leaving ~8K for prompt + retrieved
+    # chunks (RAGAS prompts are typically 1-3K). Plenty of headroom.
+    # Per-call latency rises (15-30s on dense answers) but only
+    # for the 5 Faithfulness calls in a 5-entry dataset.
     #
-    # If 4096 still produces NaN on any entry, the next escalation is
-    # NOT another bump (diminishing returns) but a structural change:
-    # truncate the langgraph response before scoring, or override
-    # max_tokens per-metric so only Faithfulness gets the higher cap.
-    judge_llm = LangchainLLMWrapper(
+    # Other-metric judge: 2048 max_tokens. ResponseRelevancy and
+    # ContextPrecision JSON outputs are short — list of generated
+    # questions (4-5 items) for relevancy, list of yes/no scores
+    # for precision. 2048 is comfortably above their actual budget;
+    # keeping it tight saves the per-call generation time.
+    faithfulness_judge = LangchainLLMWrapper(
         ChatOpenAI(
             model=JUDGE_LLM_MODEL,
             base_url=JUDGE_LLM_URL,
             api_key="not-required",  # vLLM doesn't enforce
             temperature=0.0,
-            max_tokens=4096,
+            max_tokens=8192,
+            timeout=120,  # bigger budget can mean longer wall-clock
+        )
+    )
+    # Used by ResponseRelevancy + LLMContextPrecisionWithReference.
+    judge_llm = LangchainLLMWrapper(
+        ChatOpenAI(
+            model=JUDGE_LLM_MODEL,
+            base_url=JUDGE_LLM_URL,
+            api_key="not-required",
+            temperature=0.0,
+            max_tokens=2048,
             timeout=60,
         )
     )
@@ -361,8 +371,11 @@ def main() -> int:
     )
 
     print("Scoring with RAGAS...")
+    # Faithfulness gets the higher-budget judge (8192 max_tokens).
+    # The other two metrics use the default 2048-budget judge_llm
+    # since their judge outputs are inherently shorter.
     metrics = [
-        Faithfulness(llm=judge_llm),
+        Faithfulness(llm=faithfulness_judge),
         ResponseRelevancy(llm=judge_llm, embeddings=embeddings),
         LLMContextPrecisionWithReference(llm=judge_llm),
     ]
