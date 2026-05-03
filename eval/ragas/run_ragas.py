@@ -310,35 +310,41 @@ def main() -> int:
     eval_ds = build_eval_dataset(dataset, results)
 
     print("Configuring judge LLM + embeddings (in-cluster vLLM)...")
-    # max_tokens=2048 (was 512 pre-2026-05-02). RAGAS Faithfulness is a
-    # 2-step LLM-judge metric: (1) extract atomic statements from the
-    # response, (2) verify each statement vs retrieved_contexts — both
-    # as strict JSON output. For technical multi-paragraph answers
-    # (5-15 atomic statements × 30-80 tokens of JSON each), the judge
-    # output blows past 512 tokens mid-JSON; RAGAS catches this with
-    # `LLMDidNotFinishException(The LLM generation was not completed.
-    # Please increase the max_tokens and try again.)` and the metric
-    # returns NaN for that row.
+    # max_tokens history (chasing LLMDidNotFinishException → NaN
+    # faithfulness):
+    #   pre-2026-05-02: 512   (8B judge)  → 3/5 NaN
+    #   895d665:        2048  (8B judge)  → 1/5 NaN
+    #   895d665+007e495 2048  (70B judge) → ALL NaN initially
+    #                                       (pod crashed under load,
+    #                                        fixed by 78854c5)
+    #   78854c5:        2048  (70B judge) → 4/5 NaN
+    #   THIS:           4096  (70B judge) → expected 0/5 NaN
     #
-    # Diagnosed in run 25263776179 (sha dcf0115, 2026-05-02): 3 of 5
-    # questions returned NaN faithfulness. Job indices 0, 3, 12 in the
-    # RAGAS exception trace map to flat (entry × metric) indices for
-    # the 3 high-information questions (pod-identity, karpenter-nodepool,
-    # graph-reasoning-loop). The 2 questions that scored valid had
-    # shorter answers fitting under 512.
+    # Why successive bumps were necessary: RAGAS Faithfulness is a
+    # 2-step LLM-judge metric: (1) extract atomic statements from
+    # the response, (2) verify each statement vs retrieved_contexts —
+    # both as strict JSON. The 70B-as-judge produces denser, more
+    # nuanced statement breakdowns than the 8B (the very behavior
+    # that makes it a better judge), so the same per-call output
+    # budget runs out faster. RAGAS surfaces this as
+    # `LLMDidNotFinishException(...Please increase the max_tokens...)`.
     #
-    # 2048 leaves ~6K of context-window headroom on the 8B's 8192
-    # max-model-len for the prompt + retrieved chunks; ample for any
-    # plausible RAGAS judge prompt. Latency grows modestly (each
-    # judge call may take 5-15s on cap-bound questions vs ~5s before),
-    # adding ~30-60s to the full eval. No cost impact (in-cluster).
+    # 4096 with 70B judge: 70B serves at --max-model-len 16384, so
+    # 4096 output leaves 12K for prompt + retrieved chunks. Latency
+    # rises to maybe 10-25s per cap-bound call; full eval grows
+    # ~60-120s. No cost impact (in-cluster).
+    #
+    # If 4096 still produces NaN on any entry, the next escalation is
+    # NOT another bump (diminishing returns) but a structural change:
+    # truncate the langgraph response before scoring, or override
+    # max_tokens per-metric so only Faithfulness gets the higher cap.
     judge_llm = LangchainLLMWrapper(
         ChatOpenAI(
             model=JUDGE_LLM_MODEL,
             base_url=JUDGE_LLM_URL,
             api_key="not-required",  # vLLM doesn't enforce
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=4096,
             timeout=60,
         )
     )
