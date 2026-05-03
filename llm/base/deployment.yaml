@@ -116,8 +116,30 @@ spec:
             - "half"         # FP16 activations
             - "--max-model-len"
             - "16384"        # conservative; bump if KV cache has room
+            # Phase #83c attempt-2 follow-up (2026-05-03): 0.92 -> 0.80.
+            # The original 0.92 was sized for 70B-only on this Deployment.
+            # With spec decoding wired (--speculative-model below loading
+            # a 1B FP16 draft TP-sharded across all 4 ranks), vLLM's
+            # memory pool at 0.92 saturates the GPU at ~21.3 GiB used /
+            # 22 GiB total on the L4-class g6.12xlarge -- leaving only
+            # ~123 MiB free for NCCL's all_reduce working memory during
+            # inference. RAGAS judge load triggered OOM:
+            #   torch.OutOfMemoryError: CUDA out of memory. Tried to
+            #   allocate 246.00 MiB. GPU 0 has a total capacity of
+            #   22.03 GiB of which 123.69 MiB is free.
+            # at vllm/distributed/parallel_state.py: _all_reduce_out_place.
+            # Crashed under the 15-concurrent eval /v1/chat/completions
+            # barrage (was idle-fine for ~50 min before that).
+            #
+            # 0.80 leaves ~4.4 GiB free per GPU for NCCL + system buffer
+            # while still affording ~3 GiB KV pool per GPU. Trade-off:
+            # lower max-concurrent-decode capacity per pod, but stable
+            # under realistic load instead of OOM-crashing. If Karpenter
+            # ever schedules to a larger GPU class (L40S 48 GiB or A100
+            # 80 GiB) the same 0.80 leaves much more headroom -- the
+            # tightness only shows on L4 24 GiB.
             - "--gpu-memory-utilization"
-            - "0.92"
+            - "0.80"
             - "--enforce-eager"   # skip CUDA graph capture → faster cold start, -15% tokens/sec
             - "--host"
             - "0.0.0.0"
