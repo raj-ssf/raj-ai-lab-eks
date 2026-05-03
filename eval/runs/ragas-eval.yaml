@@ -91,10 +91,29 @@ spec:
               value: http://langgraph-service.langgraph.svc.cluster.local
             - name: INGESTION_URL
               value: http://ingestion-service.ingestion.svc.cluster.local
+            # Judge LLM: switched 8B -> canonical 70B (`vllm` Service)
+            # 2026-05-03 to fix residual NaN faithfulness on the 2 highest-
+            # information dataset entries (pod-identity-vs-irsa,
+            # graph-reasoning-loop-cap). The 8B at max_tokens=2048 still
+            # truncated mid-JSON for those (LLMDidNotFinishException in
+            # run 25265817206). Two reasons the 70B is the right
+            # escalation:
+            #   - --max-model-len 16384 (vs 8192 on the 8B) gives 2x more
+            #     context-window headroom for the prompt + judge output.
+            #   - 70B follows strict-JSON schemas more reliably than 8B
+            #     under length pressure — 8B-class judges are inherently
+            #     a softer signal for RAGAS.
+            # Cost: only when the eval Job actually runs (the 70B is JIT-
+            # warmed via scaling.yaml). Operator scales it up before
+            # eval, scales down after — same pattern as bge-m3 / deepseek.
+            # Pre-req added: vllm Deployment must be at replicas: 1
+            # in scaling.yaml when this Job runs (see workflow's
+            # `Verify required GPU services are warm` precondition; will
+            # need GPU_DEPLOYMENTS env to include `vllm`).
             - name: JUDGE_LLM_URL
-              value: http://vllm-llama-8b.llm.svc.cluster.local:8000/v1
+              value: http://vllm.llm.svc.cluster.local:8000/v1
             - name: JUDGE_LLM_MODEL
-              value: llama-3.1-8b
+              value: llama-3.3-70b
             - name: EMBEDDINGS_URL
               value: http://vllm-bge-m3.llm.svc.cluster.local:8000/v1
             - name: EMBEDDINGS_MODEL
