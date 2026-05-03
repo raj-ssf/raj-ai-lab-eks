@@ -70,13 +70,14 @@ env:
   # tuned-lora — both served by vllm-llama-8b), 5th errors with
   # "httpx.ReadTimeout: timed out", whole Job hangs until
   # JOB_WAIT_TIMEOUT, scores JSON empty, gate exits 1.
-  # Phase #73b NaN-fix follow-up (2026-05-03): added `vllm` (canonical
-  # 70B) — the eval Job's judge LLM was switched from vllm-llama-8b
-  # to the 70B (eval/runs/ragas-eval.yaml: JUDGE_LLM_URL/MODEL). The
-  # 8B at max_tokens=2048 still truncated mid-JSON for the highest-
-  # information dataset entries; the 70B's --max-model-len 16384 +
-  # better strict-JSON adherence resolves that.
-  GPU_DEPLOYMENTS: vllm-llama-8b vllm-bge-m3 vllm-deepseek-r1-70b vllm
+  # Phase #46e (2026-05-03): dropped `vllm` (canonical 70B) from
+  # the precondition list. The eval no longer uses it as a judge —
+  # Faithfulness was switched to FaithfulnesswithHHEM (local NLI
+  # classifier baked into the eval image), and the LLM-judge for
+  # the other metrics + HHEM's statement-extraction step reverted
+  # to vllm-llama-8b. The 70B can now stay cold without breaking
+  # the eval.
+  GPU_DEPLOYMENTS: vllm-llama-8b vllm-bge-m3 vllm-deepseek-r1-70b
   # Phase #81f run #2: bumped 1500→3600 to leave headroom for the 70B
   # cold-start (~5-10 min on g6.12xlarge) PLUS 5 langgraph /invoke
   # turns PLUS the 5×3-metric RAGAS scoring loop. 25 min was too

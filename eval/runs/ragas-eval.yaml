@@ -91,29 +91,21 @@ spec:
               value: http://langgraph-service.langgraph.svc.cluster.local
             - name: INGESTION_URL
               value: http://ingestion-service.ingestion.svc.cluster.local
-            # Judge LLM: switched 8B -> canonical 70B (`vllm` Service)
-            # 2026-05-03 to fix residual NaN faithfulness on the 2 highest-
-            # information dataset entries (pod-identity-vs-irsa,
-            # graph-reasoning-loop-cap). The 8B at max_tokens=2048 still
-            # truncated mid-JSON for those (LLMDidNotFinishException in
-            # run 25265817206). Two reasons the 70B is the right
-            # escalation:
-            #   - --max-model-len 16384 (vs 8192 on the 8B) gives 2x more
-            #     context-window headroom for the prompt + judge output.
-            #   - 70B follows strict-JSON schemas more reliably than 8B
-            #     under length pressure — 8B-class judges are inherently
-            #     a softer signal for RAGAS.
-            # Cost: only when the eval Job actually runs (the 70B is JIT-
-            # warmed via scaling.yaml). Operator scales it up before
-            # eval, scales down after — same pattern as bge-m3 / deepseek.
-            # Pre-req added: vllm Deployment must be at replicas: 1
-            # in scaling.yaml when this Job runs (see workflow's
-            # `Verify required GPU services are warm` precondition; will
-            # need GPU_DEPLOYMENTS env to include `vllm`).
+            # Judge LLM (Phase #46e — 2026-05-03): reverted from canonical
+            # 70B back to vllm-llama-8b. The 70B-as-judge experiment
+            # (commits 007e495..ce2f2d4) produced strictly worse NaN
+            # counts than the 8B@2048 baseline because the 70B's denser,
+            # more nuanced JSON output blew past every practical token
+            # budget. Switched Faithfulness scoring entirely to
+            # FaithfulnesswithHHEM (local NLI classifier baked into the
+            # eval image) so the only LLM-judge step left for that metric
+            # is statement extraction (~5-10 statements, ~500 tokens —
+            # comfortably within 2048). The 8B's brevity is now a
+            # feature, not a bug.
             - name: JUDGE_LLM_URL
-              value: http://vllm.llm.svc.cluster.local:8000/v1
+              value: http://vllm-llama-8b.llm.svc.cluster.local:8000/v1
             - name: JUDGE_LLM_MODEL
-              value: llama-3.3-70b
+              value: llama-3.1-8b
             - name: EMBEDDINGS_URL
               value: http://vllm-bge-m3.llm.svc.cluster.local:8000/v1
             - name: EMBEDDINGS_MODEL
@@ -149,12 +141,18 @@ spec:
                 name: ragas-eval-credentials
 
           resources:
+            # Phase #46e: bumped from 2/4 GiB → 3/6 GiB to fit the
+            # HHEM model. vectara/hallucination_evaluation_model is
+            # ~568M params; loaded in fp32 it occupies ~2.3 GiB of
+            # RAM, plus transient activations during NLI inference.
+            # CPU is bumped because HHEM does serial CPU forward
+            # passes (~50 statements × ~1-2 s each per eval run).
             requests:
-              cpu: "1"
-              memory: "2Gi"
-            limits:
               cpu: "2"
-              memory: "4Gi"
+              memory: "3Gi"
+            limits:
+              cpu: "4"
+              memory: "6Gi"
 
           # Use the empty volume mount as a writable scratch area for
           # the runner's scores.json output — the image's WORKDIR

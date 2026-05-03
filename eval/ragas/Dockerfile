@@ -49,6 +49,29 @@ WORKDIR /workspace
 COPY requirements.txt /workspace/requirements.txt
 RUN pip install --no-cache-dir -r /workspace/requirements.txt
 
+# Phase #46e (2026-05-03): pre-cache the HHEM model into the image so
+# the eval Job runs offline. RAGAS's FaithfulnesswithHHEM loads
+# vectara/hallucination_evaluation_model on first use; we don't want
+# that download in the hot path (HF can be slow / rate-limited; we
+# also want determinism on the model version baked into a given
+# image SHA).
+#
+# trust_remote_code=True is required because HHEM v2.x ships custom
+# modeling code in the repo. Set HF_HOME so the cache lives somewhere
+# stable across runtime invocations; HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE
+# below force the loader to use only what's in the cache, never reach
+# the network.
+ENV HF_HOME=/opt/hf-cache
+RUN mkdir -p "$HF_HOME" && \
+    python -c "\
+from transformers import AutoModelForSequenceClassification, AutoTokenizer; \
+m = AutoModelForSequenceClassification.from_pretrained('vectara/hallucination_evaluation_model', trust_remote_code=True); \
+t = AutoTokenizer.from_pretrained('vectara/hallucination_evaluation_model'); \
+print('HHEM cached:', m.__class__.__name__, t.__class__.__name__)"
+
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
+
 # After requirements settle, drop the build-essential layer to slim the
 # final image. Most Python wheels are pre-built; build-essential is
 # only needed when a sdist falls through. If pip resolves cleanly to

@@ -37,6 +37,19 @@ boto3>=1.34,<2.0
 # pip resolves an older version that crashes on newer datasets calls.
 transformers>=4.45.0,<5.0
 
+# Phase #46e (2026-05-03): HHEM-based Faithfulness uses
+# vectara/hallucination_evaluation_model (~568M params NLI classifier)
+# loaded locally on CPU via transformers. Replaced the LLM-judge JSON
+# variant after 8 commits of cap-tuning hit a structural ceiling
+# (judge output truncates regardless of token budget). HHEM has no
+# token-budget failure surface — it's a deterministic
+# SequenceClassifier forward pass.
+#
+# CPU-only build to keep the layer small (~700 MB vs ~2.5 GB CUDA).
+# The eval Job runs on the `general` Karpenter NodePool (CPU only).
+torch>=2.0,<3.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 # pydantic — version range is tight on RAGAS 0.2: it requires
 # pydantic>=2.x and we already use 2.9 elsewhere. Range-pin to give
 # pip room to resolve.
