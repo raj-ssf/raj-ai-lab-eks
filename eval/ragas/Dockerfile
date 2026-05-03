@@ -62,11 +62,17 @@ RUN pip install --no-cache-dir -r /workspace/requirements.txt
 # below force the loader to use only what's in the cache, never reach
 # the network.
 ENV HF_HOME=/opt/hf-cache
+# Both calls need trust_remote_code=True. AutoTokenizer's
+# from_pretrained internally calls AutoConfig.from_pretrained to
+# figure out which tokenizer class to use, and AutoConfig fails
+# the trust_remote_code prompt for HHEM v2's custom HHEMv2Config
+# class. Without this flag the build fails with EOFError on the
+# interactive y/N prompt that buildkit can't answer.
 RUN mkdir -p "$HF_HOME" && \
     python -c "\
 from transformers import AutoModelForSequenceClassification, AutoTokenizer; \
 m = AutoModelForSequenceClassification.from_pretrained('vectara/hallucination_evaluation_model', trust_remote_code=True); \
-t = AutoTokenizer.from_pretrained('vectara/hallucination_evaluation_model'); \
+t = AutoTokenizer.from_pretrained('vectara/hallucination_evaluation_model', trust_remote_code=True); \
 print('HHEM cached:', m.__class__.__name__, t.__class__.__name__)"
 
 ENV HF_HUB_OFFLINE=1
