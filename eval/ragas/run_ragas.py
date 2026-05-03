@@ -310,13 +310,35 @@ def main() -> int:
     eval_ds = build_eval_dataset(dataset, results)
 
     print("Configuring judge LLM + embeddings (in-cluster vLLM)...")
+    # max_tokens=2048 (was 512 pre-2026-05-02). RAGAS Faithfulness is a
+    # 2-step LLM-judge metric: (1) extract atomic statements from the
+    # response, (2) verify each statement vs retrieved_contexts — both
+    # as strict JSON output. For technical multi-paragraph answers
+    # (5-15 atomic statements × 30-80 tokens of JSON each), the judge
+    # output blows past 512 tokens mid-JSON; RAGAS catches this with
+    # `LLMDidNotFinishException(The LLM generation was not completed.
+    # Please increase the max_tokens and try again.)` and the metric
+    # returns NaN for that row.
+    #
+    # Diagnosed in run 25263776179 (sha dcf0115, 2026-05-02): 3 of 5
+    # questions returned NaN faithfulness. Job indices 0, 3, 12 in the
+    # RAGAS exception trace map to flat (entry × metric) indices for
+    # the 3 high-information questions (pod-identity, karpenter-nodepool,
+    # graph-reasoning-loop). The 2 questions that scored valid had
+    # shorter answers fitting under 512.
+    #
+    # 2048 leaves ~6K of context-window headroom on the 8B's 8192
+    # max-model-len for the prompt + retrieved chunks; ample for any
+    # plausible RAGAS judge prompt. Latency grows modestly (each
+    # judge call may take 5-15s on cap-bound questions vs ~5s before),
+    # adding ~30-60s to the full eval. No cost impact (in-cluster).
     judge_llm = LangchainLLMWrapper(
         ChatOpenAI(
             model=JUDGE_LLM_MODEL,
             base_url=JUDGE_LLM_URL,
             api_key="not-required",  # vLLM doesn't enforce
             temperature=0.0,
-            max_tokens=512,
+            max_tokens=2048,
             timeout=60,
         )
     )
