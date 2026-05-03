@@ -402,38 +402,29 @@ def main() -> int:
     )
 
     print("Scoring with RAGAS...")
-    # Phase #46e final: Faithfulness DROPPED from the metric list.
-    # Eleven commits chasing NaN faithfulness across both LLM-judge
-    # and HHEM variants established that the failure isn't in the
-    # metric's algorithm — it's in the langchain-openai 0.2.14 ↔
-    # RAGAS 0.2.15 ↔ vLLM /v1/chat/completions parameter pipeline.
-    # max_tokens set on the LangchainLLMWrapper's underlying ChatOpenAI
-    # gets silently stripped before reaching vLLM, causing every
-    # Faithfulness statement-extraction call to request the model's
-    # max-model-len (8192 on the 8B) as completion tokens — which
-    # vLLM rejects with HTTP 400 since that leaves zero budget for
-    # the prompt.
+    # 2026-05-03: Faithfulness restored. The earlier drop (commit
+    # aeb1fd1) was based on the langchain-openai 0.2.14 ↔ RAGAS 0.2.15
+    # max_tokens parameter-propagation regression — every Faithfulness
+    # statement-extraction call went out to vLLM with max_tokens=8192
+    # (the model's max-model-len) instead of our configured 2048,
+    # triggering HTTP 400 because the prompt + 8192 exceeded the
+    # context window. Rather than fixing the langchain wrapper (which
+    # would require forking RAGAS or replacing the wrapper), we
+    # bumped the served 8B's --max-model-len from 8192 -> 16384 in
+    # llm/base/deployment-models.yaml. The unbounded max_tokens
+    # request now fits comfortably (prompt 500 + completion 8192 =
+    # 8700 ≪ 16384). Targets the symptom; cause stays documented
+    # in feedback_ragas_judge_max_tokens.md for if RAGAS ever fixes
+    # the wrapper.
     #
-    # Tried: max_tokens at constructor (commits 895d665, 4f96500,
-    # 89a4207, fe095fc, ce2f2d4), 70B-as-judge (007e495..ce2f2d4),
-    # FaithfulnesswithHHEM swap (17d440a..8ff2e55), explicit
-    # llm= at metric construction (8ff2e55), model_kwargs passthrough
-    # (e5e9d81). All exhibited the same downstream symptom.
-    #
-    # The other two metrics propagate max_tokens correctly because
-    # their internal LLM call paths are differently structured —
-    # ResponseRelevancy uses the wrapper's `agenerate()` directly,
-    # LLMContextPrecisionWithReference uses a constrained-output
-    # prompt that fits well below the cap. Both have produced valid
-    # scores across all 5 entries on every successful run.
-    #
-    # The gate ships with answer_relevancy + context_precision.
-    # Hallucination-specific signal is recoverable in a future commit
-    # by calling HHEM directly (skip RAGAS entirely; the model is
-    # already baked into the image at /opt/hf-cache from commit
-    # 8a2953b) or after a RAGAS / langchain-openai upgrade fixes
-    # the parameter-propagation regression.
+    # Faithfulness here is FaithfulnesswithHHEM — uses the local
+    # vectara/hallucination_evaluation_model NLI classifier
+    # (~568M params, baked into the eval image at /opt/hf-cache)
+    # for the per-statement entailment check. Statement extraction
+    # still runs via judge_llm but emits ~5-10 statements and
+    # naturally stops well short of any plausible cap.
     metrics = [
+        FaithfulnesswithHHEM(llm=judge_llm),
         ResponseRelevancy(llm=judge_llm, embeddings=embeddings),
         LLMContextPrecisionWithReference(llm=judge_llm),
     ]

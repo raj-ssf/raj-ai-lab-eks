@@ -161,8 +161,33 @@ spec:
             # (the gpu-experiments NodePool also includes A100/H100).
             - "--dtype"
             - "half"
+            # 2026-05-03: bumped 8192 -> 16384 to unblock RAGAS
+            # Faithfulness scoring. langchain-openai 0.2.14 ↔ RAGAS
+            # 0.2.15 has a max_tokens parameter-propagation regression
+            # that strips our configured max_tokens=2048 before the
+            # request reaches vLLM. The unbounded default resolves to
+            # max-model-len, so vLLM was rejecting every Faithfulness
+            # statement-extraction call with HTTP 400 ("8192 requested
+            # in completion, prompt 507 → 8699 > 8192"). Doubling
+            # max-model-len makes the unbounded request fit
+            # comfortably. Targets the SYMPTOM (request rejection),
+            # not the cause (the langchain pipeline drop) — see
+            # feedback_ragas_judge_max_tokens.md for the full arc.
+            #
+            # Cost trade-offs at 16384:
+            #   - KV cache reservation per request: 2x the previous
+            #     ceiling (vLLM's per-sequence KV reservation scales
+            #     with max_model_len). Peak concurrent decode capacity
+            #     on the L4 24 GiB drops from ~60 to ~30. Trivial-
+            #     tier traffic is well under that ceiling.
+            #   - Live chat brief unavailability on rollout (Recreate
+            #     strategy + cold-start ~5 min). One-time cost the
+            #     operator approved.
+            #   - Prefix caching efficiency unchanged: max-model-len
+            #     doesn't affect cache hit rate, only the budget
+            #     reserved if a request needs the full window.
             - "--max-model-len"
-            - "8192"
+            - "16384"
             # Phase #80a: bumped 0.85 → 0.92. With prefix caching (below)
             # enabled, more memory in the KV cache pool = more prefixes
             # retained = higher hit rate. Llama-3.1-8B FP16 is ~16GB
