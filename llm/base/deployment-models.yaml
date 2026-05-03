@@ -585,7 +585,13 @@ spec:
       # topology.kubernetes.io/zone pin, restore readOnly: true on
       # the volumeMount.
       nodeSelector:
-        workload: gpu-experiment
+        # 2026-05-03: switched from `workload: gpu-experiment` (a label
+        # the cluster's NodePools don't actually advertise — was a stale
+        # selector that never got tested because this Deployment hadn't
+        # been scaled to >0 since the rename of gpu-experiments NodePool's
+        # ec2nodeclass labels). Aligning with the working pattern used by
+        # the 8B and other GPU Deployments in this manifest.
+        karpenter.sh/nodepool: gpu-experiments
         # AZ pin swapped 2026-04-29 22:30 → 23:31 from us-west-2a
         # back to us-west-2c. AWS capacity rotated: at 22:30,
         # us-west-2a had p4d/p5 capacity and us-west-2c didn't;
