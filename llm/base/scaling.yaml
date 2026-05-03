@@ -60,7 +60,7 @@ kind: Deployment
 metadata:
   name: vllm-llama-1b-distilled
 spec:
-  replicas: 1
+  replicas: 0
 
 # ============================================================
 # JIT — scale up before use, scale down after
@@ -76,7 +76,7 @@ kind: Deployment
 metadata:
   name: vllm-bge-m3
 spec:
-  replicas: 1
+  replicas: 0
 
 ---
 # vllm-deepseek-r1-70b: reasoning-tier model. Cold-start ~10 min on
@@ -87,7 +87,7 @@ kind: Deployment
 metadata:
   name: vllm-deepseek-r1-70b
 spec:
-  replicas: 1
+  replicas: 0
 
 ---
 # vllm: the canonical 70B AWQ Deployment (tp=4 g6e.12xlarge ~$11/hr).
@@ -97,7 +97,7 @@ kind: Deployment
 metadata:
   name: vllm
 spec:
-  replicas: 1
+  replicas: 0
 
 # ============================================================
 # COLD by default — bring up only for specific demos
