@@ -592,14 +592,14 @@ spec:
         # ec2nodeclass labels). Aligning with the working pattern used by
         # the 8B and other GPU Deployments in this manifest.
         karpenter.sh/nodepool: gpu-experiments
-        # AZ pin swapped 2026-05-03 from us-west-2c → us-west-2a:
-        # AWS had no p4d/p5 capacity in us-west-2c at scale-up time
-        # (Karpenter logged "no instance type ... had a required
-        # offering" for ~5 min of retry). us-west-2a's gp3 PVC
-        # vllm-cache-llama-405b-gp3-usw2a is pre-staged for exactly
-        # this swap. If 2a also lacks capacity, try 2b
-        # (vllm-cache-llama-405b-gp3-usw2b) — both PVCs persist.
-        topology.kubernetes.io/zone: us-west-2a
+        # AZ pin tried 2026-05-03: us-west-2c (no capacity) →
+        # us-west-2a (no capacity) → us-west-2b. AWS is tight on
+        # p4d/p5 in us-west-2 today. us-west-2b's pre-staged PVC
+        # vllm-cache-llama-405b-gp3-usw2b is the third try.
+        # If 2b is also dry, fall back to S3 Mountpoint (multi-AZ,
+        # vllm-cache-llama-405b — slower cold-start but works
+        # against any AZ that has capacity).
+        topology.kubernetes.io/zone: us-west-2b
       tolerations:
         - { key: nvidia.com/gpu,    operator: Exists, effect: NoSchedule }
         - { key: gpu-experiment,    operator: Exists, effect: NoSchedule }
@@ -677,10 +677,9 @@ spec:
             # See the nodeSelector comment above for the full
             # claimName/zone-pin swap recipe + the S3-Mountpoint
             # fallback path (vllm-cache-llama-405b, multi-AZ).
-            # 2026-05-03: swapped from -gp3 (us-west-2c) to
-            # -gp3-usw2a (us-west-2a) due to lack of p4d/p5 capacity
-            # in us-west-2c at scale-up time.
-            claimName: vllm-cache-llama-405b-gp3-usw2a
+            # 2026-05-03: swapped 2c → 2a (no capacity) → 2b. The
+            # third pre-staged PVC vllm-cache-llama-405b-gp3-usw2b.
+            claimName: vllm-cache-llama-405b-gp3-usw2b
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 16Gi }
 
