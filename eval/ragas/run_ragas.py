@@ -395,7 +395,15 @@ def main() -> int:
     # was failing on token budget. Statement extraction still uses
     # judge_llm (passed below via evaluate's `llm=` arg).
     metrics = [
-        FaithfulnesswithHHEM(),
+        # Pass llm=judge_llm explicitly. Without it, the metric's
+        # internal LLM client defaults to max_tokens=None which
+        # resolves to the served model's max-model-len (8192 on the
+        # 8B), starving the prompt and triggering vLLM's HTTP 400
+        # "max context length 8192, requested 8192 in completion"
+        # for every Faithfulness call. Symptom seen in run
+        # 25268312166: 5/5 NaN with BadRequestError. The other two
+        # metrics already passed llm= so they were unaffected.
+        FaithfulnesswithHHEM(llm=judge_llm),
         ResponseRelevancy(llm=judge_llm, embeddings=embeddings),
         LLMContextPrecisionWithReference(llm=judge_llm),
     ]
