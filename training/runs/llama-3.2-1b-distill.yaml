@@ -16,7 +16,7 @@
 #
 # Apply via:
 #   export TRAINING_IMAGE=<account>.dkr.ecr.us-west-2.amazonaws.com/training:sha-<short>
-#   export TRAINING_BUCKET=raj-ai-lab-eks-training
+#   export TRAINING_BUCKET=raj-ai-lab-eks-cilium-training
 #   envsubst < training/runs/llama-3.2-1b-distill.yaml | kubectl apply -f -
 #
 # Prerequisites (Phase #81b operational step, NOT in this commit):

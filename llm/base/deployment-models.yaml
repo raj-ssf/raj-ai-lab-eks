@@ -99,7 +99,7 @@ spec:
           image: amazon/aws-cli:2.17.0
           env:
             - { name: AWS_REGION,   value: us-west-2 }
-            - { name: S3_URI,       value: s3://raj-ai-lab-eks-training/adapters/llama-3.1-8b-alpaca-lora/ }
+            - { name: S3_URI,       value: s3://raj-ai-lab-eks-cilium-training/adapters/llama-3.1-8b-alpaca-lora/ }
             - { name: ADAPTER_PATH, value: /adapters/alpaca-lora }
           command: ["/bin/sh", "-euxc"]
           args:
@@ -1215,7 +1215,7 @@ spec:
 # vs the 8B.
 #
 # Stays at replicas=0 in this scaffolding commit because Phase #81c
-# hasn't run yet — the s3://raj-ai-lab-eks-training/adapters/
+# hasn't run yet — the s3://raj-ai-lab-eks-cilium-training/adapters/
 # llama-3.2-1b-distilled/ path doesn't exist until then. Scaling up
 # pre-#81c would fail in the adapter-sync init container.
 #
@@ -1261,7 +1261,7 @@ spec:
   # Pre-reqs already satisfied (Phase #81b/c/d-prereq):
   #   - base weights at s3://raj-ai-lab-eks-cilium-model-weights/llama-3.2-1b/
   #     (operational Job at llm/operational/base-stage-llama-3.2-1b.yaml)
-  #   - LoRA adapter at s3://raj-ai-lab-eks-training/adapters/
+  #   - LoRA adapter at s3://raj-ai-lab-eks-cilium-training/adapters/
   #     llama-3.2-1b-distilled/ (trained 2026-05-01 23:26 PT,
   #     45 MB, train loss 0.74 / eval loss 0.95)
   replicas: 1
@@ -1311,7 +1311,7 @@ spec:
           image: amazon/aws-cli:2.17.0
           env:
             - { name: AWS_REGION,   value: us-west-2 }
-            - { name: S3_URI,       value: s3://raj-ai-lab-eks-training/adapters/llama-3.2-1b-distilled/ }
+            - { name: S3_URI,       value: s3://raj-ai-lab-eks-cilium-training/adapters/llama-3.2-1b-distilled/ }
             - { name: ADAPTER_PATH, value: /adapters/distilled }
           command: ["/bin/sh", "-euxc"]
           args:

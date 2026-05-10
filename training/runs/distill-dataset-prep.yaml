@@ -31,7 +31,7 @@
 #   # because `aws s3 sync "$S3_URI" "$MODEL_PATH"` got pre-substituted
 #   # to `aws s3 sync "" ""`. The allowlist syntax tells envsubst to
 #   # ONLY touch $TRAINING_BUCKET and pass everything else through.
-#   export TRAINING_BUCKET=raj-ai-lab-eks-training
+#   export TRAINING_BUCKET=raj-ai-lab-eks-cilium-training
 #   envsubst '$TRAINING_BUCKET' < training/runs/distill-dataset-prep.yaml | kubectl apply -f -
 #
 #   # Watch

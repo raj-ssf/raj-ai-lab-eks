@@ -120,7 +120,7 @@ jobs:
             echo "**Run a fine-tune:**"
             echo "\`\`\`"
             echo "export TRAINING_IMAGE=${{ vars.TRAINING_ECR_REPOSITORY_URL }}:sha-${{ steps.sha.outputs.short }}"
-            echo "export TRAINING_BUCKET=raj-ai-lab-eks-training"
+            echo "export TRAINING_BUCKET=raj-ai-lab-eks-cilium-training"
             echo "envsubst < training/runs/llama-3.1-8b-alpaca-lora.yaml | kubectl apply -f -"
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"

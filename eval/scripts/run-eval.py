@@ -27,7 +27,7 @@ for the F4 smoke):
                       smoke set; full mmlu would be ~4 hr)
   LIMIT             — per-task sample cap (default 100)
   S3_DEST           — destination prefix for results JSON
-                      (default s3://raj-ai-lab-eks-training/eval-results/<run-id>)
+                      (default s3://raj-ai-lab-eks-cilium-training/eval-results/<run-id>)
   RUN_ID            — short tag for this run (default = ISO timestamp)
   LANGFUSE_HOST     — Langfuse API URL
                       (default http://langfuse-web.langfuse.svc.cluster.local:3000)
@@ -51,7 +51,7 @@ VLLM_URL    = os.environ.get("VLLM_URL", "http://vllm-llama-8b:8000/v1")
 TASKS       = os.environ.get("TASKS", "mmlu_anatomy,arc_easy,hellaswag")
 LIMIT       = os.environ.get("LIMIT", "100")
 RUN_ID      = os.environ.get("RUN_ID") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-S3_DEST     = os.environ.get("S3_DEST") or f"s3://raj-ai-lab-eks-training/eval-results/{RUN_ID}"
+S3_DEST     = os.environ.get("S3_DEST") or f"s3://raj-ai-lab-eks-cilium-training/eval-results/{RUN_ID}"
 
 # HF Hub tokenizer to use locally for prompt construction + logprob math.
 # The lm-eval `local-completions` adapter ALWAYS loads a tokenizer to

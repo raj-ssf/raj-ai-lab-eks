@@ -2,7 +2,7 @@
 #
 # Apply via:
 #   export TRAINING_IMAGE=<account>.dkr.ecr.us-west-2.amazonaws.com/training:sha-<short>
-#   export TRAINING_BUCKET=raj-ai-lab-eks-training
+#   export TRAINING_BUCKET=raj-ai-lab-eks-cilium-training
 #   envsubst < training/runs/llama-3.1-8b-alpaca-lora.yaml | kubectl apply -f -
 #
 # Why PyTorchJob (Kubeflow Training Operator) rather than a plain K8s Job:

@@ -115,7 +115,7 @@ export TRAINING_IMAGE=$(aws ecr describe-images \
   --repository-name training --region us-west-2 \
   --query 'imageDetails[0].imageTags[0]' --output text)
 export TRAINING_IMAGE=050693401425.dkr.ecr.us-west-2.amazonaws.com/training:${TRAINING_IMAGE}
-export TRAINING_BUCKET=raj-ai-lab-eks-training
+export TRAINING_BUCKET=raj-ai-lab-eks-cilium-training
 
 # Refresh training-configs ConfigMap with the new distill config
 kubectl -n training create configmap training-configs \
