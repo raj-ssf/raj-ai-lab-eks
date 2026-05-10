@@ -114,7 +114,7 @@ spec:
           image: amazon/aws-cli:2.17.0
           env:
             - { name: AWS_REGION, value: us-west-2 }
-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.3-70b-instruct-awq/ }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/llama-3.3-70b-instruct-awq/ }
             - { name: MODEL_PATH, value: /model }
           command: ["/bin/sh", "-euxc"]
           args:

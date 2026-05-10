@@ -28,7 +28,7 @@
 # rerunning produces a clean state matching the HF source.
 #
 # Verification post-completion:
-#   aws s3 ls s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/
+#   aws s3 ls s3://raj-ai-lab-eks-cilium-model-weights/llama-3.1-8b-awq/
 #   # Expect: model.safetensors* + tokenizer.json + config.json +
 #   # quant_config.json.
 apiVersion: batch/v1
@@ -118,14 +118,14 @@ spec:
               ls -lh
 
               echo
-              echo "=== Uploading to s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/ ==="
-              aws s3 sync . s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/ \
+              echo "=== Uploading to s3://raj-ai-lab-eks-cilium-model-weights/llama-3.1-8b-awq/ ==="
+              aws s3 sync . s3://raj-ai-lab-eks-cilium-model-weights/llama-3.1-8b-awq/ \
                 --delete \
                 --no-progress
 
               echo
               echo "=== S3 contents post-upload ==="
-              aws s3 ls s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/
+              aws s3 ls s3://raj-ai-lab-eks-cilium-model-weights/llama-3.1-8b-awq/
 
               echo
               echo "=== AWQ pre-stage complete ==="

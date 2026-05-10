@@ -100,7 +100,7 @@ spec:
             - name: HF_MODEL
               value: meta-llama/Llama-Guard-3-8B
             - name: S3_DEST
-              value: s3://raj-ai-lab-eks-model-weights/llama-guard-3-8b/
+              value: s3://raj-ai-lab-eks-cilium-model-weights/llama-guard-3-8b/
             # Disable HF Hub's progress bars for cleaner CI logs.
             # Errors still surface; only the spinning bytes-per-second
             # progress is suppressed.

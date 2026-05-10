@@ -49,13 +49,13 @@ spec:
     - region us-west-2
     # Mount only objects under this S3 prefix. The prefix is stripped
     # from visible paths — so /model/config.json in the pod maps to
-    # s3://raj-ai-lab-eks-model-weights/llama-3.1-405b-instruct-awq/config.json
+    # s3://raj-ai-lab-eks-cilium-model-weights/llama-3.1-405b-instruct-awq/config.json
     - prefix llama-3.1-405b-instruct-awq/
   csi:
     driver: s3.csi.aws.com
     volumeHandle: s3-csi-vllm-llama-405b
     volumeAttributes:
-      bucketName: raj-ai-lab-eks-model-weights
+      bucketName: raj-ai-lab-eks-cilium-model-weights
 
 ---
 apiVersion: v1

@@ -1,6 +1,6 @@
 # Phase #83b: vllm-llama-8b → AWQ-INT4 quantization
 
-Status: **APPLIED 2026-05-01**. S3 pre-staged via `llm/operational/awq-stage-llama-3.1-8b.yaml` (Job `awq-stage-llama-3-1-8b` ran in 5m41s, ~5.73GB AWQ weights at `s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/`). Code diff applied to `deployment-models.yaml` in the same commit that flipped this status line.
+Status: **APPLIED 2026-05-01**. S3 pre-staged via `llm/operational/awq-stage-llama-3.1-8b.yaml` (Job `awq-stage-llama-3-1-8b` ran in 5m41s, ~5.73GB AWQ weights at `s3://raj-ai-lab-eks-cilium-model-weights/llama-3.1-8b-awq/`). Code diff applied to `deployment-models.yaml` in the same commit that flipped this status line.
 
 ## What this delivers
 
@@ -11,7 +11,7 @@ Status: **APPLIED 2026-05-01**. S3 pre-staged via `llm/operational/awq-stage-lla
 
 ## Why this is staged not committed
 
-vLLM's `--quantization awq` flag requires the on-disk weights to be in AWQ-INT4 format. The current S3 path (`s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-instruct/`) holds the FP16 safetensors. Switching the flag without staging the AWQ weights produces a load error.
+vLLM's `--quantization awq` flag requires the on-disk weights to be in AWQ-INT4 format. The current S3 path (`s3://raj-ai-lab-eks-cilium-model-weights/llama-3.1-8b-instruct/`) holds the FP16 safetensors. Switching the flag without staging the AWQ weights produces a load error.
 
 ## Operator pre-stage steps
 
@@ -25,7 +25,7 @@ huggingface-cli download \
   --local-dir . \
   --local-dir-use-symlinks False
 
-aws s3 sync . s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/
+aws s3 sync . s3://raj-ai-lab-eks-cilium-model-weights/llama-3.1-8b-awq/
 
 # Option B: produce our own AWQ from the existing FP16 (4-bit quantize
 # pass takes ~30 min on g6.xlarge, single-shot; needs the PyTorchJob
@@ -41,8 +41,8 @@ In `llm/base/deployment-models.yaml`, on the `vllm-llama-8b` Deployment:
        initContainers:
          - name: model-sync
            env:
--            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-instruct/ }
-+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/ }
+-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/llama-3.1-8b-instruct/ }
++            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/llama-3.1-8b-awq/ }
              - { name: MODEL_PATH, value: /model }
        containers:
          - name: vllm

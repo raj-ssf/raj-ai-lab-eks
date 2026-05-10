@@ -75,7 +75,7 @@ spec:
             # ~75% VRAM reduction in the loaded model). Pre-staged via
             # llm/operational/awq-stage-llama-3.1-8b.yaml against the
             # hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4 repo.
-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.1-8b-awq/ }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/llama-3.1-8b-awq/ }
             - { name: MODEL_PATH, value: /model }
           command: ["/bin/sh", "-euxc"]
           args:
@@ -354,7 +354,7 @@ spec:
           image: amazon/aws-cli:2.17.0
           env:
             - { name: AWS_REGION, value: us-west-2 }
-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/mixtral-8x7b-instruct-awq/ }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/mixtral-8x7b-instruct-awq/ }
             - { name: MODEL_PATH, value: /model }
           command: ["/bin/sh", "-euxc"]
           args:
@@ -451,7 +451,7 @@ spec:
           image: amazon/aws-cli:2.17.0
           env:
             - { name: AWS_REGION, value: us-west-2 }
-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.2-11b-vision-instruct/ }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/llama-3.2-11b-vision-instruct/ }
             - { name: MODEL_PATH, value: /model }
           command: ["/bin/sh", "-euxc"]
           args:
@@ -735,7 +735,7 @@ spec:
           image: amazon/aws-cli:2.17.0
           env:
             - { name: AWS_REGION, value: us-west-2 }
-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/deepseek-r1-distill-llama-70b-awq/ }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/deepseek-r1-distill-llama-70b-awq/ }
             - { name: MODEL_PATH, value: /model }
           command: ["/bin/sh", "-euxc"]
           args:
@@ -865,7 +865,7 @@ spec:
           image: amazon/aws-cli:2.17.0
           env:
             - { name: AWS_REGION, value: us-west-2 }
-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/bge-m3/ }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/bge-m3/ }
             - { name: MODEL_PATH, value: /model }
           command: ["/bin/sh", "-euxc"]
           args:
@@ -1000,7 +1000,7 @@ spec:
           image: amazon/aws-cli:2.17.0
           env:
             - { name: AWS_REGION, value: us-west-2 }
-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/bge-reranker-v2-m3/ }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/bge-reranker-v2-m3/ }
             - { name: MODEL_PATH, value: /model }
           command: ["/bin/sh", "-euxc"]
           args:
@@ -1089,7 +1089,7 @@ spec:
 #   no-laptop-staging policy) running:
 #     huggingface-cli download meta-llama/Llama-Guard-3-8B \
 #       --local-dir /tmp/lg && \
-#     aws s3 sync /tmp/lg s3://raj-ai-lab-eks-model-weights/llama-guard-3-8b/
+#     aws s3 sync /tmp/lg s3://raj-ai-lab-eks-cilium-model-weights/llama-guard-3-8b/
 #   See the model-stage Job pattern in training/ for a template.
 #
 # Why a separate model (not folded into vllm-llama-8b's pod):
@@ -1138,7 +1138,7 @@ spec:
           image: amazon/aws-cli:2.17.0
           env:
             - { name: AWS_REGION, value: us-west-2 }
-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-guard-3-8b/ }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/llama-guard-3-8b/ }
             - { name: MODEL_PATH, value: /model }
           command: ["/bin/sh", "-euxc"]
           args:
@@ -1226,7 +1226,7 @@ spec:
 #      uploads to s3://<bucket>/adapters/llama-3.2-1b-distilled/.
 #   3. Pre-stage base weights (one-time):
 #        aws s3 sync s3://huggingface-models-public/NousResearch/Llama-3.2-1B/ \
-#          s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/
+#          s3://raj-ai-lab-eks-cilium-model-weights/llama-3.2-1b/
 #   4. kubectl -n llm scale deploy/vllm-llama-1b-distilled --replicas=1
 #   5. Phase #81e merges to enable routing.
 #
@@ -1259,7 +1259,7 @@ spec:
   # ArgoCD selfHeal sync.
   #
   # Pre-reqs already satisfied (Phase #81b/c/d-prereq):
-  #   - base weights at s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/
+  #   - base weights at s3://raj-ai-lab-eks-cilium-model-weights/llama-3.2-1b/
   #     (operational Job at llm/operational/base-stage-llama-3.2-1b.yaml)
   #   - LoRA adapter at s3://raj-ai-lab-eks-training/adapters/
   #     llama-3.2-1b-distilled/ (trained 2026-05-01 23:26 PT,
@@ -1288,7 +1288,7 @@ spec:
           image: amazon/aws-cli:2.17.0
           env:
             - { name: AWS_REGION, value: us-west-2 }
-            - { name: S3_URI,     value: s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/ }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/llama-3.2-1b/ }
             - { name: MODEL_PATH, value: /model }
           command: ["/bin/sh", "-euxc"]
           args:

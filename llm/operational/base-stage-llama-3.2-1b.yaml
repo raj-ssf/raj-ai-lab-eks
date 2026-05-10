@@ -2,7 +2,7 @@
 #
 # Prerequisite for the vllm-llama-1b-distilled Deployment in
 # llm/base/deployment-models.yaml — its model-sync init container
-# does `aws s3 sync s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/`
+# does `aws s3 sync s3://raj-ai-lab-eks-cilium-model-weights/llama-3.2-1b/`
 # and will fail-fast if the prefix is empty.
 #
 # This Job is INTENTIONALLY OUT-OF-KUSTOMIZATION — same pattern as
@@ -27,7 +27,7 @@
 # state matching the HF source.
 #
 # Verification post-completion:
-#   aws s3 ls s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/
+#   aws s3 ls s3://raj-ai-lab-eks-cilium-model-weights/llama-3.2-1b/
 #   # Expect: model.safetensors* + tokenizer.json + tokenizer_config.json
 #   # + config.json + special_tokens_map.json + generation_config.json.
 apiVersion: batch/v1
@@ -102,14 +102,14 @@ spec:
               ls -lh
 
               echo
-              echo "=== Uploading to s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/ ==="
-              aws s3 sync . s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/ \
+              echo "=== Uploading to s3://raj-ai-lab-eks-cilium-model-weights/llama-3.2-1b/ ==="
+              aws s3 sync . s3://raj-ai-lab-eks-cilium-model-weights/llama-3.2-1b/ \
                 --delete \
                 --no-progress
 
               echo
               echo "=== S3 contents post-upload ==="
-              aws s3 ls s3://raj-ai-lab-eks-model-weights/llama-3.2-1b/
+              aws s3 ls s3://raj-ai-lab-eks-cilium-model-weights/llama-3.2-1b/
 
               echo
               echo "=== Base pre-stage complete ==="
