@@ -8,4 +8,4 @@ images:
     # Full image reference (newName + newTag) — GHA bumps newTag on
     # every build. Account ID is not a secret.
     newName: 050693401425.dkr.ecr.us-west-2.amazonaws.com/ingestion-service
-    newTag: sha-ce4ebfd # GHA workflow rewrites this on each main-branch push
+    newTag: sha-8c440d3 # GHA workflow rewrites this on each main-branch push
