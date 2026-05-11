@@ -53,6 +53,32 @@ jobs:
       # next to the image (tag: sha256-<digest>.sig). No private key to
       # manage. Kyverno admission controller verifies the identity matches
       # this workflow (see kyverno-policies.tf in raj-ai-lab-eks-infra).
+
+      # ------------------------------------------------------------
+      # Trivy CVE scan (StackRox parity — gate #4 of 5)
+      #
+      # Scans the freshly-built image manifest BEFORE cosign sign + tag
+      # bump. Fails the workflow if HIGH or CRITICAL vulnerabilities with
+      # an available fix are present. Threshold matches the in-cluster
+      # Kyverno + Trivy operator policy for consistency.
+      #
+      # ignore-unfixed=true mirrors StackRox's default "available fix"
+      # filter — we don't want to fail builds on CVEs upstream hasn't
+      # patched yet (those go in a separate accept-list).
+
+
+      # ------------------------------------------------------------
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.build.outputs.imageid }}
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
