@@ -1,0 +1,272 @@
+# PyTorchJob: DPO (Direct Preference Optimization) of Llama 3.1 8B
+# starting from the existing alpaca-LoRA SFT adapter.
+#
+# What this run does
+# ------------------
+# Stage 3 of the training pipeline (after SFT). Trains a new LoRA
+# adapter on top of the SFT-LoRA-adapted base, using preference pairs
+# (prompt, chosen, rejected) from HuggingFaceH4/ultrafeedback_binarized.
+# Output: a DPO-tuned LoRA that can be swapped in via vLLM
+# --enable-lora at serve time.
+#
+# Apply via:
+#   export TRAINING_IMAGE=<account>.dkr.ecr.us-west-2.amazonaws.com/training:sha-<short>
+#   export TRAINING_BUCKET=raj-ai-lab-eks-cilium-training
+#   envsubst < training/runs/llama-3-1-8b-ultrafeedback-dpo-lora.yaml | kubectl apply -f -
+#
+# Prerequisites (operational, NOT in this YAML)
+# ----------------------------------------------
+#   1. The SFT-LoRA adapter from llama-3.1-8b-alpaca-lora.yaml must
+#      already exist at:
+#        s3://${TRAINING_BUCKET}/adapters/llama-3.1-8b-alpaca-lora/
+#      DPO needs a strong SFT model to start from — running DPO on the
+#      raw base will collapse mode coverage.
+#
+#   2. A training-configs ConfigMap entry named
+#      `llama-3-1-8b-ultrafeedback-dpo-lora.yaml` must exist in the
+#      training namespace. Reference content at the bottom of this
+#      file (commented). Refresh via:
+#        kubectl -n training create configmap training-configs \
+#          --from-file=llama-3-1-8b-ultrafeedback-dpo-lora.yaml=training/configs/llama-3-1-8b-ultrafeedback-dpo-lora.yaml \
+#          --dry-run=client -o yaml | kubectl apply -f -
+#
+# DPO vs SFT differences worth knowing
+# ------------------------------------
+#  - **Memory**: DPO computes TWO forward passes per step (policy + frozen
+#    reference). With LoRA the reference is "base model only, no adapter"
+#    or "base + SFT adapter only" — handled by axolotl's
+#    `dpo_use_logits_to_keep` and `dpo_beta` config. Memory ~1.3-1.5x
+#    SFT, so I've bumped this pod to 40Gi (vs SFT's 28Gi).
+#  - **Dataset format**: requires (prompt, chosen, rejected) columns,
+#    not (prompt, response) like SFT. Axolotl auto-handles this when
+#    `rl: dpo` is set + `datasets[].type: chatml.ultra` (or .alpaca, or
+#    .llama3, etc., matching the SFT's prompt template).
+#  - **Quality knob**: `dpo_beta` (typically 0.05-0.5). Lower = stay
+#    closer to the SFT model. Higher = move further toward preference
+#    signal but risk reward hacking / degradation. Default 0.1 is sane.
+#  - **Eval**: DPO doesn't expose per-step accuracy like SFT does. You
+#    need an offline eval harness — RAGAS for RAG-style answers, MT-Bench
+#    for chat, custom rubric for domain tasks. Eval lives in eval.tf /
+#    your ragas-eval CronJob.
+
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: llama-3-1-8b-ultrafeedback-dpo-lora
+  namespace: training
+  labels:
+    app.kubernetes.io/name: training
+    app.kubernetes.io/component: preference-tune
+    training.raj-ai-lab/model: llama-3.1-8b
+    training.raj-ai-lab/dataset: ultrafeedback-binarized
+    training.raj-ai-lab/method: dpo-lora
+    # Track which SFT adapter this DPO build stacks on. Lets eval pipeline
+    # cleanly group runs by SFT lineage and identify regressions.
+    training.raj-ai-lab/sft-base: llama-3.1-8b-alpaca-lora
+spec:
+  runPolicy:
+    cleanPodPolicy: None
+    backoffLimit: 0
+
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: training
+            app.kubernetes.io/component: preference-tune
+        spec:
+          serviceAccountName: training-pod
+
+          # Same gpu-experiments NodePool as SFT — DPO of an 8B with QLoRA
+          # fits on L40S (48GB) with the reference-model overhead.
+          # An L4 (24GB, used for 1B distill) would NOT have enough headroom.
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+            - key: gpu-experiment
+              operator: Exists
+              effect: NoSchedule
+          nodeSelector:
+            karpenter.sh/nodepool: gpu-experiments
+
+          # Pull the SFT-LoRA adapter before training. DPO-LoRA starts
+          # from "base + SFT-LoRA loaded as the policy starting point";
+          # the reference (frozen) snapshot is the same SFT-LoRA. Axolotl
+          # handles the dual-model bookkeeping when `rl: dpo` and the
+          # SFT adapter path are set in the config.
+          initContainers:
+            - name: sft-adapter-sync
+              image: amazon/aws-cli:2.17.0
+              command: ["/bin/sh", "-euxc"]
+              args:
+                - |
+                  aws s3 sync \
+                    "s3://${TRAINING_BUCKET}/adapters/llama-3.1-8b-alpaca-lora/" \
+                    /workspace/adapters/sft-base/ \
+                    --exclude "checkpoint-*/*" \
+                    --exclude "runs/*" \
+                    --no-progress
+                  ls -la /workspace/adapters/sft-base/
+              volumeMounts:
+                - name: workspace
+                  mountPath: /workspace
+
+          containers:
+            - name: pytorch
+              image: ${TRAINING_IMAGE}
+              imagePullPolicy: IfNotPresent
+              terminationMessagePolicy: FallbackToLogsOnError
+
+              # Shell chain mirrors SFT:
+              #   1. axolotl train: runs DPO. The config (mounted via
+              #      training-configs CM) sets `rl: dpo`, points
+              #      `adapter_model_id` at the SFT adapter from the
+              #      init container, and uses ultrafeedback_binarized.
+              #   2. aws s3 sync: ship the resulting DPO-LoRA adapter
+              #      to S3 for vLLM to load via --enable-lora.
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euxo pipefail
+                  echo "=== Starting DPO-LoRA training ==="
+                  axolotl train /workspace/configs/llama-3-1-8b-ultrafeedback-dpo-lora.yaml
+                  echo "=== Training complete; uploading DPO adapter to S3 ==="
+                  aws s3 sync /workspace/output \
+                    "s3://${TRAINING_BUCKET}/adapters/llama-3.1-8b-ultrafeedback-dpo-lora/" \
+                    --exclude "checkpoint-*/*" \
+                    --exclude "runs/*"
+                  echo "=== Upload complete ==="
+
+              env:
+                - name: TRAINING_BUCKET
+                  value: ${TRAINING_BUCKET}
+                - name: HF_HOME
+                  value: /workspace/.cache/huggingface
+                - name: HF_HUB_DISABLE_TELEMETRY
+                  value: "1"
+                # DPO can be sensitive to numerical precision. The TRL
+                # underlying axolotl will use bf16 if available; this env
+                # makes sure flash-attn picks the same dtype to avoid
+                # mixed-precision footguns in the reference-model path.
+                - name: TORCH_DTYPE
+                  value: bfloat16
+
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"
+                  # 40Gi vs SFT's 28Gi: DPO holds two forward passes worth
+                  # of activations (policy + reference). The reference's
+                  # weights are shared with base (since we're using LoRA),
+                  # but activations & KV are separate. Empirically ~1.4x
+                  # the SFT memory peak. 40Gi fits comfortably on a
+                  # g6e.xlarge's 32GiB system RAM + L40S 48GB VRAM.
+                  # NOTE: bump to g6e.2xlarge (64GiB) if this consistently
+                  # OOMs at the OS level — VRAM is fine, but DataLoader
+                  # workers + tokenizer state push into RAM.
+                  memory: 40Gi
+                  cpu: "3"
+                  ephemeral-storage: 30Gi
+                requests:
+                  nvidia.com/gpu: "1"
+                  cpu: "2"
+                  memory: 16Gi
+                  ephemeral-storage: 10Gi
+
+              volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: hf-cache
+                  mountPath: /workspace/.cache/huggingface
+                - name: training-configs
+                  mountPath: /workspace/configs
+                # Shared workspace for the SFT-adapter handed off from
+                # the init container.
+                - name: workspace
+                  mountPath: /workspace
+
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                # DPO + larger DataLoader worker count needs more /dev/shm
+                # than SFT (4Gi). 12Gi covers the dual-buffer case.
+                sizeLimit: 12Gi
+            - name: hf-cache
+              persistentVolumeClaim:
+                claimName: hf-cache
+            - name: training-configs
+              configMap:
+                name: training-configs
+            - name: workspace
+              emptyDir: {}
+
+# Reference axolotl config — put a copy of this at
+# training/configs/llama-3-1-8b-ultrafeedback-dpo-lora.yaml and load
+# into the training-configs ConfigMap (see Prerequisites at top).
+#
+# ---
+# base_model: meta-llama/Llama-3.1-8B
+# model_type: LlamaForCausalLM
+# tokenizer_type: AutoTokenizer
+#
+# load_in_4bit: true   # QLoRA — same 4-bit base as the SFT run
+# strict: false
+#
+# # Start from the SFT-LoRA adapter (synced by init container)
+# lora_model_dir: /workspace/adapters/sft-base
+#
+# # DPO mode + ultrafeedback_binarized recipe
+# rl: dpo
+# datasets:
+#   - path: HuggingFaceH4/ultrafeedback_binarized
+#     split: train_prefs
+#     type: chatml.ultra   # matches SFT's prompt template family
+#
+# # DPO-specific
+# dpo_beta: 0.1
+# dpo_use_logits_to_keep: true   # saves memory on the reference pass
+#
+# # LoRA config — these are the DPO adapter's own knobs, separate from
+# # the SFT adapter that's loaded as the policy starting point.
+# adapter: qlora
+# lora_r: 16
+# lora_alpha: 32
+# lora_dropout: 0.05
+# lora_target_modules:
+#   - q_proj
+#   - k_proj
+#   - v_proj
+#   - o_proj
+#
+# # Training
+# sequence_len: 2048
+# sample_packing: false   # off for DPO — packing breaks the pair semantics
+# micro_batch_size: 2
+# gradient_accumulation_steps: 8   # effective batch = 16
+# num_epochs: 1
+# optimizer: adamw_bnb_8bit
+# learning_rate: 5.0e-7   # DPO lr is ~10-100x SMALLER than SFT lr (1e-5)
+# lr_scheduler: cosine
+# warmup_steps: 100
+# bf16: auto
+# flash_attention: true
+# gradient_checkpointing: true   # ~1.5x slowdown, ~30% memory savings
+#
+# # Output
+# output_dir: /workspace/output
+# save_strategy: steps
+# save_steps: 200
+# save_total_limit: 2
+# logging_steps: 10
+# eval_steps: 100
+# val_set_size: 0.02   # 2% holdout for DPO loss curve
+#
+# # Tracking — set via env or Axolotl CLI flag; uncomment if you wire
+# # in W&B or Langfuse experiment tracking from the training pod.
+# # wandb_project: raj-ai-lab
+# # wandb_name: llama-3.1-8b-ultrafeedback-dpo-lora-${run_sha}

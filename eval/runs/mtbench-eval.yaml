@@ -1,0 +1,200 @@
+# K8s Job: MT-Bench eval comparing the DPO-LoRA adapter against the
+# SFT-LoRA baseline (and optionally the raw base model).
+#
+# MT-Bench is the canonical instruction-following / chat benchmark for
+# preference-tuned models. 80 multi-turn questions across 8 categories
+# (writing, roleplay, reasoning, math, coding, extraction, STEM,
+# humanities), judged by a strong model.
+#
+# Apply via:
+#   kubectl create configmap mtbench-eval-files \
+#     --from-file=eval/mt-bench/ \
+#     -n llm \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl apply -f eval/runs/mtbench-eval.yaml
+#   kubectl -n llm logs -f job/mtbench-eval
+#
+# Pre-reqs:
+#   1. The DPO-LoRA adapter exists at
+#      s3://${TRAINING_BUCKET}/adapters/llama-3.1-8b-ultrafeedback-dpo-lora/
+#      (produced by training/runs/llama-3-1-8b-ultrafeedback-dpo-lora.yaml).
+#   2. The SFT-LoRA adapter exists at
+#      s3://${TRAINING_BUCKET}/adapters/llama-3.1-8b-alpaca-lora/
+#      (the head-to-head baseline).
+#   3. vllm-llama-8b is scaled up with --enable-lora and both adapters
+#      registered as lora_modules at server start. Verify with
+#      `curl http://vllm-llama-8b.llm:8000/v1/models` — both adapter
+#      names should appear as separate models.
+#   4. vllm-llama-70b is scaled up to serve as the judge. (Using your
+#      in-cluster 70B as judge keeps eval traffic on-prem; alternative
+#      is OpenAI gpt-4o via OPENAI_API_KEY in a Secret, slower and $.)
+#   5. eval/mt-bench/ ConfigMap loaded (run_mtbench.py, questions.yaml,
+#      baselines.json). The questions file mirrors the canonical
+#      FastChat MT-Bench question_v1.jsonl format.
+#   6. eval-pod ServiceAccount + Pod Identity already exist
+#      (raj-ai-lab-eks-infra/eval.tf — shared with RAGAS + adversarial).
+#
+# Why a Job vs PyTorchJob: MT-Bench eval is CPU-bound — HTTP calls to
+# the served models, JSON parsing, score aggregation. No GPU needed on
+# the eval pod itself; it just talks to the vLLM Services.
+#
+# Why not a CronJob: 70B serving cost is non-trivial (cold start +
+# ~2-3 min eval-time GPU spend ≈ $0.50/run). Operator-applied on PR
+# merge of a new DPO adapter is the right cadence — automated nightly
+# would burn $15/month on inference for a benchmark that only matters
+# when training artifacts change.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mtbench-eval
+  namespace: llm
+  labels:
+    app.kubernetes.io/name: eval
+    app.kubernetes.io/component: mt-bench
+    eval.raj-ai-lab/comparison: dpo-vs-sft
+    # Track which artifacts this run scored. Lets the eval pipeline
+    # group MT-Bench runs by adapter lineage for trend analysis.
+    eval.raj-ai-lab/target-adapter: llama-3.1-8b-ultrafeedback-dpo-lora
+    eval.raj-ai-lab/baseline-adapter: llama-3.1-8b-alpaca-lora
+spec:
+  backoffLimit: 1
+  # Auto-clean Job + Pod 2h after completion. Eval logs survive in S3
+  # (run_mtbench.py uploads results + judge transcripts before exit);
+  # in-cluster Job state is scratch.
+  ttlSecondsAfterFinished: 7200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: eval
+        app.kubernetes.io/component: mt-bench
+    spec:
+      # Pod Identity → eval_pod IAM role (s3 read adapters/* +
+      # datasets/*, s3 write eval-results/*).
+      serviceAccountName: eval-pod
+      restartPolicy: OnFailure
+
+      # No GPU toleration — eval is CPU-bound, hits the model Services
+      # via HTTP. Schedule on default Karpenter NodePool.
+
+      containers:
+        - name: mtbench
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
+
+          # Bootstrap deps + run. ~12s pip install overhead is fine for
+          # an operator-applied Job; building a dedicated image for
+          # <300 lines of Python isn't worth the ECR repo + GHA
+          # workflow + Kyverno registry-allowlist update.
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euxo pipefail
+              echo "=== Installing eval deps ==="
+              pip install --quiet --no-cache-dir httpx==0.27.* pyyaml==6.* openai==1.* boto3==1.34.*
+              echo "=== Running MT-Bench eval ==="
+              cd /workspace
+              python run_mtbench.py
+              echo "=== Eval complete; results in s3://${RESULTS_BUCKET}/eval-results/mt-bench/${RUN_ID}/ ==="
+
+          env:
+            # Models under test. Both are LoRA-adapted variants served
+            # by vllm-llama-8b via --enable-lora. The OpenAI-compatible
+            # API exposes each adapter as a separate `model` name.
+            - name: TARGET_MODEL          # the DPO-LoRA adapter
+              value: llama-3.1-8b-ultrafeedback-dpo-lora
+            - name: BASELINE_MODEL        # the SFT-only baseline
+              value: llama-3.1-8b-alpaca-lora
+            - name: VLLM_URL
+              value: http://vllm-llama-8b.llm:8000/v1
+
+            # Judge model. The in-cluster 70B is strong enough to
+            # discriminate quality. Set JUDGE_PROVIDER=openai +
+            # provide a Secret with OPENAI_API_KEY to swap to gpt-4o
+            # — required if you want to publish MT-Bench numbers
+            # comparable to the FastChat leaderboard, which uses GPT-4.
+            - name: JUDGE_MODEL
+              value: llama-3.3-70b-instruct-awq
+            - name: JUDGE_URL
+              value: http://vllm.llm:8000/v1
+            - name: JUDGE_PROVIDER        # "local" or "openai"
+              value: local
+
+            # Scoring: MT-Bench uses pairwise comparison with a
+            # 1-10 Likert score. SCORE_MODE=single rates each answer
+            # absolutely; SCORE_MODE=pairwise compares target vs
+            # baseline directly (less judge variance, what we want).
+            - name: SCORE_MODE
+              value: pairwise
+
+            # Question subset. "all" runs all 80; for fast iteration
+            # use a category subset like "reasoning,math,coding"
+            # (24 questions, ~3 min wall time).
+            - name: CATEGORIES
+              value: all
+
+            # S3 output destination + run identifier. RUN_ID gets
+            # appended to the path; defaults to ISO timestamp if
+            # unset (run_mtbench.py fills it).
+            - name: RESULTS_BUCKET
+              value: raj-ai-lab-eks-cilium-training
+            - name: RUN_ID
+              value: ""    # auto-filled from $(date -u +%Y%m%dT%H%M%SZ)
+
+            # Regression gate. If TARGET avg score is < BASELINE * (1 - PCT/100),
+            # the Job exits 1 — the merge that produced this adapter is
+            # blocked from being canary-promoted. Set to 5 = 5pp drop
+            # tolerated, tighten as confidence grows.
+            - name: REGRESSION_THRESHOLD_PCT
+              value: "5"
+
+            - name: AWS_REGION
+              value: us-west-2
+
+          # Optional Langfuse credentials — same Secret RAGAS uses.
+          # When present, each (question, target_answer, baseline_answer,
+          # judge_verdict) tuple emits a trace span, so you can see
+          # the eval flow in the Langfuse UI alongside production
+          # inference traces.
+          envFrom:
+            - secretRef:
+                name: langfuse-eval-credentials
+                optional: true
+            # OpenAI key for JUDGE_PROVIDER=openai. Optional — empty
+            # if you're using the in-cluster 70B judge (JUDGE_PROVIDER=local).
+            - secretRef:
+                name: openai-judge-credentials
+                optional: true
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+            limits:
+              # MT-Bench eval generates 80 questions × 2 models × ~1024 tok
+              # answers + judging passes = ~5 min wall time on warm 8B,
+              # ~3 min on warm 70B judge. Mostly idle on the eval pod
+              # itself (waiting on HTTP); 4Gi RAM is plenty for the
+              # answer buffer + Pydantic models.
+              cpu: "2"
+              memory: "4Gi"
+
+          volumeMounts:
+            - name: mtbench-files
+              mountPath: /workspace
+
+      volumes:
+        # ConfigMap with the runner + question set + baselines.
+        # Files expected:
+        #   run_mtbench.py     — orchestrator: gen answers, judge, score
+        #   questions.yaml     — 80 MT-Bench questions (or your custom set)
+        #   baselines.json     — committed prior-run scores for regression
+        # Refresh via:
+        #   kubectl -n llm create configmap mtbench-eval-files \
+        #     --from-file=eval/mt-bench/ \
+        #     --dry-run=client -o yaml | kubectl apply -f -
+        - name: mtbench-files
+          configMap:
+            name: mtbench-eval-files
