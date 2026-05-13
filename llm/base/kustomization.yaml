@@ -23,6 +23,13 @@ resources:
   # with its dedicated PVC (or S3 Mountpoint PVC for 405B). Replicas=0
   # by default; kubectl scale to bring one online for a demo.
   - deployment-models.yaml
+  # R1-Distill-Qwen-32B reasoning tier — single-GPU L40S Deployment,
+  # max-model-len=32k for visible <think>...</think> output, no LoRA /
+  # no spec decoding (reasoning-model-specific tradeoffs documented
+  # in the file). Companion: scaledobject-vllm-r1-distill-32b.yaml,
+  # PVC vllm-cache-r1-distill-32b in pvcs-models.yaml, Service
+  # vllm-r1-distill-32b in services-models.yaml.
+  - deployment-r1-distill-32b.yaml
   # Per-model-variant Services so callers (langgraph-service router,
   # rag-service hybrid path) can address each variant by stable DNS
   # name. The default `vllm` Service in service.yaml continues to
@@ -67,6 +74,11 @@ resources:
   # mechanism is now subsumed by the cron trigger inside this
   # ScaledObject.
   - scaledobject-vllm-llama-8b.yaml
+  # R1-Distill-32B reasoning tier autoscaler. Tighter scale-up
+  # threshold (queue depth ≥3 instead of 5) since each reasoning
+  # request is long-running. Shorter business-hours window (10am-9pm
+  # PT) since reasoning traffic is bursty rather than steady chat.
+  - scaledobject-vllm-r1-distill-32b.yaml
   # Phase #81d: chat template for vllm-llama-1b-distilled.
   # NousResearch/Llama-3.2-1B is the BASE variant (no chat_template
   # in its tokenizer_config.json), so vLLM's /v1/chat/completions

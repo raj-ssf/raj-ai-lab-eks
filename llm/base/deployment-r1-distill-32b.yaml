@@ -1,0 +1,231 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-r1-distill-32b
+  labels:
+    app: vllm-r1-distill-32b
+    app.kubernetes.io/name: vllm
+    app.kubernetes.io/component: reasoning-model
+    tracing.myriad/langfuse: enabled
+  annotations:
+    # When was this base image last bumped? Used by ops + langgraph-
+    # service for cache-busting model-version-aware prefix caches.
+    model-weights.raj-ai-lab/model: deepseek-r1-distill-qwen-32b-awq
+spec:
+  # Same on-demand pattern as the 70B (deployment.yaml): replicas=0
+  # at steady state, scale to 1 only when a reasoning-tagged request
+  # arrives. Karpenter spins up the L40S node (~60-90s); first request
+  # eats the ~4-5 min model cold-start. Keep warm by raising replicas
+  # to 1 during business hours via the ScaledObject's cron trigger
+  # (separate file: scaledobject-vllm-r1-distill-32b.yaml).
+  replicas: 0
+
+  # Recreate (not RollingUpdate): single-GPU pod, scheduling a second
+  # one while the first holds the GPU just blocks both. Matches the
+  # rationale in deployment.yaml.
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: vllm-r1-distill-32b
+
+  template:
+    metadata:
+      labels:
+        app: vllm-r1-distill-32b
+        app.kubernetes.io/name: vllm
+        app.kubernetes.io/component: reasoning-model
+        tracing.myriad/langfuse: enabled
+    spec:
+      serviceAccountName: vllm
+      enableServiceLinks: false
+
+      # GPU node — same selector + tolerations as the other vLLM
+      # Deployments. The 32B-AWQ fits on a single L40S 48GB (model
+      # ~17 GB + KV cache + activations); no TP needed.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      # ----- Init: sync model weights from S3 ----------------------------
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_REGION, value: us-west-2 }
+            - { name: S3_URI,     value: s3://raj-ai-lab-eks-cilium-model-weights/deepseek-r1-distill-qwen-32b-awq/ }
+            - { name: MODEL_PATH, value: /model }
+          command: ["/bin/sh", "-euxc"]
+          args:
+            - |
+              aws configure set default.s3.max_concurrent_requests 32
+              aws configure set default.s3.multipart_chunksize 128MB
+              aws s3 sync "$S3_URI" "$MODEL_PATH" --no-progress
+              ls -la "$MODEL_PATH"
+          resources:
+            requests: { cpu: "2", memory: "2Gi" }
+            limits:   { cpu: "8", memory: "4Gi" }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model }
+
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:placeholder
+          imagePullPolicy: IfNotPresent
+
+          args:
+            - "--model"
+            - "/model"
+
+            # Served-model-name is the string clients pass in
+            # /v1/chat/completions's `model:` field. Distinct from
+            # both Instruct deployments so the router can address
+            # reasoning explicitly.
+            - "--served-model-name"
+            - "r1-distill-32b"
+
+            # Single GPU — no TP. The Distill-Qwen-32B at AWQ-4bit
+            # is ~17 GB in VRAM. L40S 48GB has plenty of headroom
+            # for KV cache + activations + speculative-decoding
+            # working buffer.
+            - "--tensor-parallel-size"
+            - "1"
+
+            - "--quantization"
+            - "awq_marlin"            # the optimized AWQ kernel (per feedback_vllm_awq_marlin)
+            - "--dtype"
+            - "half"
+
+            # --- REASONING-MODEL-SPECIFIC TUNING --------------------------
+            # max-model-len = 32k: R1's <think> blocks routinely consume
+            # 1-10k tokens BEFORE the answer; 16k like the 70B Instruct
+            # Deployment would clip mid-reasoning on hard problems. 32k
+            # is the practical floor for a reasoning model; bump to 64k
+            # if you start serving competition-math-class problems.
+            #
+            # KV-cache memory math for sizing:
+            #   per-token-KV-bytes = 2 (K+V) × 32 (layers) × num_kv_heads (8 for 32B) × 128 (head_dim) × 2 (fp16)
+            #                     = 131,072 bytes/token ≈ 128 KiB/token
+            #   At max-model-len=32k: ~4 GiB KV cache for ONE saturated request.
+            #   At 4 concurrent requests at full context: ~16 GiB → fits in
+            #   the 48GB-17GB(weights) = 31GB budget with margin.
+            - "--max-model-len"
+            - "32768"
+
+            # gpu-memory-utilization 0.85: leaves ~7 GB free per the
+            # L40S for NCCL working memory + system buffer. Slightly
+            # more conservative than the 70B's 0.80 (which had 4-rank
+            # all-reduce pressure); single-GPU reasoning has no
+            # all-reduce path, so 0.85 is fine.
+            - "--gpu-memory-utilization"
+            - "0.85"
+
+            # max-num-seqs 16: reasoning requests are LONG-RUNNING.
+            # Higher concurrency saturates KV cache faster (each request
+            # holds the slot through the full 1-10k thinking tokens).
+            # 16 is conservative; bump after observing
+            # vllm:gpu_cache_usage_perc < 0.7 sustained under load.
+            # The cluster-policy bound-vllm-max-num-seqs ≤ 256 caps the
+            # ceiling.
+            - "--max-num-seqs"
+            - "16"
+
+            # enable-prefix-caching: reasoning workloads often share
+            # system prompts ("Think step-by-step..."); prefix cache
+            # reuses the prefill KV across requests with matching
+            # prefixes. ~30-50% latency reduction on the prefill phase
+            # when callers respect a stable system prompt.
+            - "--enable-prefix-caching"
+
+            # enable-chunked-prefill: for very long thinking outputs,
+            # the prefill+decode interleave keeps decode latency
+            # responsive (token streaming UX). Critical for the
+            # "stream thinking to UI" pattern.
+            - "--enable-chunked-prefill"
+
+            # NO --speculative-model: R1's output distribution doesn't
+            # match the standard Llama 3.2 1B draft we use elsewhere.
+            # Reasoning-trained drafts (R1-Distill-1.5B) would work but
+            # add ~$120/month at idle GPU costs. Not worth it until
+            # spec-decode in vLLM is reasoning-aware.
+            #
+            # NO --enable-lora: reasoning models aren't typically
+            # adapter-swapped. If a future use-case needs domain-tuned
+            # reasoning, train R1-Distill-32B-LoRA in a separate
+            # Deployment.
+
+            # --- Streaming/UX considerations ------------------------------
+            # No CUDA-graph capture: faster cold start, -15% tokens/sec
+            # at warm-state. Trade-off is favorable for reasoning where
+            # cold-start UX matters more than peak throughput.
+            - "--enforce-eager"
+
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+
+          env:
+            - { name: HF_HUB_DISABLE_TELEMETRY, value: "1" }
+            # vLLM service env-link footgun (per the 70B deployment's
+            # comment) — disable to prevent VLLM_PORT injection.
+            - { name: VLLM_LOGGING_LEVEL, value: INFO }
+
+          ports:
+            - { name: http, containerPort: 8000 }
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "24Gi"
+              nvidia.com/gpu: "1"
+
+          # ----- Probes — tuned for reasoning model cold start ------------
+          # Startup probe must accommodate:
+          #   - awq_marlin kernel compile  ~30s
+          #   - model load to GPU          ~60-90s
+          #   - vLLM engine init           ~30s
+          #   - first CUDA graph (we have --enforce-eager so this is skipped)
+          # Worst case ~3 min. failureThreshold: 60 × periodSeconds: 5 = 5 min.
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            failureThreshold: 60
+            timeoutSeconds: 5
+
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 30
+            # 5 consecutive failures (2.5 min) before kill. Reasoning
+            # generations don't block /health, but a hung CUDA context
+            # might — give it time to recover before forced restart.
+            failureThreshold: 5
+
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: dshm,        mountPath: /dev/shm }
+
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache-r1-distill-32b    # declared in pvcs-models.yaml
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            # Larger /dev/shm: reasoning workloads have higher prefix-
+            # cache turnover + chunked-prefill working buffer.
+            sizeLimit: 8Gi

@@ -302,3 +302,26 @@ spec:
   resources:
     requests:
       storage: 10Gi
+
+---
+# DeepSeek-R1-Distill-Qwen-32B AWQ — single-GPU reasoning-tier sibling
+# to the multi-GPU 70B distilled R1 above (vllm-cache-deepseek-r1-70b).
+# At AWQ-4bit the weights are ~17 GB; 30 GiB PVC matches the 8B Llama
+# Instruct's headroom margin and leaves room for transient s3-sync
+# staging files.
+#
+# Pre-stage weights via (operator-side, one-time):
+#   aws s3 sync s3://huggingface-models-public/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B-AWQ/ \
+#     s3://raj-ai-lab-eks-cilium-model-weights/deepseek-r1-distill-qwen-32b-awq/
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-r1-distill-32b
+  labels:
+    app: vllm
+    model: deepseek-r1-distill-qwen-32b-awq
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 30Gi

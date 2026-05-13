@@ -192,3 +192,25 @@ spec:
       port: 8000
       targetPort: http
       protocol: TCP
+
+---
+# DeepSeek-R1-Distill-Qwen-32B AWQ — single-GPU reasoning tier.
+# Distinct from the 70B-Llama R1 above; langgraph-service's router
+# picks this one for cost-sensitive reasoning queries (32B Qwen-distill
+# is the sweet spot for math/code reasoning at <10 GB AWQ working set).
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-r1-distill-32b
+  labels:
+    app: vllm-r1-distill-32b
+    vllm-model: deepseek-r1-distill-qwen-32b-awq
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-r1-distill-32b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP

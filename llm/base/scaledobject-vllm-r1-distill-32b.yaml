@@ -1,0 +1,87 @@
+# KEDA ScaledObject for the R1-Distill-32B reasoning tier. Mirrors
+# scaledobject-vllm-llama-8b.yaml with reasoning-workload tuning:
+#
+#   - Lower threshold (3 instead of 5): each reasoning request is
+#     10x longer-running, so queue depth has more weight per item.
+#     Smaller queues warrant scale-up.
+#   - Shorter business-hours window (10am-9pm PT): reasoning-tier
+#     traffic is bursty (eval runs, complex queries), not steady
+#     chat traffic. No need to pre-warm overnight.
+#   - cooldownPeriod 900 (15min vs 8B's 10min): reasoning gens
+#     are long; lingering tail requests benefit from a warmer
+#     pool. Karpenter consolidates the GPU node after 15min idle.
+#   - maxReplicaCount: 2 (vs 8B's 4): reasoning workloads are
+#     per-request expensive; horizontal scale-out has limited
+#     marginal benefit until queue depth justifies it.
+#
+# Same KEDA mechanics as the 8B:
+#   - minReplicaCount=0 + scale-from-0 via Prometheus query (HPA
+#     can't do this — needs pod-emitted metrics).
+#   - Stacked cron + prometheus triggers (MAX semantic).
+#   - underlying HPA behavior tuned for fast scale-up (GPU spawn
+#     is the bottleneck) and slow scale-down (don't thrash).
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-r1-distill-32b
+  namespace: llm
+  labels:
+    app: vllm-r1-distill-32b
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vllm-r1-distill-32b
+
+  minReplicaCount: 0
+  maxReplicaCount: 2
+
+  pollingInterval: 30
+  cooldownPeriod: 900    # 15min — longer tail than chat workload
+  idleReplicaCount: 0
+
+  triggers:
+    # Trigger 1: business-hours cron warm-pool. Tighter window than
+    # the 8B chat tier (which runs 9am-2am PT) since reasoning is
+    # bursty rather than steady — no overnight chat traffic to keep
+    # the model warm for.
+    - type: cron
+      metadata:
+        timezone: America/Los_Angeles
+        start: "0 10 * * *"     # 10am PT
+        end:   "0 21 * * *"     # 9pm PT
+        desiredReplicas: "1"
+
+    # Trigger 2: load-driven scale-up by queue depth. Threshold 3:
+    # reasoning requests are long; queue >3 means caller-perceived
+    # latency is climbing toward 60s+. Tight signal.
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: vllm_num_requests_waiting
+        threshold: "3"
+        query: sum(vllm:num_requests_waiting{pod=~"vllm-r1-distill-32b-.*"})
+
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          selectPolicy: Max
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 30
+            - type: Pods
+              value: 1
+              periodSeconds: 30
+        scaleDown:
+          # 15min stabilization — gives reasoning gens time to
+          # complete before yanking the pod. Matches cooldownPeriod.
+          stabilizationWindowSeconds: 900
+          selectPolicy: Min
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 120
