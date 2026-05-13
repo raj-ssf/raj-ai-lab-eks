@@ -1,0 +1,51 @@
+{{- with .Values.policies.requireTenantLabelOnLoraPods }}
+{{- if .enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-tenant-label-on-lora-pods
+  annotations:
+    policies.kyverno.io/title: LoRA-serving pods must declare a tenant label
+    policies.kyverno.io/category: AI Platform (App)
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      Pods loading LoRA adapters (vLLM --lora-modules or --enable-lora)
+      must declare a `{{ .requiredLabel }}=…` label on the pod metadata.
+      Multi-tenant LoRA serving uses the label to: (1) scope NetworkPolicy
+      ingress per tenant, (2) attribute GPU-time cost in Langfuse, (3)
+      partition audit logs. Without it, two tenants' adapters sharing the
+      same vLLM pod are operationally indistinguishable.
+spec:
+  validationFailureAction: {{ include "appPolicies.action" .action }}
+  background: true
+  rules:
+    - name: lora-pods-need-tenant-label
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces:
+                {{- range .namespaces }}
+                - {{ . }}
+                {{- end }}
+      preconditions:
+        any:
+          # Pod has any container whose args include --enable-lora or
+          # --lora-modules (single-token, prefix-matched).
+          - key: {{ "{{ request.object.spec.containers[?contains(args || `[]`, '--enable-lora')] | length(@) }}" | quote }}
+            operator: GreaterThan
+            value: 0
+          - key: {{ "{{ request.object.spec.containers[?args[?starts_with(@, '--lora-modules=')]] | length(@) }}" | quote }}
+            operator: GreaterThan
+            value: 0
+      validate:
+        message: >-
+          Pods loading LoRA adapters must declare metadata.labels.{{ .requiredLabel }}
+          to enable per-tenant network policy, cost attribution, and audit
+          scoping.
+        pattern:
+          metadata:
+            labels:
+              {{ .requiredLabel }}: "?*"
+{{- end }}
+{{- end }}

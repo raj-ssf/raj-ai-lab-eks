@@ -1,0 +1,51 @@
+{{- with .Values.policies.requireInferenceTracingEnv }}
+{{- if .enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-inference-tracing-env
+  annotations:
+    policies.kyverno.io/title: Inference pods must set Langfuse SDK env
+    policies.kyverno.io/category: AI Platform (App)
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      Pods in inference-tier namespaces must declare LANGFUSE_HOST,
+      LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY env vars. Without these,
+      the Langfuse Python SDK silently runs in no-op mode — no traces
+      are emitted, no cost is attributed, no audit trail captured.
+      This complements the metadata-label policy in cluster-policies
+      (which ensures Langfuse can join spans BY workload identity);
+      this policy ensures the SDK actually emits in the first place.
+spec:
+  validationFailureAction: {{ include "appPolicies.action" .action }}
+  background: true
+  rules:
+    - name: inference-pods-need-langfuse-env
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces:
+                {{- range .namespaces }}
+                - {{ . }}
+                {{- end }}
+      validate:
+        message: >-
+          Inference pods must declare env vars:
+          {{- range .requiredEnvVars }} {{ . }}{{- end }}.
+          Without these, the Langfuse SDK silently no-ops.
+        foreach:
+          - list: request.object.spec.containers
+            deny:
+              conditions:
+                # For each REQUIRED env var, check it's present in this
+                # container's env array. Kyverno's deny.conditions.any
+                # means: deny if ANY of these named env vars is missing.
+                any:
+                  {{- range .requiredEnvVars }}
+                  - key: {{ printf "{{ element.env[?name == '%s'] | length(@) }}" . | quote }}
+                    operator: Equals
+                    value: 0
+                  {{- end }}
+{{- end }}
+{{- end }}

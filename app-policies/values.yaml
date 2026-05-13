@@ -1,0 +1,62 @@
+# App-tier policies. Scope-restricted via per-policy .namespaces (default
+# list defined in .global.appNamespaces).
+#
+# Difference vs cluster-policies (the platform-tier chart in the infra repo):
+# - cluster-policies: invariants the platform enforces over EVERY namespace
+#   (no privileged containers, image-registry allowlist, GPU pods declare
+#   nvidia.com/gpu, etc.). Apps inherit them.
+# - app-policies (this chart): invariants that only make sense within app
+#   namespaces (inference workload must set LANGFUSE_HOST env, vLLM
+#   --max-num-seqs ≤ N, LoRA pods must declare tenant label). These would
+#   be wrong to apply cluster-wide (kube-system pods don't have a tenant).
+
+global:
+  # Namespaces these policies match. Listed exhaustively to make the scope
+  # explicit. Add a new app namespace here when the corresponding workload
+  # lands.
+  appNamespaces:
+    - llm
+    - rag-service
+    - langgraph-service
+    - ingestion-service
+    - chat-ui
+
+policies:
+
+  # Inference pods must set Langfuse SDK env so every request is traced
+  # to the cost-attribution + audit pipeline. Differs from the
+  # cluster-policies chart's require-tracing-labels: that one enforces
+  # METADATA labels (for span-context join); this one enforces RUNTIME
+  # env (so the SDK actually emits to Langfuse). Both are needed.
+  requireInferenceTracingEnv:
+    enabled: true
+    action: audit
+    requiredEnvVars:
+      - LANGFUSE_HOST
+      - LANGFUSE_PUBLIC_KEY
+      - LANGFUSE_SECRET_KEY
+    # Only inference-tier pods. Chat-ui is excluded since it doesn't make
+    # LLM calls itself — it talks to langgraph-service which has tracing.
+    namespaces:
+      - llm
+      - rag-service
+      - langgraph-service
+      - ingestion-service
+
+  # Cap vLLM --max-num-seqs to bound kv-cache claim. Default cap of 256
+  # matches an L4/L40-class GPU's working-set budget at AWQ-4bit. Bump
+  # for H100, lower for T4.
+  boundVllmMaxNumSeqs:
+    enabled: true
+    action: audit
+    maxValue: 256
+
+  # Pods that load LoRA adapters (vLLM --lora-modules) must declare a
+  # `tenant=` label. Enables tenant-scoped network policies, billing,
+  # and audit attribution for multi-tenant fine-tune serving.
+  requireTenantLabelOnLoraPods:
+    enabled: true
+    action: audit
+    requiredLabel: tenant
+    namespaces:
+      - llm

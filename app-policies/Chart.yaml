@@ -1,0 +1,18 @@
+apiVersion: v2
+name: app-policies
+description: Kyverno policies that enforce invariants intrinsic to specific
+  AI-lab applications (vLLM, RAG service, langgraph-service, ingestion-service,
+  chat-ui). Scope-restricted to app namespaces only. Complements the
+  platform-tier cluster-policies chart, which enforces cross-cutting invariants
+  (registry allowlist, GPU resource declaration, init-container timeout) over
+  every namespace.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - kyverno
+  - policy
+  - llm
+  - vllm
+  - rag
+home: https://github.com/raj-ssf/raj-ai-lab-eks

@@ -1,0 +1,52 @@
+{{- with .Values.policies.boundVllmMaxNumSeqs }}
+{{- if .enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: bound-vllm-max-num-seqs
+  annotations:
+    policies.kyverno.io/title: vLLM --max-num-seqs must be ≤ {{ .maxValue }}
+    policies.kyverno.io/category: AI Platform (App)
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      vLLM's --max-num-seqs sets the maximum concurrent sequences that
+      can be in-flight. Each occupies kv-cache memory proportional to
+      its length. Setting too-high values exhausts kv-cache budget,
+      causes paging/preemption (sequences are evicted mid-generation
+      and replayed when capacity frees), and tanks p95 latency. This
+      policy caps the value to a known-safe ceiling.
+spec:
+  validationFailureAction: {{ include "appPolicies.action" .action }}
+  background: true
+  rules:
+    - name: vllm-max-num-seqs-cap
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [llm]
+      preconditions:
+        all:
+          # only run on pods that contain a vllm-flavored container
+          - key: {{ "{{ request.object.spec.containers[?contains(image, 'vllm')] | length(@) }}" | quote }}
+            operator: GreaterThan
+            value: 0
+      validate:
+        message: >-
+          vLLM containers must invoke with --max-num-seqs ≤ {{ .maxValue }}.
+          Higher values exhaust kv-cache budget under load.
+        foreach:
+          - list: "request.object.spec.containers[?contains(image, 'vllm')]"
+            deny:
+              conditions:
+                # If --max-num-seqs=N appears anywhere in args and N exceeds
+                # the cap, deny. Pattern handles only the single-token
+                # `--max-num-seqs=256` form; two-token form would need a
+                # separate rule (see vllm-gpu-mem-util-bound for the same
+                # limitation).
+                any:
+                  - key: {{ "{{ element.args[?starts_with(@, '--max-num-seqs=')] | [0] || '' | split(@, '=')[1] | to_number(@) }}" | quote }}
+                    operator: GreaterThan
+                    value: {{ .maxValue }}
+{{- end }}
+{{- end }}
